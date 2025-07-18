@@ -1,6 +1,6 @@
 These scripts were hacked together to provide support for using the Qwen3 Text Embedder model to produce text encodings for inference with the Chroma image generation model, and for distillation training Qwen3 using T5-xxl as the teacher in order to produce text encodings that more closely match those of the T5-xxl model. This was only tested on Arch Linux, using an Nvidia GPU, and the below instructions are written for this environment only.
 
-Installation:
+Installation (I'll tidy this up later):
 
 Before proceeding, ensure you are using Python 3.12. Personally, I use pyenv to make a 3.12 venv:
 
