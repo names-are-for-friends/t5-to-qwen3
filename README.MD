@@ -5,21 +5,17 @@ Installation:
 Before proceeding, ensure you are using Python 3.12. Personally, I use pyenv to make a 3.12 venv:
 
 pacman -S pyenv
-
 pyenv init
 
 Follow the instructions given, then:
 
 pyenv install 3.12
-
 pyenv global 3.12
 
 In the desired folder for the venv:
 
 python -m venv venv
-
 pyenv global system
-
 source venv/bin/activate.fish
 
 Now, install pytorch:
