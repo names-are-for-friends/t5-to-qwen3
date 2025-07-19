@@ -1,6 +1,23 @@
 These scripts were hacked together to provide support for using the Qwen3 Text Embedder model to produce text encodings for inference with the Chroma image generation model, and for distillation training Qwen3 using T5-xxl as the teacher in order to produce text encodings that more closely match those of the T5-xxl model. This was only tested on Arch Linux, using an Nvidia GPU, and the below instructions are written for this environment only.
 
-Installation (I'll tidy this up later):
+Updates:
+
+---
+19/07/2025
+---
+
+Training hit a wall. After some research, I have made a number of changes. Initial results seem to show an improvement. 
+
+Changes:
+
+- Replaced MSE with Huber for loss calculation, this should make us more resilient to outliers than using squared error;
+- Added cosine distance component to loss calculation to make our loss calculation more properly reflect the difference between the target vectors and the output vectors;
+- Added gradient accumulation to preserve VRAM;
+- Added ability to cache teacher embeddings to the disk so that T5-xxl weights don't need to be loaded during the training loop and on subsequent runs (on a slow hard-drive, this might be very slow, even with prefetching - my useless SMR drive doesn't stand a chance);
+- Added a GeLU layer to the projection layer to non-linearly process the text embedder output, which will hopefully make the nuance of the projected embedding closer to the T5-xxl embedding; and
+- Added ability to use a separate dataset for evaluation to better test generalisation.
+
+Installation:
 
 Before proceeding, ensure you are using Python 3.12. Personally, I use pyenv to make a 3.12 venv:
 
