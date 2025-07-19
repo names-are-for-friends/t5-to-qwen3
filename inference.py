@@ -25,17 +25,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-DEFAULT_CHROMA_FILE = "/home/naff/q3-xxs_script/chroma/chroma-unlocked-v41.safetensors"
-DEFAULT_VAE_FILE = "/home/naff/q3-xxs_script/ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/home/naff/q3-xxs_script/q5-xxs-v0/"
-DEFAULT_T5_FOLDER = "/home/naff/q3-xxs_script/t5-xxl/"
-DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, giving a thumbs up to the camera. They're stood under cherry blossom trees, surrounded by falling blossoms.'"
+DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
+DEFAULT_VAE_FILE = "ae/ae.safetensors"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-v13"
+DEFAULT_T5_FOLDER = "t5-xxl/"
+DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'."
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_SEED = 42
 DEFAULT_STEPS = 30
 DEFAULT_CFG = 4
 DEFAULT_RESOLUTION = [512,512]
-DEFAULT_OUTPUT_FILE = "output/image"
+DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'img_in', 'txt_in', 'distilled_guidance_layer', 'final_layer']
@@ -635,7 +635,7 @@ class Chroma(Module):
         img = self.final_layer(img, distill_vec=final_mod)
         return img
 
-# === AutoEncoder Implementation ===
+# === Detailed AutoEncoder Implementation (from autoencoder.py) ===
 def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
 
@@ -942,14 +942,16 @@ class AutoEncoder(nn.Module):
 
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim=1024, output_dim=4096):
+    def __init__(self, input_dim=1024, intermediate_dim=4096, output_dim=4096):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, output_dim)
-        torch.nn.init.xavier_uniform_(self.linear.weight)
-        self.linear.bias.data.zero_()
+        self.linear1 = torch.nn.Linear(input_dim, intermediate_dim)
+        self.activation = torch.nn.GELU()
+        self.linear2 = torch.nn.Linear(intermediate_dim, output_dim)
 
     def forward(self, x):
-        return self.linear(x)
+        x = self.linear1(x)
+        x = self.activation(x)
+        return self.linear2(x)
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1023,13 +1025,13 @@ def cast_linear(module, dtype, name=''):
         child_full_name = f"{name}.{child_name}" if name else child_name
         if isinstance(child, nn.Linear):
             if any(keyword in child_full_name for keyword in KEEP_IN_HIGH_PRECISION):
-                continue
+                continue  # Skip casting for these layers
             else:
                 child.to(dtype)
         else:
             cast_linear(child, dtype, child_full_name)
 
-# === Inference Function ===
+# === Inference Function (Fixed) ===
 def denoise_cfg(
     model: Chroma,
     img: Tensor,
@@ -1041,11 +1043,12 @@ def denoise_cfg(
     txt_mask: Tensor,
     neg_txt_mask: Tensor,
     timesteps: list[float],
-    cfg: float,
+    cfg: float,       # Changed to float
     first_n_steps_wo_cfg: int,
     image_dim: Tuple[int, int]
 ) -> Tensor:
     logger.info("Starting denoising with CFG")
+    # Set guidance to zero as in training
     guidance_vec = torch.zeros((img.shape[0],), device=img.device, dtype=img.dtype)
     step_count = 0
     pbar = tqdm(total=len(timesteps)-1, desc="Denoising steps")
@@ -1103,8 +1106,10 @@ def inference_chroma(
             noise, shape = vae_flatten(noise)
             noise = noise.to(device)
             n, c, h, w = shape
+            # Corrected: use prepare_latent_image_ids for proper positional embeddings
             image_pos_id = prepare_latent_image_ids(t5_embed.shape[0], h, w).to(device)
 
+            # ADDED: Ensure all text-related tensors are on the same device as the model
             t5_embed = t5_embed.to(device)
             t5_embed_neg = t5_embed_neg.to(device)
             text_ids = text_ids.to(device)
@@ -1191,28 +1196,26 @@ def load_autoencoder(vae_file: str) -> AutoEncoder:
 def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
     logger.info(f"Loading Qwen3 model from {qwen3_folder}")
 
+    # Look for the model file
     model_file = os.path.join(qwen3_folder, "model.safetensors")
     if not os.path.exists(model_file):
         logger.error(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
         raise FileNotFoundError(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
 
-    # ========== Initialize or Load Projection Layer ==========
-    projection_path = os.path.join(DEFAULT_QWEN3_FOLDER, "projection_layer.safetensors")
-    if os.path.exists(projection_path):
-        print("Loading existing projection layer from", projection_path)
-        projection = ProjectionLayer(input_dim=1024, output_dim=4096)
-        state_dict = load_file(projection_path)
-        projection.load_state_dict(state_dict)
-    else:
-        print("Initializing new projection layer")
-        projection = ProjectionLayer(input_dim=1024, output_dim=4096)
+    # Look for the projection layer file
+    projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
+    if not os.path.exists(projection_file):
+        logger.error(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
+        raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
 
+    # Load tokenizer from the folder
     try:
         tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
     except Exception as e:
         logger.error(f"Failed to load tokenizer from {qwen3_folder}: {e}")
         raise
 
+    # Use flash attention for speed if available
     model = AutoModelForCausalLM.from_pretrained(
         qwen3_folder,
         torch_dtype=torch.bfloat16,
@@ -1222,26 +1225,37 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
     )
     model.eval()
 
-    projection.eval()
+    projection = ProjectionLayer(
+        input_dim=1024,
+        intermediate_dim=4096
+        output_dim=4096,
+    )
+    projection_state = load_file(projection_file)
+    projection.load_state_dict(projection_state)
     projection.to(model.device, dtype=torch.bfloat16)
+    projection.eval()
 
     return model, projection, tokenizer
 
 def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
     logger.info(f"Loading T5 model from {t5_folder}")
 
+    # Look for the model file
     model_file = os.path.join(t5_folder, "model.safetensors")
     if not os.path.exists(model_file):
         logger.error(f"Model file not found in {t5_folder}. Expected file: model.safetensors")
         raise FileNotFoundError(f"Model file not found in {t5_folder}. Expected file: model.safetensors")
 
+    # Look for the tokenizer file
     tokenizer_file = os.path.join(t5_folder, "tokenizer.json")
     if not os.path.exists(tokenizer_file):
         logger.error(f"Tokenizer file not found in {t5_folder}. Expected file: tokenizer")
         raise FileNotFoundError(f"Tokenizer file not found in {t5_folder}. Expected file: tokenizer")
 
+    # Load tokenizer
     tokenizer = T5Tokenizer.from_pretrained(t5_folder)
 
+    # Use flash attention for speed if available
     model = T5EncoderModel.from_pretrained(t5_folder)
     model.eval()
 
@@ -1282,10 +1296,13 @@ if __name__ == "__main__":
 
     logger.info("Parsing arguments complete")
 
+    # Choose text embedder based on flag
     if args.qwen:
         logger.info("Using Qwen3 for text embeddings")
+        # Load Qwen3 model and projection to CUDA first
         qwen3_model, projection, tokenizer = load_qwen3_model(args.qwen3_folder)
 
+        # Tokenize and create embeddings
         text_inputs = tokenizer(
             [args.positive_prompt],
             padding="max_length",
@@ -1308,7 +1325,7 @@ if __name__ == "__main__":
                 attention_mask=text_inputs["attention_mask"],
                 output_hidden_states=True
             )
-            qwen3_embed = output.hidden_states[-1]
+            qwen3_embed = output.hidden_states[-1]  # Last hidden state
 
         t5_embed = projection(qwen3_embed).to(qwen3_model.device)
 
@@ -1318,16 +1335,18 @@ if __name__ == "__main__":
                 attention_mask=text_inputs_neg["attention_mask"],
                 output_hidden_states=True
             )
-            qwen3_embed_neg = output_neg.hidden_states[-1]
+            qwen3_embed_neg = output_neg.hidden_states[-1]  # Last hidden state
 
         t5_embed_neg = projection(qwen3_embed_neg).to(qwen3_model.device)
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
     else:
-        logger.info("Using T5-xxl for text embeddings. Note: pass the --qwen flag for the Qwen3 model: python inference.py --qwen")
+        logger.info("Using T5-xxl for text embeddings")
+        # Load T5 model and tokenizer
         t5_model, tokenizer = load_t5_model(args.t5_folder)
 
+        # Tokenize and create embeddings
         text_inputs = tokenizer(
             [args.positive_prompt],
             padding="max_length",
@@ -1358,24 +1377,28 @@ if __name__ == "__main__":
         text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
 
+    # Clear text models from CUDA memory
     if 'qwen3_model' in locals():
         del qwen3_model, projection
     else:
         del t5_model
     torch.cuda.empty_cache()
 
+    # Load Chroma model with memory optimization
     model = load_chroma_model(args.chroma_file)
     if args.fp8:
         logger.info("Converting to FP8")
-        model = model.cpu()
+        model = model.cpu()  # Move to CPU for casting
         cast_linear(model, torch.float8_e4m3fn, '')
         model = model.to("cuda")
     else:
-        model = model.to("cuda")
+        model = model.to("cuda")  # Directly move to CUDA if not using FP8
 
+    # Load VAE model
     ae = load_autoencoder(args.vae_file)
     ae = ae.to("cuda")
 
+    # Run inference with precomputed embeddings
     images = inference_chroma(
         model,
         ae,
@@ -1394,7 +1417,7 @@ if __name__ == "__main__":
 
     # Adjust output filename if requested
     if APPEND_DATETIME:
-        current_time = datetime.datetime.now().strftime("%Y%m%d%M%S")
+        current_time = datetime.datetime.now().strftime("%Y%m%d%S")
         base_name = args.output_file
         output_filename = f"{base_name}_{current_time}.{args.format}"
     else:
