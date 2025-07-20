@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-v13"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
-DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'."
+DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_SEED = 42
 DEFAULT_STEPS = 30
@@ -1227,7 +1227,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
 
     projection = ProjectionLayer(
         input_dim=1024,
-        intermediate_dim=4096
+        intermediate_dim=4096,
         output_dim=4096,
     )
     projection_state = load_file(projection_file)
