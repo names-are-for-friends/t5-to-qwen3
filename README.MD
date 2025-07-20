@@ -13,7 +13,7 @@ Changes:
 - Replaced MSE with Huber for loss calculation, this should make us more resilient to outliers than using squared error;
 - Added cosine distance component to loss calculation to make our loss calculation more properly reflect the difference between the target vectors and the output vectors;
 - Added gradient accumulation to preserve VRAM;
-- Added ability to cache teacher embeddings to the disk so that T5-xxl weights don't need to be loaded during the training loop and on subsequent runs (on a slow hard-drive, this might be very slow, even with prefetching - my useless SMR drive doesn't stand a chance);
+- ~~Added ability to cache teacher embeddings to the disk so that T5-xxl weights don't need to be loaded during the training loop and on subsequent runs (on a slow hard-drive, this might be very slow, even with prefetching - my useless SMR drive doesn't stand a chance);~~ actually this is broken for now, don't touch it
 - Added a GeLU layer to the projection layer to non-linearly process the text embedder output, which will hopefully make the nuance of the projected embedding closer to the T5-xxl embedding; and
 - Added ability to use a separate dataset for evaluation to better test generalisation.
 
