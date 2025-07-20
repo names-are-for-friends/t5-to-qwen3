@@ -18,18 +18,25 @@ import threading
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/train_prompts.txt" # Format: one prompt per line of the txt file
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl/"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/Qwen3-Embedding-0.6B"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v1"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v2"
 
-USE_CACHED_EMBEDDINGS = True # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are stored in float32 and are around 8MB in size per, so expect around 800GB for a 100K prompt dataset, for example
+'''
+DO NOT TOUCH THE CACHING SETTINGS! THEY ARE BROKEN!
+YOUR TRAINING WILL BE A WASTE! YOU WILL BE A BIG LOSER!
+NEE-NAW-NEE-NAW... THIS IS THE SETTINGS POLICE.
+IT IS ILLEGAL TO USE CACHED EMBEDDINGS = TRUE
+YOU WILL BE ARRESTED FOREVER IF YOU DO THIS.
+'''
+USE_CACHED_EMBEDDINGS = False # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are stored in float32 and are around 8MB in size per, so expect around 800GB for a 100K prompt dataset, for example
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache" # This cache file will be kept and should be picked up on subsequent runs by referencing the dataset file name
-PREFETCH_LIMIT = 96 # Number of embeddings to prefetch in background
+PREFETCH_LIMIT = 32 # Number of embeddings to prefetch in background
 EMBEDDING_THREADS = 1 # Number of background threads for prefetching
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, pulls 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 EPOCHS = 1
 LEARNING_RATE = 2e-4
 GRAD_CLIP = 0.5
@@ -40,7 +47,7 @@ SAVE_BEST_MODEL = True
 PRINT_EVERY_X_BATCHES = 4
 GRAD_ACCUM_STEPS = 4 # Note: when taking this value as n, you will only see effective changes every n batches
 INTERMEDIATE_DIM = 4096 # The projection layer does linear projection to this dim, then processes non-linearly through GeLU; probably best as-is
-HYBRID_LAMBDA = 0.5 # We use Huber/cosine hybrid loss calculation: 1 = full cosine; 0 = full Huber. Optimal ratio needs investigation
+HYBRID_LAMBDA = 0.3 # We use Huber/cosine hybrid loss calculation: 1 = full cosine; 0 = full Huber. Optimal ratio needs investigation
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -293,7 +300,6 @@ projection.to(device, dtype=torch.bfloat16)
 hybrid_loss = HybridLoss(lambda_weight=HYBRID_LAMBDA).to(device)
 
 # ========== Dataset and Dataloader ==========
-print(f"Loading and pre-tokenizing dataset from {DATASET_PATH}...")
 train_dataset = PreTokenizedDataset(
     DATASET_PATH,
     student_tokenizer,
