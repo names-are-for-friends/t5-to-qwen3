@@ -54,6 +54,7 @@ You'll also want to install flash attention:
   pip install flash-attn --no-build-isolation
 
 Of course, you'll also want to download the models. Please note that the script expects BF16. For T5-xxl I recommend using the BF16 safetensors file listed here: https://huggingface.co/silveroxides/flan-t5-xxl-encoder-only/tree/main
+
 ---
 Now you can run either script, we hope. You'll want to set the correct paths in the scripts, and you can look at some other configuration options. The inference script uses T5-xxl by default, so pass the --qwen flag to use Qwen3; you can also cast the Chroma model down to FP8 with the --fp8 flag if you need to. The training script is set up for BF16; I used the BF16 flan-t5-xxl here: https://huggingface.co/silveroxides/flan-t5-xxl-encoder-only and the Qwen3 0.6B model: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B.
 
