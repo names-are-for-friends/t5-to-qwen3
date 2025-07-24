@@ -13,9 +13,9 @@ Updates:
 ---
 
 - Replaced MSE with Huber for loss calculation, this should make us more resilient to outliers than using squared error;
-- Added cosine distance component to loss calculation to make our loss calculation more properly reflect the difference between the target vectors and the output vectors;
+- Added optional cosine distance component to loss calculation to potentially make our loss calculation more properly reflect the difference between the target vectors and the output vectors;
 - Added gradient accumulation to preserve VRAM;
-- Added a GELU layer to the projection layer to non-linearly process the text embedder output, which will hopefully make the nuance of the projected embedding closer to the T5-xxl embedding; and
+- Added a GELU layer to the projection layer, which will hopefully make the nuance of the projected embedding closer to the T5-xxl embedding; and
 - Added ability to use a separate dataset for evaluation to better test generalisation.
 ---
 Installation:
