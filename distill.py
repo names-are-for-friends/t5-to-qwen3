@@ -16,28 +16,19 @@ import queue
 import threading
 
 # ========== Configuration ==========
-DATASET_PATH = "/mnt/f/q5_xxs_training_script/train_prompts.txt" # Format: one prompt per line of the txt file
-T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl/"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v2"
+DATASET_PATH = "/mnt/f/q5_xxs_training_script/500k_dataset.txt" # Format: one prompt per line of the txt file
+T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v6"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v7"
 
-'''
-DO NOT TOUCH THE CACHING SETTINGS! THEY ARE BROKEN!
-YOUR TRAINING WILL BE A WASTE! YOU WILL BE A BIG LOSER!
-NEE-NAW-NEE-NAW... THIS IS THE SETTINGS POLICE.
-IT IS ILLEGAL TO USE CACHED EMBEDDINGS = TRUE
-YOU WILL BE ARRESTED FOREVER IF YOU DO THIS.
-'''
-USE_CACHED_EMBEDDINGS = False # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are stored in float32 and are around 8MB in size per, so expect around 800GB for a 100K prompt dataset, for example
-CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache" # This cache file will be kept and should be picked up on subsequent runs by referencing the dataset file name
-PREFETCH_LIMIT = 32 # Number of embeddings to prefetch in background
-EMBEDDING_THREADS = 1 # Number of background threads for prefetching
+USE_CACHED_EMBEDDINGS = False # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are saved as bfloat16 and are around 4MB in size for each prompt in the dataset
+CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, pulls 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
 BATCH_SIZE = 16
-EPOCHS = 1
+EPOCHS = 3
 LEARNING_RATE = 2e-4
 GRAD_CLIP = 0.5
 MIN_LR = 2e-5
@@ -45,9 +36,9 @@ SAVE_EVERY_X_STEPS = 0
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
 PRINT_EVERY_X_BATCHES = 4
-GRAD_ACCUM_STEPS = 4 # Note: when taking this value as n, you will only see effective changes every n batches
-INTERMEDIATE_DIM = 4096 # The projection layer does linear projection to this dim, then processes non-linearly through GeLU; probably best as-is
-HYBRID_LAMBDA = 0.3 # We use Huber/cosine hybrid loss calculation: 1 = full cosine; 0 = full Huber. Optimal ratio needs investigation
+GRAD_ACCUM_STEPS = 4 # Note: when taking this value as n, you will only see effective changes every n batches, hence the matching print interval
+INTERMEDIATE_DIM = 4096 # The projection layer does linear projection to this dim, then processes through GELU; probably best as-is
+HYBRID_LOSS = 0.00 # Increasing this will add cosine loss: 1.0 = full cosine; 0.5 = fifty-fifty; 0.0 = full Huber
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -79,29 +70,19 @@ class PreTokenizedDataset(Dataset):
 
         if use_cached_embeddings:
             base_name = os.path.basename(file_path)
-            cache_filename = f"{base_name}.teacher_embeddings.npy"
-            cache_file = os.path.join(cache_path, cache_filename)
+            cache_folder = os.path.join(cache_path, base_name)
+            validation_file = os.path.join(cache_folder, f"{base_name}.validation")
 
-            if os.path.exists(cache_file):
-                print(f"Loading cached embeddings from {cache_file}")
-                num_samples = len(lines)
-                hidden_dim = teacher_model.config.hidden_size
-                self.teacher_embeddings = np.memmap(cache_file, dtype=np.float32, mode='r', shape=(num_samples, max_length, hidden_dim))
-                self.embedding_queue = queue.Queue(maxsize=PREFETCH_LIMIT)
-                self.stop_event = threading.Event()
-                self.prefetch_threads = []
-
-                for _ in range(EMBEDDING_THREADS):
-                    thread = threading.Thread(target=self.prefetch_embeddings)
-                    thread.daemon = True
-                    thread.start()
-                    self.prefetch_threads.append(thread)
+            if os.path.exists(validation_file):
+                print(f"Loading cached embeddings from folder {cache_folder}")
+                self.cache_folder = cache_folder
+                self.num_samples = len(lines)
+                self.hidden_dim = 4096
             else:
                 print(f"Generating and caching embeddings for {file_path}")
-                os.makedirs(cache_path, exist_ok=True)
-                num_samples = len(lines)
-                hidden_dim = teacher_model.config.hidden_size
-                memmap_array = np.memmap(cache_file, dtype=np.float32, mode='w+', shape=(num_samples, max_length, hidden_dim))
+                os.makedirs(cache_folder, exist_ok=True)
+                self.num_samples = len(lines)
+                self.hidden_dim = teacher_model.config.hidden_size
 
                 for i, line in enumerate(tqdm(lines, desc="Generating embeddings")):
                     teacher_inputs = teacher_tokenizer(
@@ -118,24 +99,15 @@ class PreTokenizedDataset(Dataset):
                             input_ids=input_ids.to(teacher_model.device),
                             attention_mask=att_mask.to(teacher_model.device)
                         )
-                        embeddings = outputs.last_hidden_state
-                        embeddings = embeddings.to(torch.float32)
+                        embeddings = outputs.last_hidden_state.cpu()
 
-                    emb_np = embeddings.cpu().numpy().astype(np.float32)
-                    memmap_array[i] = emb_np
+                    embedding_file = os.path.join(cache_folder, f"{i}.pt")
+                    torch.save(embeddings, embedding_file)
 
-                memmap_array.flush()
-                self.teacher_embeddings = np.memmap(cache_file, dtype=np.float32, mode='r', shape=(num_samples, max_length, hidden_dim))
-                print(f"Saved embeddings to {cache_file}")
-                self.embedding_queue = queue.Queue(maxsize=PREFETCH_LIMIT)
-                self.stop_event = threading.Event()
-                self.prefetch_threads = []
-
-                for _ in range(EMBEDDING_THREADS):
-                    thread = threading.Thread(target=self.prefetch_embeddings)
-                    thread.daemon = True
-                    thread.start()
-                    self.prefetch_threads.append(thread)
+                with open(validation_file, "w") as f:
+                    pass
+                print(f"Saved embeddings to folder {cache_folder}")
+                self.cache_folder = cache_folder
         else:
             self.teacher_input_ids = []
             self.teacher_attention_mask = []
@@ -153,36 +125,22 @@ class PreTokenizedDataset(Dataset):
             self.teacher_attention_mask = torch.tensor(self.teacher_attention_mask, dtype=torch.long)
 
         self.use_cached_embeddings = use_cached_embeddings
-
-    def prefetch_embeddings(self):
-        while not self.stop_event.is_set():
-            idx = random.randint(0, len(self.teacher_embeddings) - 1)
-            embedding = torch.from_numpy(np.array(self.teacher_embeddings[idx])).clone()
-            try:
-                self.embedding_queue.put_nowait((idx, embedding))
-            except queue.Full:
-                pass
+        self.prefetch_queue = queue.Queue(maxsize=1)
+        self.prefetch_thread = None
+        self.stop_thread = False
+        self.current_batch_idx = 0
 
     def __len__(self):
         return len(self.student_input_ids)
 
     def __getitem__(self, idx):
         if self.use_cached_embeddings:
-            for _ in range(3):  # Attempt up to 3 times
-                try:
-                    _, embedding = self.embedding_queue.get_nowait()
-                    return (
-                        self.student_input_ids[idx],
-                        self.student_attention_mask[idx],
-                        embedding
-                    )
-                except queue.Empty:
-                    pass
-            # Fallback to direct load if queue empty
+            embedding_file = os.path.join(self.cache_folder, f"{idx}.pt")
+            embeddings = torch.load(embedding_file)
             return (
                 self.student_input_ids[idx],
                 self.student_attention_mask[idx],
-                torch.from_numpy(np.array(self.teacher_embeddings[idx])).clone()
+                embeddings
             )
         else:
             return (
@@ -192,11 +150,44 @@ class PreTokenizedDataset(Dataset):
                 self.teacher_attention_mask[idx]
             )
 
-    def __del__(self):
-        if hasattr(self, 'stop_event'):
-            self.stop_event.set()
-            for thread in self.prefetch_threads:
-                thread.join()
+    def start_prefetching(self, batch_size):
+        if self.use_cached_embeddings:
+            self.prefetch_thread = threading.Thread(target=self._prefetch_batch, args=(batch_size,))
+            self.prefetch_thread.daemon = True
+            self.prefetch_thread.start()
+
+    def stop_prefetching(self):
+        self.stop_thread = True
+        if self.prefetch_thread:
+            self.prefetch_thread.join()
+
+    def _prefetch_batch(self, batch_size):
+        while not self.stop_thread:
+            start_idx = self.current_batch_idx
+            end_idx = min(start_idx + batch_size, len(self))
+            batch_indices = list(range(start_idx, end_idx))
+
+            embeddings = []
+            for idx in batch_indices:
+                embedding_file = os.path.join(self.cache_folder, f"{idx}.pt")
+                embeddings.append(torch.load(embedding_file))
+
+            s_input_ids = self.student_input_ids[batch_indices]
+            s_att_mask = self.student_attention_mask[batch_indices]
+            t_embeddings = torch.stack(embeddings)
+
+            try:
+                self.prefetch_queue.put((s_input_ids, s_att_mask, t_embeddings), timeout=0.1)
+            except queue.Full:
+                continue
+
+            self.current_batch_idx = end_idx
+            if self.current_batch_idx >= len(self):
+                self.current_batch_idx = 0
+
+    def get_prefetched_batch(self):
+        return self.prefetch_queue.get()
+
 
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
@@ -215,7 +206,7 @@ class ProjectionLayer(torch.nn.Module):
         x = self.activation(x)
         return self.linear2(x)
 
-# ========== Hybrid Loss Function ==========
+# ========== Loss Function ==========
 class HybridLoss(torch.nn.Module):
     def __init__(self, lambda_weight=0.5):
         super().__init__()
@@ -270,15 +261,15 @@ if not USE_CACHED_EMBEDDINGS:
     teacher_model.eval()
 else:
     base_name = os.path.basename(DATASET_PATH)
-    cache_filename = f"{base_name}.teacher_embeddings.safetensors"
-    cache_file = os.path.join(CACHE_PATH, cache_filename)
-    if not os.path.exists(cache_file):
+    cache_folder = os.path.join(CACHE_PATH, base_name)
+    validation_file = os.path.join(cache_folder, f"{base_name}.validation")
+    if not os.path.exists(validation_file):
         teacher_model = T5EncoderModel.from_pretrained(
         T5_MODEL_NAME,
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
-    teacher_model.eval()
+        teacher_model.eval()
 
 # ========== Initialize or Load Projection Layer ==========
 projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layer.safetensors")
@@ -297,7 +288,7 @@ else:
 
 projection.to(device, dtype=torch.bfloat16)
 
-hybrid_loss = HybridLoss(lambda_weight=HYBRID_LAMBDA).to(device)
+hybrid_loss = HybridLoss(lambda_weight=HYBRID_LOSS).to(device)
 
 # ========== Dataset and Dataloader ==========
 train_dataset = PreTokenizedDataset(
@@ -345,7 +336,7 @@ eval_dataloader = DataLoader(
 
 total_steps = EPOCHS * len(train_dataloader) // GRAD_ACCUM_STEPS
 
-# ========== Mixed Precision Training Setup ==========
+# ========== Training Setup ==========
 autocast_dtype = torch.bfloat16
 scaler = GradScaler(enabled=False)
 
@@ -361,21 +352,29 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     eta_min=MIN_LR,
 )
 
+# Start prefetching
+if USE_CACHED_EMBEDDINGS:
+    train_dataset.start_prefetching(BATCH_SIZE)
+    eval_dataset.start_prefetching(BATCH_SIZE)
+
 # ========== Training Loop ==========
 print("Starting training with mixed precision and gradient accumulation...")
 student_model.train()
 
 start_time = time.time()
+eval_delta_time = 0
 global_step = 0
 best_loss = float('inf')
 accumulation_step = 0
 
 for epoch in range(EPOCHS):
+
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(train_dataloader):
         if USE_CACHED_EMBEDDINGS:
-            s_input_ids, s_att_mask, t_embeddings = batch
+            # Use the prefetched batch
+            s_input_ids, s_att_mask, t_embeddings = train_dataset.get_prefetched_batch()
         else:
             s_input_ids, s_att_mask, t_input_ids, t_att_mask = batch
 
@@ -392,7 +391,7 @@ for epoch in range(EPOCHS):
             projected_student = projection(student_hidden)
 
         if USE_CACHED_EMBEDDINGS:
-            teacher_hidden = t_embeddings.to(device).to(torch.bfloat16)
+            teacher_hidden = t_embeddings.to(device).squeeze(1)
         else:
             with torch.no_grad():
                 t_input_ids = t_input_ids.to(device)
@@ -432,7 +431,7 @@ for epoch in range(EPOCHS):
                 save_file(projection_state, projection_path)
 
         if batch_idx % PRINT_EVERY_X_BATCHES == 0:
-            elapsed = time.time() - start_time
+            elapsed = time.time() - start_time - eval_delta_time
             remaining_batches = total_steps * GRAD_ACCUM_STEPS - (batch_idx + 1)
             eta = (elapsed / (batch_idx + 1)) * remaining_batches if batch_idx > 0 else 0
 
@@ -446,13 +445,14 @@ for epoch in range(EPOCHS):
             )
 
     if (epoch + 1) % EVAL_EVERY_EPOCHS == 0:
+        eval_start_time = time.time()
         student_model.eval()
         total_eval_loss = 0.0
         total_elements = 0
         with torch.no_grad():
-            for batch_idx, batch in tqdm(enumerate(eval_dataloader)):
+            for batch_idx, batch in enumerate(tqdm(eval_dataloader)):
                 if USE_CACHED_EMBEDDINGS:
-                    s_input_ids, s_att_mask, t_embeddings = batch
+                    s_input_ids, s_att_mask, t_embeddings = eval_dataset.get_prefetched_batch()
                 else:
                     s_input_ids, s_att_mask, t_input_ids, t_att_mask = batch
 
@@ -469,7 +469,7 @@ for epoch in range(EPOCHS):
                     projected_student = projection(student_hidden)
 
                 if USE_CACHED_EMBEDDINGS:
-                    teacher_hidden = t_embeddings.to(device)
+                    teacher_hidden = t_embeddings.to(device).squeeze(1)
                 else:
                     with torch.no_grad():
                         t_input_ids = t_input_ids.to(device)
@@ -500,7 +500,14 @@ for epoch in range(EPOCHS):
                 projection_path = os.path.join(best_model_dir, "projection_layer.safetensors")
                 save_file(projection_state, projection_path)
 
+        eval_end_time = time.time()
+        eval_delta_time += (eval_end_time - eval_start_time)
         student_model.train()
+
+# ========== Cleanup Prefetching Threads ==========
+if USE_CACHED_EMBEDDINGS:
+    train_dataset.stop_prefetching()
+    eval_dataset.stop_prefetching()
 
 # ========== Save Final Model ==========
 print(f"\nSaving final model to {OUTPUT_DIR}...")
