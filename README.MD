@@ -1,22 +1,15 @@
 These scripts were hacked together to provide support for using the Qwen3 Text Embedder model to produce text embeddings for inference with the Chroma image generation model, and for distillation training Qwen3 using T5-xxl as the teacher in order to produce text embeddings that more closely match those of the T5-xxl model. This was only tested on Arch Linux, using an Nvidia GPU, and the below instructions are written for this environment only.
 
 ---
-Updates:
+Latest Update:
 ---
-24/07/2025
----
-
-- Added caching for the teacher embeddings. They are stored in BFloat16 and are 4MB in size, so multiply that by your dataset prompt count to get the size on disc. 
-
----
-19/07/2025
+30/07/2025
 ---
 
-- Replaced MSE with Huber for loss calculation, this should make us more resilient to outliers than using squared error;
-- Added optional cosine distance component to loss calculation to potentially make our loss calculation more properly reflect the difference between the target vectors and the output vectors;
-- Added gradient accumulation to preserve VRAM;
-- Added a GELU layer to the projection layer, which will hopefully make the nuance of the projected embedding closer to the T5-xxl embedding; and
-- Added ability to use a separate dataset for evaluation to better test generalisation.
+- Adjusted the loss function. We now get much better results: for the first time I was able to get fully coherent images and stronger prompt comprehension from just a further hour training on the model we previously trained.
+
+- Requires creating a new dataset cache. Projection layer is unchanged though.
+
 ---
 Installation:
 ---
