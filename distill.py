@@ -18,11 +18,11 @@ import threading
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Format: one prompt per line of the txt file
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v1"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v2/checkpoint_step_6000"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v3/"
 
 USE_CACHED_EMBEDDINGS = True # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are saved as bfloat16 and are around 4MB in size for each prompt in the dataset
-CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
+CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache_test2" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, pulls 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
@@ -30,14 +30,15 @@ EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 BATCH_SIZE = 32
 EPOCHS = 1
 LEARNING_RATE = 2e-4
-GRAD_CLIP = 0.5
-MIN_LR = 2e-5
+GRAD_CLIP = 1.0
+MIN_LR = 5e-5
 SAVE_EVERY_X_STEPS = 1000
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
-PRINT_EVERY_X_BATCHES = 2
-GRAD_ACCUM_STEPS = 2
-HYBRID_LOSS = 0.50 # Increasing this will add cosine loss: 1.0 = full cosine; 0.0 = full Huber. Around 0.5 is good.
+PRINT_EVERY_X_BATCHES = 1
+GRAD_ACCUM_STEPS = 1
+HYBRID_LOSS = 0.50 # Increasing this will add cosine loss: 1.0 = full cosine; 0.0 = full Huber. Around 0.5 is good
+ADAPTIVE_LOSS_RATIO = True # Will shift the hybrid loss ratio gradually if the loss isn't balanced'
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -238,12 +239,14 @@ class SequenceLevelHybridLoss(torch.nn.Module):
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
     def forward(self, student_output, teacher_output, student_mask, teacher_mask):
-        # Ensure all inputs are in bfloat16
+        # Ensure all inputs are in bfloat16 and on the same device
+        device = student_output.device
         dtype = torch.bfloat16
+
         student_output = student_output.to(dtype)
         teacher_output = teacher_output.to(dtype)
-        student_mask = student_mask.to(dtype)
-        teacher_mask = teacher_mask.to(dtype)
+        student_mask = student_mask.to(dtype).to(device)
+        teacher_mask = teacher_mask.to(dtype).to(device)
 
         # Learn attention weights for pooling
         student_logits = self.student_pooler(student_output).squeeze(-1)
@@ -269,10 +272,13 @@ class SequenceLevelHybridLoss(torch.nn.Module):
         if self.dynamic_ratio:
             # Adjust lambda based on relative loss magnitudes
             loss_ratio = huber_loss / (cos_loss + 1e-8)
-            if loss_ratio > 2.0:  # Huber loss is dominating
-                self.current_lambda = min(0.9, self.current_lambda * (1 + (1 - self.lambda_decay)))
-            elif loss_ratio < 0.5:  # Cosine loss is dominating
-                self.current_lambda = max(0.1, self.current_lambda * self.lambda_decay)
+            adjustment_factor = 1.01  # Small adjustment factor
+
+            if loss_ratio > 2.0:  # Huber loss is dominating - increase cosine influence
+                self.current_lambda = min(0.9, self.current_lambda * adjustment_factor)
+            elif loss_ratio < 0.5:  # Cosine loss is dominating - decrease cosine influence
+                self.current_lambda = max(0.1, self.current_lambda / adjustment_factor)
+
 
         # Combine losses
         hybrid_loss = (1 - self.current_lambda) * huber_loss + self.current_lambda * cos_loss
@@ -342,8 +348,6 @@ else:
     projection = ProjectionLayer(input_dim=1024, intermediate_dim=4096, output_dim=4096)
 
 projection.to(device, dtype=torch.bfloat16)
-
-ADAPTIVE_LOSS_RATIO = False # Currently not properly implemented hence being placed here
 
 hybrid_loss = SequenceLevelHybridLoss(
     lambda_weight=HYBRID_LOSS,
@@ -510,7 +514,7 @@ for epoch in range(EPOCHS):
                     f"Step: {global_step}/{total_steps}, "
                     f"Hybrid Loss: {loss.item():.6f}, "
                     f"Huber Loss: {huber_loss.item():.6f}, "
-                    f"Cosine Loss: {cos_loss.item():.6f}, "
+                    f"Cos Loss: {cos_loss.item():.6f}, "
                     f"Grad Norm: {grad_norm:.6f}, "
                     f"Elapsed: {elapsed/60:.1f} min, "
                     f"ETA: {eta/60:.1f} min"
