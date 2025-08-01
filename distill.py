@@ -22,7 +22,7 @@ QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v2/checkpoint_ste
 OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v3/"
 
 USE_CACHED_EMBEDDINGS = True # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are saved as bfloat16 and are around 4MB in size for each prompt in the dataset
-CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache_test2" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
+CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, pulls 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
@@ -32,13 +32,19 @@ EPOCHS = 1
 LEARNING_RATE = 2e-4
 GRAD_CLIP = 1.0
 MIN_LR = 5e-5
-SAVE_EVERY_X_STEPS = 1000
+SAVE_EVERY_X_STEPS = 2000
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
 PRINT_EVERY_X_BATCHES = 1
 GRAD_ACCUM_STEPS = 1
 HYBRID_LOSS = 0.50 # Increasing this will add cosine loss: 1.0 = full cosine; 0.0 = full Huber. Around 0.5 is good
-ADAPTIVE_LOSS_RATIO = True # Will shift the hybrid loss ratio gradually if the loss isn't balanced'
+
+ADAPTIVE_LOSS_RATIO = True # Will shift the hybrid loss ratio gradually to account for unbalanced loss
+ADAPTIVE_LOSS_HUBER_THRESHOLD = 80.0 # If cosine loss if over n times the huber loss, then huber loss alignment is dominating
+ADAPTIVE_LOSS_COS_THRESHOLD = 40.0 # If cosine loss is under n times the huber loss, then cosine loss alignment is dominating
+ADAPTIVE_LOSS_RATIO_UPPER_BOUND = 0.8 # Highest bound of hybrid loss ratio scaling
+ADAPTIVE_LOSS_RATIO_LOWER_BOUND = 0.2 # Lowest bound of hybrid loss ratio scaling
+ADAPTIVE_LOSS_ADJUSTMENT_FACTOR = 0.005 # Adjustment addition/subtraction applied to hybrid loss when unbalanced loss
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -271,14 +277,17 @@ class SequenceLevelHybridLoss(torch.nn.Module):
         # Dynamic loss ratio adjustment
         if self.dynamic_ratio:
             # Adjust lambda based on relative loss magnitudes
-            loss_ratio = huber_loss / (cos_loss + 1e-8)
-            adjustment_factor = 1.01  # Small adjustment factor
+            loss_ratio = cos_loss / (huber_loss + 1e-8)
+            adjustment_factor = ADAPTIVE_LOSS_ADJUSTMENT_FACTOR  # Small adjustment factor
 
-            if loss_ratio > 2.0:  # Huber loss is dominating - increase cosine influence
-                self.current_lambda = min(0.9, self.current_lambda * adjustment_factor)
-            elif loss_ratio < 0.5:  # Cosine loss is dominating - decrease cosine influence
-                self.current_lambda = max(0.1, self.current_lambda / adjustment_factor)
-
+            if loss_ratio > ADAPTIVE_LOSS_HUBER_THRESHOLD:  # Huber loss is dominating - increase cosine influence
+                self.current_lambda = min(ADAPTIVE_LOSS_RATIO_UPPER_BOUND, self.current_lambda + adjustment_factor)
+            elif loss_ratio < ADAPTIVE_LOSS_COS_THRESHOLD: # Cosine loss is dominating - decrease cosine influence
+                self.current_lambda = max(ADAPTIVE_LOSS_RATIO_LOWER_BOUND, self.current_lambda - adjustment_factor)
+            elif loss_ratio > original_loss_ratio:
+                loss_ratio -= adjustment_factor
+            elif loss_ratio < original_loss_ratio:
+                loss_ratio += adjustment_factor
 
         # Combine losses
         hybrid_loss = (1 - self.current_lambda) * huber_loss + self.current_lambda * cos_loss
@@ -433,6 +442,7 @@ global_step = 0
 best_loss = float('inf')
 accumulation_step = 0
 grad_norm = 0
+original_loss_ratio = HYBRID_LOSS
 
 for epoch in range(EPOCHS):
 
@@ -515,6 +525,7 @@ for epoch in range(EPOCHS):
                     f"Hybrid Loss: {loss.item():.6f}, "
                     f"Huber Loss: {huber_loss.item():.6f}, "
                     f"Cos Loss: {cos_loss.item():.6f}, "
+                    f"Loss Ratio: {current_lambda:.3f}, "
                     f"Grad Norm: {grad_norm:.6f}, "
                     f"Elapsed: {elapsed/60:.1f} min, "
                     f"ETA: {eta/60:.1f} min"
