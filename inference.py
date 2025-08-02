@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/new-q5-xxs-v7/checkpoint_step_500"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v4/checkpoint_step_3000"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -575,7 +575,7 @@ class Chroma(Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
-    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor, attn_padding: int = 8) -> Tensor:
+    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor, attn_padding: int = 8, use_padding_modification: bool = False) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
@@ -606,10 +606,14 @@ class Chroma(Module):
 
         max_len = txt.shape[1]
         with torch.no_grad():
-            txt_mask_w_padding = modify_mask_to_attend_padding(
-                txt_mask, max_len, attn_padding
-            )
-            txt_mask_w_padding = txt_mask_w_padding.to(img.device)
+            if use_padding_modification:
+                txt_mask_w_padding = modify_mask_to_attend_padding(
+                    txt_mask, max_len, attn_padding
+                )
+                txt_mask_w_padding = txt_mask_w_padding.to(img.device)
+            else:
+                txt_mask_w_padding = txt_mask.to(img.device)
+
             txt_img_mask = torch.cat(
                 [
                     txt_mask_w_padding,
@@ -1043,9 +1047,10 @@ def denoise_cfg(
     txt_mask: Tensor,
     neg_txt_mask: Tensor,
     timesteps: list[float],
-    cfg: float,       # Changed to float
+    cfg: float,
     first_n_steps_wo_cfg: int,
-    image_dim: Tuple[int, int]
+    image_dim: Tuple[int, int],
+    use_t5: bool = False
 ) -> Tensor:
     logger.info("Starting denoising with CFG")
     # Set guidance to zero as in training
@@ -1058,13 +1063,13 @@ def denoise_cfg(
         step_size = t_curr - t_prev
 
         # Positive prediction (guidance=0)
-        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec)
+        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
 
         if step_count < first_n_steps_wo_cfg or first_n_steps_wo_cfg == -1:
             img = img - step_size * pred
         else:
             # Negative prediction (guidance=0)
-            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec)
+            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
             # CFG scaling by blending predictions
             pred_cfg = pred_neg + cfg * (pred - pred_neg)
             img = img - step_size * pred_cfg
@@ -1089,7 +1094,8 @@ def inference_chroma(
     steps: int,
     cfg: float,
     first_n_steps_wo_cfg: int,
-    image_dim: Tuple[int, int] = (512, 512)
+    image_dim: Tuple[int, int] = (512, 512),
+    use_t5: bool = False
 ) -> Tensor:
     logger.info("Starting inference")
     WIDTH = image_dim[0]
@@ -1134,7 +1140,8 @@ def inference_chroma(
                 timesteps,
                 CFG,
                 FIRST_N_STEPS_WITHOUT_CFG,
-                image_dim
+                image_dim,
+                use_t5
             )
 
             logger.info("Decoding latent image")
@@ -1291,13 +1298,54 @@ if __name__ == "__main__":
     parser.add_argument('--format', choices=['png', 'jpg'], default='png', help='Output format')
     parser.add_argument('--quality', type=int, default=95, help='JPEG quality')
     parser.add_argument('--fp8', action='store_true', help='Use FP8 for Chroma and T5')
-    parser.add_argument('--qwen', action='store_true', help='Use Qwen3 instead of T5 for text embeddings')
+    parser.add_argument('--t5', action='store_true', help='Use T5 instead of Qwen for text embeddings')
     args = parser.parse_args()
 
     logger.info("Parsing arguments complete")
 
+    if args.t5:
+        use_t5 = True
+    else:
+        use_t5 = False
+
     # Choose text embedder based on flag
-    if args.qwen:
+    if use_t5:
+        logger.info("Using T5-xxl for text embeddings")
+        # Load T5 model and tokenizer
+        t5_model, tokenizer = load_t5_model(args.t5_folder)
+
+        # Tokenize and create embeddings
+        text_inputs = tokenizer(
+            [args.positive_prompt],
+            padding="max_length",
+            max_length=args.max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).to(t5_model.device)
+
+        text_inputs_neg = tokenizer(
+            [args.negative_prompt],
+            padding="max_length",
+            max_length=args.max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).to(t5_model.device)
+
+        with torch.no_grad():
+            t5_embed = t5_model(
+                input_ids=text_inputs["input_ids"],
+                attention_mask=text_inputs["attention_mask"],
+            ).last_hidden_state
+
+            t5_embed_neg = t5_model(
+                input_ids=text_inputs_neg["input_ids"],
+                attention_mask=text_inputs_neg["attention_mask"],
+            ).last_hidden_state
+
+        text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
+        neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
+
+    else:
         logger.info("Using Qwen3 for text embeddings")
         # Load Qwen3 model and projection to CUDA first
         qwen3_model, projection, tokenizer = load_qwen3_model(args.qwen3_folder)
@@ -1341,41 +1389,6 @@ if __name__ == "__main__":
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
-    else:
-        logger.info("Using T5-xxl for text embeddings")
-        # Load T5 model and tokenizer
-        t5_model, tokenizer = load_t5_model(args.t5_folder)
-
-        # Tokenize and create embeddings
-        text_inputs = tokenizer(
-            [args.positive_prompt],
-            padding="max_length",
-            max_length=args.max_length,
-            truncation=True,
-            return_tensors="pt"
-        ).to(t5_model.device)
-
-        text_inputs_neg = tokenizer(
-            [args.negative_prompt],
-            padding="max_length",
-            max_length=args.max_length,
-            truncation=True,
-            return_tensors="pt"
-        ).to(t5_model.device)
-
-        with torch.no_grad():
-            t5_embed = t5_model(
-                input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
-            ).last_hidden_state
-
-            t5_embed_neg = t5_model(
-                input_ids=text_inputs_neg["input_ids"],
-                attention_mask=text_inputs_neg["attention_mask"],
-            ).last_hidden_state
-
-        text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
-        neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
 
     # Clear text models from CUDA memory
     if 'qwen3_model' in locals():
@@ -1412,7 +1425,8 @@ if __name__ == "__main__":
         args.steps,
         args.cfg,
         args.first_n_steps_wo_cfg,
-        tuple(args.output_resolution)
+        tuple(args.output_resolution),
+        use_t5
     )
 
     # Adjust output filename if requested
