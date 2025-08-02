@@ -18,8 +18,8 @@ import threading
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Format: one prompt per line of the txt file
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v2/checkpoint_step_6000"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v3/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v4/checkpoint_step_3000"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v5/"
 
 USE_CACHED_EMBEDDINGS = True # If you cache the embeddings, T5-xxl won't be loaded when training and we'll pull from the cache instead. Embeddings are saved as bfloat16 and are around 4MB in size for each prompt in the dataset
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # The cache files will be kept and should be picked up on subsequent runs by referencing the dataset base name
@@ -31,20 +31,21 @@ BATCH_SIZE = 32
 EPOCHS = 1
 LEARNING_RATE = 2e-4
 GRAD_CLIP = 1.0
-MIN_LR = 5e-5
-SAVE_EVERY_X_STEPS = 2000
+MIN_LR = 2e-5
+SAVE_EVERY_X_STEPS = 1000
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
-PRINT_EVERY_X_BATCHES = 1
-GRAD_ACCUM_STEPS = 1
-HYBRID_LOSS = 0.50 # Increasing this will add cosine loss: 1.0 = full cosine; 0.0 = full Huber. Around 0.5 is good
+PRINT_EVERY_X_BATCHES = 2
+GRAD_ACCUM_STEPS = 2
+HYBRID_LOSS = 0.40 # Increasing this will add cosine loss: 1.0 = full cosine; 0.0 = full Huber
 
-ADAPTIVE_LOSS_RATIO = True # Will shift the hybrid loss ratio gradually to account for unbalanced loss
-ADAPTIVE_LOSS_HUBER_THRESHOLD = 80.0 # If cosine loss if over n times the huber loss, then huber loss alignment is dominating
-ADAPTIVE_LOSS_COS_THRESHOLD = 40.0 # If cosine loss is under n times the huber loss, then cosine loss alignment is dominating
-ADAPTIVE_LOSS_RATIO_UPPER_BOUND = 0.8 # Highest bound of hybrid loss ratio scaling
-ADAPTIVE_LOSS_RATIO_LOWER_BOUND = 0.2 # Lowest bound of hybrid loss ratio scaling
+ADAPTIVE_LOSS_RATIO = False # Will shift the hybrid loss ratio gradually to account for unbalanced loss
+ADAPTIVE_LOSS_HUBER_THRESHOLD = 40.0 # If cosine loss if over n times the huber loss, then huber loss alignment is dominating
+ADAPTIVE_LOSS_COS_THRESHOLD = 25.0 # If cosine loss is under n times the huber loss, then cosine loss alignment is dominating
+ADAPTIVE_LOSS_RATIO_UPPER_BOUND = 0.80 # Highest bound of hybrid loss ratio scaling
+ADAPTIVE_LOSS_RATIO_LOWER_BOUND = 0.20 # Lowest bound of hybrid loss ratio scaling
 ADAPTIVE_LOSS_ADJUSTMENT_FACTOR = 0.005 # Adjustment addition/subtraction applied to hybrid loss when unbalanced loss
+# Adaptive loss ratio probably isn't very useful in testing. Cosine loss floors out before huber, so maybe just leave this off and use hybrid loss of ~0.3
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -254,6 +255,8 @@ class SequenceLevelHybridLoss(torch.nn.Module):
         student_mask = student_mask.to(dtype).to(device)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
+        teacher_mask = modify_mask_to_attend_padding(teacher_mask, teacher_mask.shape[1], 1)
+
         # Learn attention weights for pooling
         student_logits = self.student_pooler(student_output).squeeze(-1)
         teacher_logits = self.teacher_pooler(teacher_output).squeeze(-1)
@@ -284,10 +287,10 @@ class SequenceLevelHybridLoss(torch.nn.Module):
                 self.current_lambda = min(ADAPTIVE_LOSS_RATIO_UPPER_BOUND, self.current_lambda + adjustment_factor)
             elif loss_ratio < ADAPTIVE_LOSS_COS_THRESHOLD: # Cosine loss is dominating - decrease cosine influence
                 self.current_lambda = max(ADAPTIVE_LOSS_RATIO_LOWER_BOUND, self.current_lambda - adjustment_factor)
-            elif loss_ratio > original_loss_ratio:
-                loss_ratio -= adjustment_factor
-            elif loss_ratio < original_loss_ratio:
-                loss_ratio += adjustment_factor
+            elif self.current_lambda > original_loss_ratio:
+                self.current_lambda -= adjustment_factor
+            elif self.current_lambda < original_loss_ratio:
+                self.current_lambda += adjustment_factor
 
         # Combine losses
         hybrid_loss = (1 - self.current_lambda) * huber_loss + self.current_lambda * cos_loss
@@ -296,6 +299,39 @@ class SequenceLevelHybridLoss(torch.nn.Module):
 
     def get_current_lambda(self):
         return self.current_lambda
+
+# ========== T5 Mask Modification ==========
+def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=8):
+    """
+    Modifies attention mask to allow attention to a few extra padding tokens.
+
+    Args:
+        mask: Original attention mask (1 for tokens to attend to, 0 for masked tokens)
+        max_seq_length: Maximum sequence length of the model
+        num_extra_padding: Number of padding tokens to unmask
+
+    Returns:
+        Modified mask
+    """
+    # Get the actual sequence length from the mask
+    seq_length = mask.sum(dim=-1)
+    batch_size = mask.shape[0]
+
+    modified_mask = mask.clone()
+
+    for i in range(batch_size):
+        current_seq_len = int(seq_length[i].item())
+
+        # Only add extra padding tokens if there's room
+        if current_seq_len < max_seq_length:
+            # Calculate how many padding tokens we can unmask
+            available_padding = max_seq_length - current_seq_len
+            tokens_to_unmask = min(num_extra_padding, available_padding)
+
+            # Unmask the specified number of padding tokens right after the sequence
+            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
+
+    return modified_mask
 
 # ========== Load Qwen3 Model ==========
 print("Loading Qwen3 model...")
