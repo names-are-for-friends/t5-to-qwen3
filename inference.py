@@ -575,7 +575,7 @@ class Chroma(Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
-    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor, attn_padding: int = 8, use_padding_modification: bool = False) -> Tensor:
+    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor, attn_padding: int = 1, use_padding_modification: bool = False) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
