@@ -6,7 +6,6 @@ import random
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import GradScaler
 from transformers import T5TokenizerFast, T5EncoderModel
 from safetensors.torch import save_file, load_file
@@ -32,7 +31,7 @@ USE_SEPARATE_EVALUATION_DATASET = True # If disabled, we'll just use 10% of the 
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 '''
 Recommendation w/ Qwen3 0.6B:
-24GB VRAM: BATCH SIZE = 64, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
+24GB VRAM: BATCH SIZE = 64, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True -or- adjust BATCH SIZE = 32 and GRAD ACCUM > 1
 16GB VRAM: BATCH SIZE = 32, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
 12GB VRAM: BATCH SIZE = 16, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
 '''
@@ -40,9 +39,9 @@ BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1 # Accumulates the gradient across x batches before averaging to simulate larger batch size; does nothing when set to 1
 EPOCHS = 2
 LEARNING_RATE = 2e-4
-MIN_LR = 5e-5
+MIN_LR = 2e-5
 GRAD_CLIP = 1.0
-SAVE_EVERY_X_STEPS = 2000
+SAVE_EVERY_X_STEPS = 500
 PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
@@ -309,6 +308,39 @@ class PreTokenizedDataset(Dataset):
                 self.teacher_attention_mask[idx]
             )
 
+# ========== T5 Mask Modification ==========
+def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
+    """
+    Modifies attention mask to allow attention to a few extra padding tokens.
+
+    Args:
+        mask: Original attention mask (1 for tokens to attend to, 0 for masked tokens)
+        max_seq_length: Maximum sequence length of the model
+        num_extra_padding: Number of padding tokens to unmask
+
+    Returns:
+        Modified mask
+    """
+    # Get the actual sequence length from the mask
+    seq_length = mask.sum(dim=-1)
+    batch_size = mask.shape[0]
+
+    modified_mask = mask.clone()
+
+    for i in range(batch_size):
+        current_seq_len = int(seq_length[i].item())
+
+        # Only add extra padding tokens if there's room
+        if current_seq_len < max_seq_length:
+            # Calculate how many padding tokens we can unmask
+            available_padding = max_seq_length - current_seq_len
+            tokens_to_unmask = min(num_extra_padding, available_padding)
+
+            # Unmask the specified number of padding tokens right after the sequence
+            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
+
+    return modified_mask
+
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
     def __init__(self, input_dim=T5_EMBEDDING_DIM, intermediate_dim=4096, output_dim=4096):
@@ -316,6 +348,8 @@ class ProjectionLayer(torch.nn.Module):
         self.linear1 = torch.nn.Linear(input_dim, intermediate_dim)
         self.activation = torch.nn.GELU()
         self.linear2 = torch.nn.Linear(intermediate_dim, output_dim)
+
+        # Initialize properly
         torch.nn.init.kaiming_normal_(self.linear1.weight, nonlinearity='relu')
         torch.nn.init.kaiming_normal_(self.linear2.weight, nonlinearity='linear')
         self.linear1.bias.data.zero_()
@@ -355,16 +389,25 @@ class HybridLoss(torch.nn.Module):
         student_mask = student_mask.to(dtype).to(device)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
-        # Per-token losses
-        combined_mask = torch.min(student_mask, teacher_mask)
+        teacher_mask = modify_mask_to_attend_padding(
+            teacher_mask,
+            teacher_mask.shape[-1],
+            num_extra_padding=T5_ADDITIONAL_PADDING_ATTENTION
+        )
+
+        # Per-token losses using mask with smallest attention
+        if torch.sum(student_mask) <= torch.sum(teacher_mask):
+            min_mask = student_mask
+        else:
+            min_mask = teacher_mask
 
         per_token_huber_loss = self.huber(student_output, teacher_output)
         per_token_huber_loss = per_token_huber_loss.mean(dim=-1)
-        per_token_huber_loss = (per_token_huber_loss * combined_mask).sum(dim=-1) / (combined_mask.sum(dim=-1) + 1e-8)
+        per_token_huber_loss = (per_token_huber_loss * min_mask).sum(dim=-1) / (min_mask.sum(dim=-1) + 1e-8)
 
         per_token_cos_sim = self.cos(student_output, teacher_output)
         per_token_cos_loss = (1 - per_token_cos_sim)
-        per_token_cos_loss = (per_token_cos_loss * combined_mask).sum(dim=-1) / (combined_mask.sum(dim=-1) + 1e-8)
+        per_token_cos_loss = (per_token_cos_loss * min_mask).sum(dim=-1) / (min_mask.sum(dim=-1) + 1e-8)
 
         # Learn attention weights for sequence-level pooling
         student_logits = self.student_pooler(student_output).squeeze(-1)
@@ -386,7 +429,6 @@ class HybridLoss(torch.nn.Module):
         sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
         sequence_cos_loss = (1 - sequence_cos_sim).mean()
 
-        # Combine all losses
         total_loss = (
             self.per_token_huber_weight * per_token_huber_loss.mean() +
             self.sequence_huber_weight * sequence_huber_loss +
@@ -396,7 +438,7 @@ class HybridLoss(torch.nn.Module):
 
         return total_loss, per_token_huber_loss.mean(), sequence_huber_loss, per_token_cos_loss.mean(), sequence_cos_loss
 
-# ========== Miscellaneous Helpers ==========
+# ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
     model.eval()
     projection.eval()
@@ -441,7 +483,7 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, per_token_huber, sequence_huber, per_token_cos, sequence_cos = loss_fn(
+                loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss = hybrid_loss(
                     projected_student,
                     teacher_hidden,
                     s_att_mask,
@@ -483,6 +525,7 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
 
     return total_losses
 
+# ========== Miscellaneous Functions ==========
 def clip_gradients_individually(parameters, max_norm):
     total_norm = 0
     for p in parameters:
