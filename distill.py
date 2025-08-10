@@ -26,7 +26,7 @@ OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/"
 
 USE_CACHED_EMBEDDINGS = True # Embeddings are 4MB in size so multiply this by the dataset size for the total capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
-PREFETCH_FACTOR = 8
+PREFETCH_FACTOR = 32
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, we'll just use 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
@@ -38,16 +38,16 @@ Recommendation w/ Qwen3 0.6B:
 '''
 BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1 # Accumulates the gradient across x batches before averaging to simulate larger batch size; does nothing when set to 1
-EPOCHS = 1
+EPOCHS = 2
 LEARNING_RATE = 2e-4
-MIN_LR = 2e-5
+MIN_LR = 5e-5
 GRAD_CLIP = 1.0
-SAVE_EVERY_X_STEPS = 500
+SAVE_EVERY_X_STEPS = 2000
 PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-PER_TOKEN_HUBER_LOSS = 0.35 # Per-token huber loss is particularly important to match our projected Qwen3 embedding with the T5-xxl embedding given differing architecture & tokenization, but since it's one-to-one we can only compare with a uniform mask (obviously, the mask of the two, usually the Qwen3 mask)
+PER_TOKEN_HUBER_LOSS = 0.35 # Per-token huber loss is particularly important to match our projected Qwen3 embedding with the T5-xxl embedding given differing architecture & tokenization, but since it's one-to-one we can only compare with a uniform mask (obviously, the smaller mask of the two, usually the Qwen3 mask)
 SEQUENCE_HUBER_LOSS = 0.35 # Sequence-level loss provides a teacher-mask-to-student-mask alignment factor to the overall loss, hopefully keeping the total Qwen3 embedding aligned to the total T5-xxl embedding
 PER_TOKEN_COSINE_LOSS = 0.30 # Ditto for cosine loss, except this helps with directional alignment
 SEQUENCE_COSINE_LOSS = 0.30 # Looks lonely without a comment here
@@ -327,7 +327,7 @@ class ProjectionLayer(torch.nn.Module):
         return self.linear2(x)
 
 # ========== Loss Function ==========
-class ComprehensiveHybridLoss(torch.nn.Module):
+class HybridLoss(torch.nn.Module):
     def __init__(self, student_hidden_size=None, teacher_hidden_size=None,
                  per_token_huber_weight=0.35, sequence_huber_weight=0.35,
                  per_token_cosine_weight=0.30, sequence_cosine_weight=0.30):
@@ -356,13 +356,15 @@ class ComprehensiveHybridLoss(torch.nn.Module):
         teacher_mask = teacher_mask.to(dtype).to(device)
 
         # Per-token losses
+        combined_mask = torch.min(student_mask, teacher_mask)
+
         per_token_huber_loss = self.huber(student_output, teacher_output)
         per_token_huber_loss = per_token_huber_loss.mean(dim=-1)
-        per_token_huber_loss = (per_token_huber_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
+        per_token_huber_loss = (per_token_huber_loss * combined_mask).sum(dim=-1) / (combined_mask.sum(dim=-1) + 1e-8)
 
         per_token_cos_sim = self.cos(student_output, teacher_output)
         per_token_cos_loss = (1 - per_token_cos_sim)
-        per_token_cos_loss = (per_token_cos_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
+        per_token_cos_loss = (per_token_cos_loss * combined_mask).sum(dim=-1) / (combined_mask.sum(dim=-1) + 1e-8)
 
         # Learn attention weights for sequence-level pooling
         student_logits = self.student_pooler(student_output).squeeze(-1)
@@ -568,7 +570,7 @@ else:
 
 projection.to(device, dtype=torch.bfloat16)
 
-hybrid_loss = ComprehensiveHybridLoss(
+hybrid_loss = HybridLoss(
     student_hidden_size=4096,
     teacher_hidden_size=4096,
     per_token_huber_weight=PER_TOKEN_HUBER_LOSS,
@@ -715,7 +717,8 @@ for epoch in range(EPOCHS):
         scaler.scale(scaled_loss).backward()
         accumulation_step += 1
 
-        if accumulation_step % GRAD_ACCUM_STEPS == 0:
+        # Check if we've accumulated enough gradients or if this is the last batch
+        if accumulation_step % GRAD_ACCUM_STEPS == 0 or batch_idx == len(train_dataloader) - 1:
             grad_norm = clip_gradients_individually(
                 [p for p in student_model.parameters() if p.requires_grad] +
                 list(projection.parameters()) +
@@ -731,6 +734,7 @@ for epoch in range(EPOCHS):
 
             global_step += 1
             steps_completed_this_epoch += 1
+            accumulation_step = 0  # Reset accumulation step
 
             current_loss = loss.item()
             current_per_token_huber = per_token_huber_loss.item()
@@ -774,29 +778,13 @@ for epoch in range(EPOCHS):
                     f"ETA: {eta/60:.1f} min"
                 )
 
-            if global_step % 100 == 0:
+            if global_step % 100 == 0 or global_step == 1:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    if accumulation_step % GRAD_ACCUM_STEPS != 0:
-        grad_norm = clip_gradients_individually(
-            [p for p in student_model.parameters() if p.requires_grad] +
-            list(projection.parameters()) +
-            list(hybrid_loss.student_pooler.parameters()) +
-            list(hybrid_loss.teacher_pooler.parameters()),
-            max_norm=GRAD_CLIP
-        )
-
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-        optimizer.zero_grad()
-
-        global_step += 1
-        steps_completed_this_epoch += 1
-        accumulation_step = 0
-
     print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
+
+    total_steps = global_step
 
     if (epoch + 1) % EVAL_EVERY_EPOCHS == 0:
         eval_start_time = time.time()
