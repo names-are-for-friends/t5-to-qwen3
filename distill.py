@@ -58,7 +58,7 @@ SEQUENCE_COSINE_LOSS = 0.05 # Looks lonely without a comment here
 QWEN_EMBEDDING_DIM = 1024 # Change for the hidden size of the model/features of the embedding, eg. 0.6B is 1024, 1.7B is 2048. Check model's config.json if unsure
 T5_ADDITIONAL_PADDING_ATTENTION = 1 # Train to match the expectations of the target image gen model. Chroma = 1, most Flux variants = 3
 
-HYBRID_ATTENTION_LOSS = 0.0 # Training with the teacher mask vs the student mask has benefits and disadvantages for each in practice. Training with the teacher mask gave us good foreground prompt following, but the background was a nonsense pattern; training with the student mask, conversely, gave us a coherent background and foreground with somewhat worse prompt following, and massive colour abberation. By using a combination of both and adding attention expansion in the projection we aim to fix this. We calculate both losses and average them using this ratio: 0 = full student, 1 = full teacher
+HYBRID_ATTENTION_LOSS = 0.0 # Training with the teacher mask vs the student mask has benefits and disadvantages for each in practice. Training with the teacher mask gave us good foreground prompt following, but the background was a nonsense pattern; training with the student mask, conversely, gave us a coherent background and foreground with somewhat worse prompt following, and massive colour abberation. By using a combination of both we aim to fix this. We calculate both losses and average them using this ratio: 0 = full student, 1 = full teacher
 ENABLE_HYBRID_ATTENTION_SHIFT = True # Over the course of training, shifts the ratio towards the teacher mask. Ultimately we want to match with the teacher attention. We still start from whatever HYBRID_LOSS_ATTENTION is set to
 HYBRID_ATTENTION_SHIFT_REACHES_1_AT = 0.5 # At what percentage of the total step count should we be using solely teacher mask attention if we're using hybrid attention shift
 
@@ -390,18 +390,21 @@ class HybridLoss(torch.nn.Module):
             num_extra_padding=T5_ADDITIONAL_PADDING_ATTENTION
         )
 
-        # Blend masks based on teacher_mask_ratio
-        blended_mask = teacher_mask_ratio * teacher_mask + (1 - teacher_mask_ratio) * student_mask
-        final_mask = (blended_mask > 0.5).float()
-
-        # Per-token losses
         per_token_huber_loss = self.huber(student_output, teacher_output)
         per_token_huber_loss = per_token_huber_loss.mean(dim=-1)
-        per_token_huber_loss = (per_token_huber_loss * final_mask).sum(dim=-1) / (final_mask.sum(dim=-1) + 1e-8)
+
+        per_token_huber_loss_teacher = (per_token_huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        per_token_huber_loss_student = (per_token_huber_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
+
+        per_token_huber_loss = teacher_mask_ratio * per_token_huber_loss_teacher + (1 - teacher_mask_ratio) * per_token_huber_loss_student
 
         per_token_cos_sim = self.cos(student_output, teacher_output)
-        per_token_cos_loss = (1 - per_token_cos_sim)
-        per_token_cos_loss = (per_token_cos_loss * final_mask).sum(dim=-1) / (final_mask.sum(dim=-1) + 1e-8)
+        per_token_cos_loss = 1 - per_token_cos_sim
+
+        per_token_cos_loss_teacher = (per_token_cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        per_token_cos_loss_student = (per_token_cos_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
+
+        per_token_cos_loss = teacher_mask_ratio * per_token_cos_loss_teacher + (1 - teacher_mask_ratio) * per_token_cos_loss_student
 
         # Learn attention weights for sequence-level pooling
         student_logits = self.student_pooler(student_output).squeeze(-1)
@@ -422,12 +425,6 @@ class HybridLoss(torch.nn.Module):
         sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
         sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
         sequence_cos_loss = (1 - sequence_cos_sim).mean()
-
-        # Statistical alignment losses
-        student_mean = student_output.mean(dim=-1)
-        teacher_mean = teacher_output.mean(dim=-1)
-        student_std = student_output.std(dim=-1)
-        teacher_std = teacher_output.std(dim=-1)
 
         total_loss = (
             self.per_token_huber_weight * per_token_huber_loss.mean() +
