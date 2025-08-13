@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/final-q5-xxs-v4/checkpoint_step_3000"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/checkpoint_step_500/checkpoint_step_500"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -37,6 +37,9 @@ DEFAULT_CFG = 4
 DEFAULT_RESOLUTION = [512,512]
 DEFAULT_OUTPUT_FILE = "output/q5"
 APPEND_DATETIME = True
+
+T5_ADDITIONAL_PADDING_ATTENTION = 0 # Personally, I recommend setting this to 0
+USE_T5_MASK_WITH_QWEN = True # This will also enable the additional padding option. It's recommended to use the T5 mask with our trained model
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'img_in', 'txt_in', 'distilled_guidance_layer', 'final_layer']
 
@@ -192,7 +195,7 @@ def distribute_modulations(tensor: torch.Tensor, depth_single_blocks, depth_doub
 
     return block_dict
 
-def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=8):
+def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
     """
     Modifies attention mask to allow attention to a few extra padding tokens.
 
@@ -607,16 +610,13 @@ class Chroma(Module):
         max_len = txt.shape[1]
         with torch.no_grad():
             if use_padding_modification:
-                txt_mask_w_padding = modify_mask_to_attend_padding(
-                    txt_mask, max_len, attn_padding
+                txt_mask = modify_mask_to_attend_padding(
+                    txt_mask, max_len, T5_ADDITIONAL_PADDING_ATTENTION
                 )
-                txt_mask_w_padding = txt_mask_w_padding.to(img.device)
-            else:
-                txt_mask_w_padding = txt_mask.to(img.device)
-
+                txt_mask = txt_mask.to(img.device)
             txt_img_mask = torch.cat(
                 [
-                    txt_mask_w_padding,
+                    txt_mask,
                     torch.ones([img.shape[0], img_ids.shape[1]], device=txt_mask.device),
                 ],
                 dim=1,
@@ -946,16 +946,31 @@ class AutoEncoder(nn.Module):
 
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim=1024, intermediate_dim=4096, output_dim=4096):
+    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, num_layers=1):
         super().__init__()
-        self.linear1 = torch.nn.Linear(input_dim, intermediate_dim)
+        self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
+
+        transformer_layer = torch.nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True
+        )
+
+        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
+        self.upscale = torch.nn.Linear(transformer_dim, output_dim)
         self.activation = torch.nn.GELU()
-        self.linear2 = torch.nn.Linear(intermediate_dim, output_dim)
+        self.linear_out = torch.nn.Linear(output_dim, output_dim)
 
     def forward(self, x):
-        x = self.linear1(x)
+        x = self.linear_in(x)
+        x = self.transformer(x)
+        x = self.upscale(x)
         x = self.activation(x)
-        return self.linear2(x)
+        x = self.linear_out(x)
+        return x
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1050,7 +1065,7 @@ def denoise_cfg(
     cfg: float,
     first_n_steps_wo_cfg: int,
     image_dim: Tuple[int, int],
-    use_t5: bool = False
+    use_t5_padding: bool = False
 ) -> Tensor:
     logger.info("Starting denoising with CFG")
     # Set guidance to zero as in training
@@ -1063,13 +1078,13 @@ def denoise_cfg(
         step_size = t_curr - t_prev
 
         # Positive prediction (guidance=0)
-        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
+        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5_padding)
 
         if step_count < first_n_steps_wo_cfg or first_n_steps_wo_cfg == -1:
             img = img - step_size * pred
         else:
             # Negative prediction (guidance=0)
-            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
+            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5_padding)
             # CFG scaling by blending predictions
             pred_cfg = pred_neg + cfg * (pred - pred_neg)
             img = img - step_size * pred_cfg
@@ -1095,7 +1110,7 @@ def inference_chroma(
     cfg: float,
     first_n_steps_wo_cfg: int,
     image_dim: Tuple[int, int] = (512, 512),
-    use_t5: bool = False
+    use_t5_padding: bool = False
 ) -> Tensor:
     logger.info("Starting inference")
     WIDTH = image_dim[0]
@@ -1141,7 +1156,7 @@ def inference_chroma(
                 CFG,
                 FIRST_N_STEPS_WITHOUT_CFG,
                 image_dim,
-                use_t5
+                use_t5_padding
             )
 
             logger.info("Decoding latent image")
@@ -1201,7 +1216,7 @@ def load_autoencoder(vae_file: str) -> AutoEncoder:
     return ae
 
 def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
-    logger.info(f"Loading Qwen3 model from {qwen3_folder}")
+    logger.info(f"Loading Qwen3 model & projection layer from {qwen3_folder}")
 
     # Look for the model file
     model_file = os.path.join(qwen3_folder, "model.safetensors")
@@ -1215,7 +1230,6 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         logger.error(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
         raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
 
-    # Load tokenizer from the folder
     try:
         tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
     except Exception as e:
@@ -1234,7 +1248,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
 
     projection = ProjectionLayer(
         input_dim=1024,
-        intermediate_dim=4096,
+        transformer_dim=1024,
         output_dim=4096,
     )
     projection_state = load_file(projection_file)
@@ -1304,12 +1318,12 @@ if __name__ == "__main__":
     logger.info("Parsing arguments complete")
 
     if args.t5:
-        use_t5 = True
+        use_t5_padding = True
     else:
-        use_t5 = False
+        use_t5_padding = False
 
     # Choose text embedder based on flag
-    if use_t5:
+    if use_t5_padding:
         logger.info("Using T5-xxl for text embeddings")
         # Load T5 model and tokenizer
         t5_model, tokenizer = load_t5_model(args.t5_folder)
@@ -1331,13 +1345,16 @@ if __name__ == "__main__":
             return_tensors="pt"
         ).to(t5_model.device)
 
+        attention_mask = text_inputs["attention_mask"]
+        attention_mask_neg = text_inputs_neg["attention_mask"]
+
         with torch.no_grad():
-            t5_embed = t5_model(
+            embed = t5_model(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=text_inputs["attention_mask"],
             ).last_hidden_state
 
-            t5_embed_neg = t5_model(
+            embed_neg = t5_model(
                 input_ids=text_inputs_neg["input_ids"],
                 attention_mask=text_inputs_neg["attention_mask"],
             ).last_hidden_state
@@ -1367,25 +1384,51 @@ if __name__ == "__main__":
             return_tensors="pt"
         ).to(qwen3_model.device)
 
+        attention_mask = text_inputs["attention_mask"]
+        attention_mask_neg = text_inputs_neg["attention_mask"]
+
         with torch.no_grad():
             output = qwen3_model(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=text_inputs["attention_mask"],
                 output_hidden_states=True
             )
-            qwen3_embed = output.hidden_states[-1]  # Last hidden state
+            embed = output.hidden_states[-1]  # Last hidden state
 
-        t5_embed = projection(qwen3_embed).to(qwen3_model.device)
+        embed = projection(embed).to(qwen3_model.device)
 
         with torch.no_grad():
             output_neg = qwen3_model(
                 input_ids=text_inputs_neg["input_ids"],
-                attention_mask=text_inputs_neg["attention_mask"],
+                attention_mask_neg=attention_mask_neg,
                 output_hidden_states=True
             )
-            qwen3_embed_neg = output_neg.hidden_states[-1]  # Last hidden state
+            embed_neg = output_neg.hidden_states[-1]  # Last hidden state
 
-        t5_embed_neg = projection(qwen3_embed_neg).to(qwen3_model.device)
+        embed_neg = projection(embed_neg).to(qwen3_model.device)
+
+        if USE_T5_MASK_WITH_QWEN:
+            tokenizer_t5 = T5Tokenizer.from_pretrained(DEFAULT_T5_FOLDER)
+            text_inputs_t5 = tokenizer_t5(
+                [args.positive_prompt],
+                padding="max_length",
+                max_length=args.max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            text_inputs_neg_t5 = tokenizer_t5(
+                [args.negative_prompt],
+                padding="max_length",
+                max_length=args.max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            attention_mask = text_inputs_t5["attention_mask"]
+            attention_mask_neg = text_inputs_neg_t5["attention_mask"]
+
+            del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5
+
+            use_t5_padding = True
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
@@ -1415,23 +1458,23 @@ if __name__ == "__main__":
     images = inference_chroma(
         model,
         ae,
-        t5_embed,
-        t5_embed_neg,
+        embed,
+        embed_neg,
         text_ids,
         neg_text_ids,
-        text_inputs.attention_mask,
-        text_inputs_neg.attention_mask,
+        attention_mask,
+        attention_mask_neg,
         args.seed,
         args.steps,
         args.cfg,
         args.first_n_steps_wo_cfg,
         tuple(args.output_resolution),
-        use_t5
+        use_t5_padding
     )
 
     # Adjust output filename if requested
     if APPEND_DATETIME:
-        current_time = datetime.datetime.now().strftime("%Y%m%d%M%S")
+        current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         base_name = args.output_file
         output_filename = f"{base_name}_{current_time}.{args.format}"
     else:
