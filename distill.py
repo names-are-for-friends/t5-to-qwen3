@@ -67,7 +67,6 @@ class PrefetchDataLoader:
         self._exception = None
         self.restart_count = 0
         self.max_restarts = 5
-        self.iterator = None
 
     def __iter__(self):
         self.iterator = iter(self.dataloader)
@@ -96,13 +95,7 @@ class PrefetchDataLoader:
             if self.thread and self.thread.is_alive():
                 return self.__next__()
             else:
-                # Properly handle StopIteration
-                if self.iterator is not None:
-                    try:
-                        next(self.iterator)
-                    except StopIteration:
-                        pass
-                raise StopIteration
+                raise StopIteration()
         except Exception as e:
             self._exception = e
             raise e
