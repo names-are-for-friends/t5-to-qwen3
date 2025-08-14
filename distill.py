@@ -25,13 +25,13 @@ OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/"
 
 USE_CACHED_EMBEDDINGS = True # Embeddings are 4MB in size so multiply this by the dataset size for the total capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
-PREFETCH_FACTOR = 32
+PREFETCH_FACTOR = 16
 
 USE_SEPARATE_EVALUATION_DATASET = True # If disabled, we'll just use 10% of the main dataset, but using unseen data is a better test of generalisation
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 '''
 Recommendation w/ Qwen3 0.6B:
-24GB VRAM: BATCH SIZE = 64, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True -or- adjust BATCH SIZE = 32 and GRAD ACCUM > 1
+24GB VRAM: BATCH SIZE = 64, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
 16GB VRAM: BATCH SIZE = 32, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
 12GB VRAM: BATCH SIZE = 16, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
 '''
@@ -39,9 +39,9 @@ BATCH_SIZE = 64 # Increasing this stabilises training by averaging the gradient,
 GRAD_ACCUM_STEPS = 1 # Accumulates the gradient across x batches before averaging to simulate larger batch size; does nothing when set to 1
 EPOCHS = 1 # Number of runs over the full dataset
 LEARNING_RATE = 2e-4 # Rate of learning. Too low and you stunt the learning, too high and you make excessive gradients and blow up the weights
-MIN_LR = 5e-5 # Cosine scheduler reduces the learning rate towards this value over the run. This should help generalisation when using a sufficiently large dataset
-GRAD_CLIP = 1.0 # Gradients of excess size are clipped to avoid excessive gradients, which leads to mangled output and further gradient explosion. The displayed grad norm while training is the value before clipping; expect the earlier values to be in excess, but it should stabilise below 1 after a while
-SAVE_EVERY_X_STEPS = 2500 # Save the model every x steps. Note that 1 step = 1 batch * grad_accum_steps
+MIN_LR = 2e-5 # Cosine scheduler reduces the learning rate towards this value over the run. This should help generalisation when using a sufficiently large dataset
+GRAD_CLIP = 1.0 # Gradients of excess size are clipped to avoid excessive gradients, which leads to mangled output and further gradient explosion. The displayed grad norm while training is the value before clipping
+SAVE_EVERY_X_STEPS = 500 # Save the model every x steps. Note that 1 step = 1 batch * grad_accum_steps
 PRINT_EVERY_X_STEPS = 1 # Print logging every x steps. Note that 1 step = 1 batch * grad_accum_steps
 EVAL_EVERY_EPOCHS = 1 # Evaluate every x epochs. This uses the evaluation dataset to test how the model performs - preferably on unseen data, so use a separate evaluation dataset
 SAVE_BEST_MODEL = True # Enabling this makes sure that you always get the model with the highest evaluation score saved in a subfolder, in addition to the other saved models
@@ -50,17 +50,11 @@ Note that losses are calculated as percentages of the sum before being used
 Feel free to use any values so long as they are appropriately proportionate to each other;
 the learning rate won't get blown out by excessive values
 '''
-PER_TOKEN_HUBER_LOSS = 0.50 # Per-token huber loss is particularly important to match our projected Qwen3 embedding with the T5-xxl embedding given differing architecture & tokenization, but since it's one-to-one we can only compare with a uniform mask (the least attended of the two, usually the Qwen3 mask)
-SEQUENCE_HUBER_LOSS = 0.20 # Sequence-level loss provides a teacher-mask-to-student-mask alignment factor to the overall loss, hopefully keeping the total Qwen3 embedding aligned to the total T5-xxl embedding
-PER_TOKEN_COSINE_LOSS = 0.25 # Ditto for cosine loss, except this helps with directional alignment of vectors
-SEQUENCE_COSINE_LOSS = 0.05 # Looks lonely without a comment here
+HUBER_LOSS = 0.70 # Helps with magnitude alignment. We use the T5 mask for all losses since we're also using a transformer layer to project the Qwen3 embedding to match the length of the T5 output
+COSINE_LOSS = 0.30 # Helps with directional alignment
 
 QWEN_EMBEDDING_DIM = 1024 # Change for the hidden size of the model/features of the embedding, eg. 0.6B is 1024, 1.7B is 2048. Check model's config.json if unsure
-T5_ADDITIONAL_PADDING_ATTENTION = 1 # Train to match the expectations of the target image gen model. Chroma = 1, most Flux variants = 3
-
-HYBRID_ATTENTION_LOSS = 0.0 # Training with the teacher mask vs the student mask has benefits and disadvantages for each in practice. Training with the teacher mask gave us good foreground prompt following, but the background was a nonsense pattern; training with the student mask, conversely, gave us a coherent background and foreground with somewhat worse prompt following, and massive colour abberation. By using a combination of both we aim to fix this. We calculate both losses and average them using this ratio: 0 = full student, 1 = full teacher
-ENABLE_HYBRID_ATTENTION_SHIFT = True # Over the course of training, shifts the ratio towards the teacher mask. Ultimately we want to match with the teacher attention. We still start from whatever HYBRID_LOSS_ATTENTION is set to
-HYBRID_ATTENTION_SHIFT_REACHES_1_AT = 0.5 # At what percentage of the total step count should we be using solely teacher mask attention if we're using hybrid attention shift
+T5_ADDITIONAL_PADDING_ATTENTION = 0
 
 # ========== Custom Prefetch DataLoader ==========
 class PrefetchDataLoader:
@@ -71,28 +65,44 @@ class PrefetchDataLoader:
         self.thread = None
         self.stop_event = threading.Event()
         self._exception = None
+        self.restart_count = 0
+        self.max_restarts = 5
+        self.iterator = None
 
     def __iter__(self):
         self.iterator = iter(self.dataloader)
         self.stop_event.clear()
         self._exception = None
+        self.restart_count = 0
         self._start_prefetch()
         return self
 
     def __next__(self):
         if self.thread is None or not self.thread.is_alive():
-            self._start_prefetch()
+            if self._exception:
+                raise self._exception
+            else:
+                self._start_prefetch()
 
         try:
             if self._exception:
                 raise self._exception
 
-            batch = self.queue.get(timeout=30)
+            batch = self.queue.get(timeout=120)
             if isinstance(batch, Exception):
                 raise batch
             return batch
         except queue.Empty:
-            raise StopIteration()
+            if self.thread and self.thread.is_alive():
+                return self.__next__()
+            else:
+                # Properly handle StopIteration
+                if self.iterator is not None:
+                    try:
+                        next(self.iterator)
+                    except StopIteration:
+                        pass
+                raise StopIteration
         except Exception as e:
             self._exception = e
             raise e
@@ -140,6 +150,9 @@ class PrefetchDataLoader:
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self.thread.start()
+        self.restart_count += 1
+        if self.restart_count > self.max_restarts:
+            raise RuntimeError(f"Prefetch thread restarted too many times ({self.max_restarts})")
 
     def __len__(self):
         return len(self.dataloader)
@@ -318,9 +331,6 @@ class PreTokenizedDataset(Dataset):
 
 # ========== T5 Mask Modification ==========
 def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
-    """
-    Modifies attention mask to allow attention to a few extra padding tokens.
-    """
     seq_length = mask.sum(dim=-1)
     batch_size = mask.shape[0]
 
@@ -335,47 +345,46 @@ def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
 
     return modified_mask
 
-# ========== Projection Layer ==========
-class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim=1024, intermediate_dim=4096, output_dim=4096):
+# ========== Projection Layers ==========
+class ProjectionLayers(torch.nn.Module):
+    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=4096, num_layers=1):
         super().__init__()
-        self.linear1 = torch.nn.Linear(input_dim, intermediate_dim)
+        self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
+
+        transformer_layer = torch.nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=8,
+            dim_feedforward=dim_feedforward,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True
+        )
+
+        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
+        self.upscale = torch.nn.Linear(transformer_dim, output_dim)
         self.activation = torch.nn.GELU()
-        self.linear2 = torch.nn.Linear(intermediate_dim, output_dim)
-
-        torch.nn.init.kaiming_normal_(self.linear1.weight, nonlinearity='relu')
-        torch.nn.init.kaiming_normal_(self.linear2.weight, nonlinearity='linear')
-
-        self.linear1.bias.data.zero_()
-        self.linear2.bias.data.zero_()
+        self.linear_out = torch.nn.Linear(output_dim, output_dim)
 
     def forward(self, x):
-        x = self.linear1(x)
+        x = self.linear_in(x)
+        x = self.transformer(x)
+        x = self.upscale(x)
         x = self.activation(x)
-        x = self.linear2(x)
+        x = self.linear_out(x)
         return x
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
     def __init__(self, student_hidden_size=None, teacher_hidden_size=None,
-                 per_token_huber_weight=0.50, sequence_huber_weight=0.20,
-                 per_token_cosine_weight=0.25, sequence_cosine_weight=0.05):
+                 huber_weight=0.70, cosine_weight=0.30):
         super().__init__()
-        self.per_token_huber_weight = per_token_huber_weight
-        self.sequence_huber_weight = sequence_huber_weight
-        self.per_token_cosine_weight = per_token_cosine_weight
-        self.sequence_cosine_weight = sequence_cosine_weight
-
-        if student_hidden_size is not None and teacher_hidden_size is not None:
-            self.student_pooler = torch.nn.Linear(student_hidden_size, 1).to(torch.bfloat16)
-            self.teacher_pooler = torch.nn.Linear(teacher_hidden_size, 1).to(torch.bfloat16)
-        else:
-            raise ValueError("Hidden sizes must be specified for learnable pooling")
+        self.huber_weight = huber_weight
+        self.cosine_weight = cosine_weight
 
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
-    def forward(self, student_output, teacher_output, student_mask, teacher_mask, teacher_mask_ratio):
+    def forward(self, student_output, teacher_output, student_mask, teacher_mask):
         device = student_output.device
         dtype = torch.bfloat16
 
@@ -384,69 +393,31 @@ class HybridLoss(torch.nn.Module):
         student_mask = student_mask.to(dtype).to(device)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
-        teacher_mask = modify_mask_to_attend_padding(
-            teacher_mask,
-            teacher_mask.shape[-1],
-            num_extra_padding=T5_ADDITIONAL_PADDING_ATTENTION
-        )
+        huber_loss = self.huber(student_output, teacher_output)
+        huber_loss = huber_loss.mean(dim=-1)
+        huber_loss = (huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
 
-        per_token_huber_loss = self.huber(student_output, teacher_output)
-        per_token_huber_loss = per_token_huber_loss.mean(dim=-1)
-
-        per_token_huber_loss_teacher = (per_token_huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
-        per_token_huber_loss_student = (per_token_huber_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
-
-        per_token_huber_loss = teacher_mask_ratio * per_token_huber_loss_teacher + (1 - teacher_mask_ratio) * per_token_huber_loss_student
-
-        per_token_cos_sim = self.cos(student_output, teacher_output)
-        per_token_cos_loss = 1 - per_token_cos_sim
-
-        per_token_cos_loss_teacher = (per_token_cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
-        per_token_cos_loss_student = (per_token_cos_loss * student_mask).sum(dim=-1) / (student_mask.sum(dim=-1) + 1e-8)
-
-        per_token_cos_loss = teacher_mask_ratio * per_token_cos_loss_teacher + (1 - teacher_mask_ratio) * per_token_cos_loss_student
-
-        # Learn attention weights for sequence-level pooling
-        student_logits = self.student_pooler(student_output).squeeze(-1)
-        teacher_logits = self.teacher_pooler(teacher_output).squeeze(-1)
-
-        # Apply masks
-        student_logits = student_logits.masked_fill(~student_mask.bool(), -1e9)
-        teacher_logits = teacher_logits.masked_fill(~teacher_mask.bool(), -1e9)
-
-        student_weights = torch.softmax(student_logits, dim=1)
-        teacher_weights = torch.softmax(teacher_logits, dim=1)
-
-        # Weighted pooling
-        student_pooled = (student_output * student_weights.unsqueeze(-1)).sum(dim=1)
-        teacher_pooled = (teacher_output * teacher_weights.unsqueeze(-1)).sum(dim=1)
-
-        # Sequence-level losses
-        sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
-        sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
-        sequence_cos_loss = (1 - sequence_cos_sim).mean()
+        cos_sim = self.cos(student_output, teacher_output)
+        cos_loss = 1 - cos_sim
+        cos_loss = (cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
 
         total_loss = (
-            self.per_token_huber_weight * per_token_huber_loss.mean() +
-            self.sequence_huber_weight * sequence_huber_loss +
-            self.per_token_cosine_weight * per_token_cos_loss.mean() +
-            self.sequence_cosine_weight * sequence_cos_loss
+            self.huber_weight * huber_loss.mean() +
+            self.cosine_weight * cos_loss.mean()
         )
 
-        return total_loss, per_token_huber_loss.mean(), sequence_huber_loss, per_token_cos_loss.mean(), sequence_cos_loss
+        return total_loss, huber_loss.mean(), cos_loss.mean()
 
 # ========== Evaluation Function ==========
-def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype, teacher_mask_ratio=0.0):
+def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
     model.eval()
     projection.eval()
     loss_fn.eval()
 
     total_losses = {
         'total': 0.0,
-        'per_token_huber': 0.0,
-        'sequence_huber': 0.0,
-        'per_token_cos': 0.0,
-        'sequence_cos': 0.0
+        'huber': 0.0,
+        'cos': 0.0,
     }
 
     with torch.no_grad():
@@ -480,21 +451,18 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss = loss_fn(
+                loss, huber_loss, cos_loss= loss_fn(
                     projected_student,
                     teacher_hidden,
                     s_att_mask,
-                    t_att_mask,
-                    teacher_mask_ratio
+                    t_att_mask
                 )
 
                 total_losses['total'] += loss.item()
-                total_losses['per_token_huber'] += per_token_huber_loss.item()
-                total_losses['sequence_huber'] += sequence_huber_loss.item()
-                total_losses['per_token_cos'] += per_token_cos_loss.item()
-                total_losses['sequence_cos'] += sequence_cos_loss.item()
+                total_losses['huber'] += huber_loss.item()
+                total_losses['cos'] += cos_loss.item()
 
-                del loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss, projected_student, student_hidden, student_outputs
+                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
                 del s_input_ids, s_att_mask, t_att_mask, t_embeddings
@@ -549,6 +517,17 @@ def get_memory_usage():
         memory_mib.append(memory_used)
         return memory_mib
 
+def save_projection_config(projection_config_path):
+    projection_config = {
+        "input_dim": QWEN_EMBEDDING_DIM,
+        "transformer_dim": QWEN_EMBEDDING_DIM,
+        "output_dim": 4096,
+        "dim_feedforward": QWEN_EMBEDDING_DIM,
+        "num_layers": 1
+    }
+    with open(projection_config_path, "w") as f:
+        json.dump(projection_config, f)
+
 # ========== Load Qwen3 Model ==========
 print("Loading Qwen3 model...")
 student_model, student_tokenizer = FastLanguageModel.from_pretrained(
@@ -593,35 +572,48 @@ else:
     )
         teacher_model.eval()
 
-# ========== Initialize or Load Projection Layer ==========
-projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layer.safetensors")
+# ========== Initialize or Load Projection Layers ==========
+projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layers.safetensors")
 
 if os.path.exists(projection_path):
-    print("Loading existing projection layer from", projection_path)
+    print("Loading existing projection layers from", projection_path)
     try:
         state_dict = load_file(projection_path)
-        projection = ProjectionLayer(input_dim=QWEN_EMBEDDING_DIM, intermediate_dim=4096, output_dim=4096)
+        projection = ProjectionLayers(
+            input_dim=QWEN_EMBEDDING_DIM,
+            transformer_dim=QWEN_EMBEDDING_DIM,
+            dim_feedforward=QWEN_EMBEDDING_DIM,
+            output_dim=4096
+        )
         projection.load_state_dict(state_dict)
     except:
-        print("Incompatible projection layer detected. Initializing new projection layer")
-        projection = ProjectionLayer(input_dim=QWEN_EMBEDDING_DIM, intermediate_dim=4096, output_dim=4096)
+        print("Incompatible projection layers detected. Initializing new projection layers")
+        projection = ProjectionLayers(
+            input_dim=QWEN_EMBEDDING_DIM,
+            transformer_dim=QWEN_EMBEDDING_DIM,
+            dim_feedforward=QWEN_EMBEDDING_DIM,
+            output_dim=4096
+        )
 else:
-    print("Initializing projection layer")
-    projection = ProjectionLayer(input_dim=QWEN_EMBEDDING_DIM, intermediate_dim=4096, output_dim=4096)
+    print("Initializing projection layers")
+    projection = ProjectionLayers(
+        input_dim=QWEN_EMBEDDING_DIM,
+        transformer_dim=QWEN_EMBEDDING_DIM,
+        dim_feedforward=QWEN_EMBEDDING_DIM,
+        output_dim=4096
+    )
 
 projection.to(device, dtype=torch.bfloat16)
 
-losses = [PER_TOKEN_HUBER_LOSS, SEQUENCE_HUBER_LOSS, PER_TOKEN_COSINE_LOSS, SEQUENCE_COSINE_LOSS]
+losses = [HUBER_LOSS, COSINE_LOSS]
 sum_loss = sum(losses)
 normalized_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
     student_hidden_size=4096,
     teacher_hidden_size=4096,
-    per_token_huber_weight=normalized_losses[0],
-    sequence_huber_weight=normalized_losses[1],
-    per_token_cosine_weight=normalized_losses[2],
-    sequence_cosine_weight=normalized_losses[3]
+    huber_weight=normalized_losses[0],
+    cosine_weight=normalized_losses[1]
 ).to(device, dtype=torch.bfloat16)
 
 # ========== Dataset and Dataloader ==========
@@ -659,8 +651,8 @@ base_train_dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=True,
     pin_memory=True,
-    num_workers=min(4, os.cpu_count() - 1) if torch.cuda.is_available() else 0,
-    persistent_workers=True if torch.cuda.is_available() and min(4, os.cpu_count() - 1) > 0 else False
+    num_workers=0,
+    persistent_workers=False
 )
 
 base_eval_dataloader = DataLoader(
@@ -668,8 +660,8 @@ base_eval_dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=False,
     pin_memory=True,
-    num_workers=min(2, os.cpu_count() - 1) if torch.cuda.is_available() else 0,
-    persistent_workers=True if torch.cuda.is_available() and min(2, os.cpu_count() - 1) > 0 else False
+    num_workers=0,
+    persistent_workers=False
 )
 
 train_dataloader = PrefetchDataLoader(base_train_dataloader, prefetch_factor=PREFETCH_FACTOR)
@@ -681,9 +673,7 @@ scaler = GradScaler(enabled=False)
 
 optimizer = torch.optim.AdamW(
     [p for p in student_model.parameters() if p.requires_grad] +
-    list(projection.parameters()) +
-    list(hybrid_loss.student_pooler.parameters()) +
-    list(hybrid_loss.teacher_pooler.parameters()),
+    list(projection.parameters()),
     lr=LEARNING_RATE,
     betas=(0.9, 0.999),
     weight_decay=0.01,
@@ -710,12 +700,6 @@ global_step = 0
 best_loss = float('inf')
 accumulation_step = 0
 grad_norm = 0
-
-teacher_ratio = HYBRID_ATTENTION_LOSS
-if ENABLE_HYBRID_ATTENTION_SHIFT == True:
-    num_steps_to_full_teacher_attention_loss = total_steps * HYBRID_ATTENTION_SHIFT_REACHES_1_AT
-    ratio_difference_from_start_to_end = 1.0 - HYBRID_ATTENTION_LOSS
-    per_step_teacher_ratio_adjustment = ratio_difference_from_start_to_end / num_steps_to_full_teacher_attention_loss
 
 for epoch in range(EPOCHS):
     optimizer.zero_grad()
@@ -756,25 +740,27 @@ for epoch in range(EPOCHS):
                     teacher_hidden = teacher_outputs.last_hidden_state
                     teacher_hidden = teacher_hidden.to(device)
 
-            loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss = hybrid_loss(
+            t_att_mask = modify_mask_to_attend_padding(
+                t_att_mask,
+                t_att_mask.shape[-1],
+                num_extra_padding=T5_ADDITIONAL_PADDING_ATTENTION
+            )
+
+            loss, huber_loss, cos_loss = hybrid_loss(
                 projected_student,
                 teacher_hidden,
                 s_att_mask,
-                t_att_mask,
-                teacher_ratio
+                t_att_mask
             )
 
             scaled_loss = loss / GRAD_ACCUM_STEPS
             scaler.scale(scaled_loss).backward()
             accumulation_step += 1
 
-            # Check if we've accumulated enough gradients or if this is the last batch
             if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataloader) - 1:
                 grad_norm = clip_gradients_individually(
                     [p for p in student_model.parameters() if p.requires_grad] +
-                    list(projection.parameters()) +
-                    list(hybrid_loss.student_pooler.parameters()) +
-                    list(hybrid_loss.teacher_pooler.parameters()),
+                    list(projection.parameters()),
                     max_norm=GRAD_CLIP
                 )
 
@@ -788,13 +774,11 @@ for epoch in range(EPOCHS):
                 accumulation_step = 0
 
                 current_loss = loss.item()
-                current_per_token_huber = per_token_huber_loss.item()
-                current_sequence_huber = sequence_huber_loss.item()
-                current_per_token_cos = per_token_cos_loss.item()
-                current_sequence_cos = sequence_cos_loss.item()
+                current_huber = huber_loss.item()
+                current_cos = cos_loss.item()
 
                 del loss, scaled_loss, student_outputs, student_hidden, projected_student
-                del teacher_hidden, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss
+                del teacher_hidden, huber_loss, cos_loss
                 if 't_input_ids' in locals():
                     del t_input_ids, t_att_mask, teacher_outputs
 
@@ -802,10 +786,15 @@ for epoch in range(EPOCHS):
                     print(f"\nSaving checkpoint at step {global_step}")
                     save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
                     os.makedirs(save_path, exist_ok=True)
+
                     student_model.save_pretrained(save_path)
                     student_tokenizer.save_pretrained(save_path)
+
                     projection_state = projection.state_dict()
-                    projection_path = os.path.join(save_path, "projection_layer.safetensors")
+                    projection_path = os.path.join(save_path, "projection_layers.safetensors")
+                    projection_config_path = os.path.join(save_path, "projection_config.json")
+                    save_projection_config(projection_config_path)
+
                     save_file(projection_state, projection_path)
 
                 if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
@@ -819,32 +808,22 @@ for epoch in range(EPOCHS):
                         f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
                         f"Step: {global_step}/{total_steps}, "
                         f"Total Loss: {current_loss:.6f}, "
-                        f"Per-Token Huber: {current_per_token_huber:.6f}, "
-                        f"Sequence Huber: {current_sequence_huber:.6f}, "
-                        f"Per-Token Cosine: {current_per_token_cos:.6f}, "
-                        f"Sequence Cosine: {current_sequence_cos:.6f}, "
-                        f"Mask Ratio: {teacher_ratio:.2f}, "
+                        f"Huber Loss: {current_huber:.6f}, "
+                        f"Cosine Loss: {current_cos:.6f}, "
                         f"Grad Norm: {grad_norm:.6f}, "
                         f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
                         f"Elapsed: {elapsed/60:.1f} min, "
                         f"ETA: {eta/60:.1f} min"
                     )
 
-                if ENABLE_HYBRID_ATTENTION_SHIFT == True:
-                    # Calculate teacher mask ratio
-                    teacher_ratio += per_step_teacher_ratio_adjustment
-                    teacher_ratio = min(1.0, teacher_ratio)
-
                 if global_step % 100 == 0 or global_step == 1:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-            # Clean up variables after each batch
             del s_input_ids, s_att_mask, t_att_mask, t_embeddings
 
         except Exception as e:
             print(f"Error in batch {batch_idx}: {e}")
-            # Clean up variables to prevent memory issues
             if 'loss' in locals():
                 del loss
             if 'scaled_loss' in locals():
@@ -857,14 +836,10 @@ for epoch in range(EPOCHS):
                 del projected_student
             if 'teacher_hidden' in locals():
                 del teacher_hidden
-            if 'per_token_huber_loss' in locals():
-                del per_token_huber_loss
-            if 'sequence_huber_loss' in locals():
-                del sequence_huber_loss
-            if 'per_token_cos_loss' in locals():
-                del per_token_cos_loss
-            if 'sequence_cos_loss' in locals():
-                del sequence_cos_loss
+            if 'huber_loss' in locals():
+                del huber_loss
+            if 'cos_loss' in locals():
+                del cos_loss
             if 't_input_ids' in locals():
                 del t_input_ids, t_att_mask, teacher_outputs
             del s_input_ids, s_att_mask, t_att_mask, t_embeddings
@@ -879,33 +854,38 @@ for epoch in range(EPOCHS):
         eval_start_time = time.time()
 
         eval_metrics = evaluate_model(
-            student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype, teacher_ratio
+            student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype
         )
 
         avg_eval_loss = eval_metrics['total']
         print(f"\n[Validation] Epoch {epoch + 1}")
         print(f"  Average Total Loss: {avg_eval_loss:.6f}")
-        print(f"  Per-Token Huber Loss: {eval_metrics['per_token_huber']:.6f}")
-        print(f"  Sequence Huber Loss: {eval_metrics['sequence_huber']:.6f}")
-        print(f"  Per-Token Cosine Loss: {eval_metrics['per_token_cos']:.6f}")
-        print(f"  Sequence Cosine Loss: {eval_metrics['sequence_cos']:.6f}")
+        print(f"  Huber Loss: {eval_metrics['huber']:.6f}")
+        print(f"  Cosine Loss: {eval_metrics['cos']:.6f}")
 
         if SAVE_BEST_MODEL and avg_eval_loss < best_loss:
             best_loss = avg_eval_loss
             print(f"\n✅ New best model at loss {best_loss:.6f}, saving...")
             best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
             os.makedirs(best_model_dir, exist_ok=True)
+
             student_model.save_pretrained(best_model_dir)
             student_tokenizer.save_pretrained(best_model_dir)
+
             projection_state = projection.state_dict()
-            projection_path = os.path.join(best_model_dir, "projection_layer.safetensors")
+            projection_path = os.path.join(best_model_dir, "projection_layers.safetensors")
+            projection_config_path = os.path.join(best_model_dir, "projection_config.json")
+            save_projection_config(projection_config_path)
+
             save_file(projection_state, projection_path)
+
 
         eval_end_time = time.time()
         eval_delta_time += (eval_end_time - eval_start_time)
         student_model.train()
 
-# Clean up prefetch loaders
+
+
 train_dataloader.close()
 eval_dataloader.close()
 
@@ -917,18 +897,11 @@ student_model.save_pretrained(OUTPUT_DIR)
 student_tokenizer.save_pretrained(OUTPUT_DIR)
 
 projection_state = projection.state_dict()
-projection_path = os.path.join(OUTPUT_DIR, "projection_layer.safetensors")
-save_file(projection_state, projection_path)
-
-projection_config = {
-    "input_dim": QWEN_EMBEDDING_DIM,
-    "intermediate_dim": 4096,
-    "output_dim": 4096,
-    "dtype": "bfloat16",
-}
+projection_path = os.path.join(OUTPUT_DIR, "projection_layers.safetensors")
 projection_config_path = os.path.join(OUTPUT_DIR, "projection_config.json")
-with open(projection_config_path, "w") as f:
-    json.dump(projection_config, f)
+save_projection_config(projection_config_path)
+
+save_file(projection_state, projection_path)
 
 torch.cuda.synchronize()
 torch.cuda.empty_cache()
