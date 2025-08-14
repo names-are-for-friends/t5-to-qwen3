@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/checkpoint_step_500/checkpoint_step_500"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/checkpoint_step_500/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -38,8 +38,8 @@ DEFAULT_RESOLUTION = [512,512]
 DEFAULT_OUTPUT_FILE = "output/q5"
 APPEND_DATETIME = True
 
-T5_ADDITIONAL_PADDING_ATTENTION = 0 # Personally, I recommend setting this to 0
-USE_T5_MASK_WITH_QWEN = True # This will also enable the additional padding option. It's recommended to use the T5 mask with our trained model
+T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount. Personally, I recommend setting this to 0 for inference
+USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'img_in', 'txt_in', 'distilled_guidance_layer', 'final_layer']
 
@@ -944,16 +944,16 @@ class AutoEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
 
-# ========== Projection Layer ==========
-class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, num_layers=1):
+# ========== Projection Layers ==========
+class ProjectionLayers(torch.nn.Module):
+    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=4096, num_layers=1):
         super().__init__()
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
 
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=transformer_dim,
             nhead=8,
-            dim_feedforward=1024,
+            dim_feedforward=dim_feedforward,
             dropout=0.0,
             activation='gelu',
             batch_first=True
@@ -1216,7 +1216,7 @@ def load_autoencoder(vae_file: str) -> AutoEncoder:
     return ae
 
 def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
-    logger.info(f"Loading Qwen3 model & projection layer from {qwen3_folder}")
+    logger.info(f"Loading Qwen3 model & projection layers from {qwen3_folder}")
 
     # Look for the model file
     model_file = os.path.join(qwen3_folder, "model.safetensors")
@@ -1224,11 +1224,11 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         logger.error(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
         raise FileNotFoundError(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
 
-    # Look for the projection layer file
-    projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
+    # Look for the projection layers file
+    projection_file = os.path.join(qwen3_folder, "projection_layers.safetensors")
     if not os.path.exists(projection_file):
-        logger.error(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
-        raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
+        logger.error(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layers.safetensors")
+        raise FileNotFoundError(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layers.safetensors")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
@@ -1246,10 +1246,16 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
     )
     model.eval()
 
-    projection = ProjectionLayer(
-        input_dim=1024,
-        transformer_dim=1024,
-        output_dim=4096,
+    projection_config_path = os.path.join(DEFAULT_QWEN3_FOLDER, "projection_config.json")
+    with open(projection_config_path, 'r') as file:
+        projection_config = json.load(file)
+
+    projection = ProjectionLayers(
+        input_dim=projection_config["input_dim"],
+        transformer_dim=projection_config["transformer_dim"],
+        output_dim=projection_config["output_dim"],
+        dim_feedforward=projection_config["dim_feedforward"],
+        num_layers=projection_config["num_layers"]
     )
     projection_state = load_file(projection_file)
     projection.load_state_dict(projection_state)
@@ -1298,7 +1304,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Chroma Inference Script')
     parser.add_argument('--chroma_file', type=str, default=DEFAULT_CHROMA_FILE, help='Path to Chroma model file')
     parser.add_argument('--vae_file', type=str, default=DEFAULT_VAE_FILE, help='Path to VAE model file')
-    parser.add_argument('--qwen3_folder', type=str, default=DEFAULT_QWEN3_FOLDER, help='Path to Qwen3 folder containing model, tokenizer, and projection layer')
+    parser.add_argument('--qwen3_folder', type=str, default=DEFAULT_QWEN3_FOLDER, help='Path to Qwen3 folder containing model, tokenizer, and projection layers')
     parser.add_argument('--t5_folder', type=str, default=DEFAULT_T5_FOLDER, help='Path to T5 folder containing model and tokenizer')
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed')
     parser.add_argument('--steps', type=int, default=DEFAULT_STEPS, help='Number of inference steps')
