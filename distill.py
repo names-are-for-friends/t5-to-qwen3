@@ -6,7 +6,7 @@ import random
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from transformers import T5TokenizerFast, T5EncoderModel
 from safetensors.torch import save_file, load_file
 import numpy as np
@@ -38,7 +38,7 @@ Recommendation w/ Qwen3 0.6B:
 BATCH_SIZE = 64 # Increasing this stabilises training by averaging the gradient, reducing the influence of outliers, but increases VRAM use and could somewhat inhibit useful learning from outliers. Generally we use as high as possible for VRAM budget
 GRAD_ACCUM_STEPS = 1 # Accumulates the gradient across x batches before averaging to simulate larger batch size; does nothing when set to 1
 EPOCHS = 1 # Number of runs over the full dataset
-LEARNING_RATE = 2e-4 # Rate of learning. Too low and you stunt the learning, too high and you make excessive gradients and blow up the weights
+LEARNING_RATE = 2e-4 # Too low and you stunt the learning, too high and you make excessive gradients and blow up the weights
 MIN_LR = 2e-5 # Cosine scheduler reduces the learning rate towards this value over the run. This should help generalisation when using a sufficiently large dataset
 GRAD_CLIP = 1.0 # Gradients of excess size are clipped to avoid excessive gradients, which leads to mangled output and further gradient explosion. The displayed grad norm while training is the value before clipping
 SAVE_EVERY_X_STEPS = 500 # Save the model every x steps. Note that 1 step = 1 batch * grad_accum_steps
@@ -46,7 +46,7 @@ PRINT_EVERY_X_STEPS = 1 # Print logging every x steps. Note that 1 step = 1 batc
 EVAL_EVERY_EPOCHS = 1 # Evaluate every x epochs. This uses the evaluation dataset to test how the model performs - preferably on unseen data, so use a separate evaluation dataset
 SAVE_BEST_MODEL = True # Enabling this makes sure that you always get the model with the highest evaluation score saved in a subfolder, in addition to the other saved models
 '''
-Note that losses are calculated as percentages of the sum before being used
+Note that losses are calculated as percentages of their sum before being used
 Feel free to use any values so long as they are appropriately proportionate to each other;
 the learning rate won't get blown out by excessive values
 '''
@@ -54,128 +54,7 @@ HUBER_LOSS = 0.70 # Helps with magnitude alignment. We use the T5 mask for all l
 COSINE_LOSS = 0.30 # Helps with directional alignment
 
 QWEN_EMBEDDING_DIM = 1024 # Change for the hidden size of the model/features of the embedding, eg. 0.6B is 1024, 1.7B is 2048. Check model's config.json if unsure
-T5_ADDITIONAL_PADDING_ATTENTION = 0
-
-# ========== Custom Prefetch DataLoader ==========
-class PrefetchDataLoader:
-    def __init__(self, dataloader, prefetch_factor=3):
-        self.dataloader = dataloader
-        self.prefetch_factor = prefetch_factor
-        self.queue = queue.Queue(maxsize=prefetch_factor)
-        self.thread = None
-        self.stop_event = threading.Event()
-        self._exception = None
-        self.restart_count = 0
-        self.max_restarts = 5
-
-    def __iter__(self):
-        self.iterator = iter(self.dataloader)
-        self.stop_event.clear()
-        self._exception = None
-        self.restart_count = 0
-        self._start_prefetch()
-        return self
-
-    def __next__(self):
-        if self.thread is None or not self.thread.is_alive():
-            if self._exception:
-                raise self._exception
-            else:
-                self._start_prefetch()
-
-        try:
-            if self._exception:
-                raise self._exception
-
-            batch = self.queue.get(timeout=120)
-            if isinstance(batch, Exception):
-                raise batch
-            return batch
-        except queue.Empty:
-            if self.thread and self.thread.is_alive():
-                return self.__next__()
-            else:
-                raise StopIteration()
-        except Exception as e:
-            self._exception = e
-            raise e
-
-    def _prefetch_worker(self):
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    batch = next(self.iterator)
-                    if isinstance(batch, tuple):
-                        cleaned_batch = []
-                        for item in batch:
-                            if hasattr(item, 'detach'):
-                                cleaned_item = item.detach()
-                                cleaned_batch.append(cleaned_item)
-                            else:
-                                cleaned_batch.append(item)
-                        batch = tuple(cleaned_batch)
-                    try:
-                        self.queue.put(batch, block=False)
-                    except queue.Full:
-                        del batch
-                        continue
-
-                except StopIteration:
-                    break
-                except Exception as e:
-                    try:
-                        self.queue.put(e, block=False)
-                    except queue.Full:
-                        pass
-                    break
-        except Exception as e:
-            self._exception = e
-            try:
-                self.queue.put(e, block=False)
-            except queue.Full:
-                pass
-
-    def _start_prefetch(self):
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
-            self.thread.join(timeout=1)
-
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self.thread.start()
-        self.restart_count += 1
-        if self.restart_count > self.max_restarts:
-            raise RuntimeError(f"Prefetch thread restarted too many times ({self.max_restarts})")
-
-    def __len__(self):
-        return len(self.dataloader)
-
-    def close(self):
-        self.stop_event.set()
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2)
-
-        while not self.queue.empty():
-            try:
-                item = self.queue.get_nowait()
-                if hasattr(item, 'delete') or hasattr(item, 'cpu'):
-                    del item
-            except:
-                break
-
-    def __del__(self):
-        self.close()
-        try:
-            while True:
-                self.queue.get_nowait()
-        except:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+T5_ADDITIONAL_PADDING_ATTENTION = 1 # Setting this to zero will have poor results. For Chroma, this is good at 1
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -322,6 +201,49 @@ class PreTokenizedDataset(Dataset):
                 self.teacher_attention_mask[idx]
             )
 
+# ========== Prefetching Dataloader ==========
+class PrefetchDataLoader:
+    def __init__(self, data_loader, prefetch_factor):
+        self.data_loader = data_loader
+        self.prefetch_factor = prefetch_factor
+        self.queue = queue.Queue(maxsize=prefetch_factor)
+        self.thread = None
+        self.stopped = False
+
+    def start_prefetch(self):
+        self.thread = threading.Thread(target=self._prefetch, daemon=True)
+        self.thread.start()
+
+    def _prefetch(self):
+        for batch in self.data_loader:
+            if self.stopped:
+                break
+            self.queue.put(batch)
+        self.queue.put(None)
+
+    def __iter__(self):
+        self.stopped = False
+        self.start_prefetch()
+        return self
+
+    def __next__(self):
+        batch = self.queue.get()
+        if batch is None:
+            self.stopped = True
+            raise StopIteration
+        return batch
+
+    def __len__(self):
+        return len(self.data_loader)
+
+    def stop(self):
+        self.stopped = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+
+    def __del__(self):
+        self.stop()
+
 # ========== T5 Mask Modification ==========
 def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
     seq_length = mask.sum(dim=-1)
@@ -340,7 +262,7 @@ def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
 
 # ========== Projection Layers ==========
 class ProjectionLayers(torch.nn.Module):
-    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=4096, num_layers=1):
+    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=1024, num_layers=1):
         super().__init__()
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
 
@@ -377,15 +299,15 @@ class HybridLoss(torch.nn.Module):
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
-    def forward(self, student_output, teacher_output, student_mask, teacher_mask):
+    def forward(self, student_output, teacher_output, teacher_mask):
         device = student_output.device
         dtype = torch.bfloat16
 
         student_output = student_output.to(dtype)
         teacher_output = teacher_output.to(dtype)
-        student_mask = student_mask.to(dtype).to(device)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
+        # Per-token losses
         huber_loss = self.huber(student_output, teacher_output)
         huber_loss = huber_loss.mean(dim=-1)
         huber_loss = (huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
@@ -410,7 +332,7 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     total_losses = {
         'total': 0.0,
         'huber': 0.0,
-        'cos': 0.0,
+        'cos': 0.0
     }
 
     with torch.no_grad():
@@ -444,10 +366,9 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, huber_loss, cos_loss= loss_fn(
+                loss, huber_loss, cos_loss = loss_fn(
                     projected_student,
                     teacher_hidden,
-                    s_att_mask,
                     t_att_mask
                 )
 
@@ -580,7 +501,7 @@ if os.path.exists(projection_path):
         )
         projection.load_state_dict(state_dict)
     except:
-        print("Incompatible projection layers detected. Initializing new projection layers")
+        print("Incompatible projection layers detected. Initializing new projection layers...")
         projection = ProjectionLayers(
             input_dim=QWEN_EMBEDDING_DIM,
             transformer_dim=QWEN_EMBEDDING_DIM,
@@ -588,7 +509,7 @@ if os.path.exists(projection_path):
             output_dim=4096
         )
 else:
-    print("Initializing projection layers")
+    print("Initializing projection layers...")
     projection = ProjectionLayers(
         input_dim=QWEN_EMBEDDING_DIM,
         transformer_dim=QWEN_EMBEDDING_DIM,
@@ -644,8 +565,8 @@ base_train_dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=True,
     pin_memory=True,
-    num_workers=0,
-    persistent_workers=False
+    num_workers=4,
+    persistent_workers=True
 )
 
 base_eval_dataloader = DataLoader(
@@ -653,16 +574,17 @@ base_eval_dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=False,
     pin_memory=True,
-    num_workers=0,
-    persistent_workers=False
+    num_workers=4,
+    persistent_workers=True
 )
 
 train_dataloader = PrefetchDataLoader(base_train_dataloader, prefetch_factor=PREFETCH_FACTOR)
 eval_dataloader = PrefetchDataLoader(base_eval_dataloader, prefetch_factor=PREFETCH_FACTOR)
 
+
 # ========== Training Setup ==========
 autocast_dtype = torch.bfloat16
-scaler = GradScaler(enabled=False)
+scaler = GradScaler('cuda', enabled=False)
 
 optimizer = torch.optim.AdamW(
     [p for p in student_model.parameters() if p.requires_grad] +
@@ -681,7 +603,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 )
 
 # ========== Training Loop ==========
-print("Starting training with mixed precision and gradient accumulation...")
+print("Starting training...")
 student_model.train()
 
 gc.collect()
@@ -742,7 +664,6 @@ for epoch in range(EPOCHS):
             loss, huber_loss, cos_loss = hybrid_loss(
                 projected_student,
                 teacher_hidden,
-                s_att_mask,
                 t_att_mask
             )
 
@@ -876,8 +797,6 @@ for epoch in range(EPOCHS):
         eval_end_time = time.time()
         eval_delta_time += (eval_end_time - eval_start_time)
         student_model.train()
-
-
 
 train_dataloader.close()
 eval_dataloader.close()
