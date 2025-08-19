@@ -34,8 +34,8 @@ EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 BATCH_SIZE = 32
 GRAD_ACCUM_STEPS = 1
 EPOCHS = 1
-MAX_LEARNING_RATE = 5e-5
-MIN_LEARNING_RATE = 5e-6
+MAX_LEARNING_RATE = 1e-4
+MIN_LEARNING_RATE = 1e-5
 GRAD_CLIP = 1.0
 SAVE_EVERY_X_STEPS = 4000
 PRINT_EVERY_X_STEPS = 1
@@ -45,8 +45,10 @@ SAVE_BEST_MODEL = True
 HUBER_LOSS = 0.70
 COSINE_LOSS = 0.30
 
-WARMUP_STEPS = 1000
-RESTART_PERIOD_STEPS = 2000
+WARMUP_STEPS = 500
+RESTART_PERIOD_STEPS = 2401
+
+T5_ADDITIONAL_PADDING_ATTENTION = 1
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -235,8 +237,8 @@ class PrefetchDataLoader:
     def __del__(self):
         self.stop()
 
-# ========== Projection Layers ==========
-class ProjectionLayers(torch.nn.Module):
+# ========== Projection Layer ==========
+class ProjectionLayer(torch.nn.Module):
     def __init__(self, input_dim, transformer_dim, output_dim=4096, dim_feedforward=None, num_layers=1):
         super().__init__()
         if dim_feedforward is None:
@@ -338,6 +340,12 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                     teacher_hidden = teacher_outputs.last_hidden_state
                     teacher_hidden = teacher_hidden.to(device)
 
+            t_att_mask = modify_mask_to_attend_padding(
+                t_att_mask,
+                512,
+                T5_ADDITIONAL_PADDING_ATTENTION
+            )
+
             loss, huber, cos = loss_fn(
                 projected_student,
                 teacher_hidden,
@@ -356,6 +364,39 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     projection.train()
 
     return total_losses
+
+# ========== T5 Mask Modification ==========
+def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
+    """
+    Modifies attention mask to allow attention to a few extra padding tokens.
+
+    Args:
+        mask: Original attention mask (1 for tokens to attend to, 0 for masked tokens)
+        max_seq_length: Maximum sequence length of the model
+        num_extra_padding: Number of padding tokens to unmask
+
+    Returns:
+        Modified mask
+    """
+    # Get the actual sequence length from the mask
+    seq_length = mask.sum(dim=-1)
+    batch_size = mask.shape[0]
+
+    modified_mask = mask.clone()
+
+    for i in range(batch_size):
+        current_seq_len = int(seq_length[i].item())
+
+        # Only add extra padding tokens if there's room
+        if current_seq_len < max_seq_length:
+            # Calculate how many padding tokens we can unmask
+            available_padding = max_seq_length - current_seq_len
+            tokens_to_unmask = min(num_extra_padding, available_padding)
+
+            # Unmask the specified number of padding tokens right after the sequence
+            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
+
+    return modified_mask
 
 # ========== Miscellaneous ==========
 def get_memory_usage():
@@ -432,13 +473,13 @@ else:
         teacher_model.eval()
 
 # ========== Initialize or Load Projection Layer ==========
-projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layers.safetensors")
+projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layer.safetensors")
 
 if os.path.exists(projection_path):
-    print("Loading existing projection layers from", projection_path)
+    print("Loading existing projection layer from", projection_path)
     try:
         state_dict = load_file(projection_path)
-        projection = ProjectionLayers(
+        projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
             transformer_dim=qwen_embedding_dim,
             output_dim=4096,
@@ -448,7 +489,7 @@ if os.path.exists(projection_path):
     except Exception as e:
         print(f"Error loading projection layer: {e}")
         print("Initializing new projection layer")
-        projection = ProjectionLayers(
+        projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
             transformer_dim=qwen_embedding_dim,
             output_dim=4096,
@@ -456,7 +497,7 @@ if os.path.exists(projection_path):
         )
 else:
     print("Initializing projection layer")
-    projection = ProjectionLayers(
+    projection = ProjectionLayer(
         input_dim=qwen_embedding_dim,
         transformer_dim=qwen_embedding_dim,
         output_dim=4096,
@@ -553,7 +594,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
 
 warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
     optimizer,
-    lr_lambda=lambda step: min((MIN_LEARNING_RATE / MAX_LEARNING_RATE) + (step / WARMUP_STEPS) * (1 - MIN_LEARNING_RATE / MAX_LEARNING_RATE), 1.0)
+    lr_lambda=lambda step: min((MIN_LEARNING_RATE / MAX_LEARNING_RATE) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE / MAX_LEARNING_RATE), 1.0)
 )
 
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -609,6 +650,12 @@ for epoch in range(EPOCHS):
                 teacher_hidden = teacher_outputs.last_hidden_state
                 teacher_hidden = teacher_hidden.to(device)
                 del t_input_ids, teacher_outputs
+
+        t_att_mask = modify_mask_to_attend_padding(
+            t_att_mask,
+            512,
+            T5_ADDITIONAL_PADDING_ATTENTION
+        )
 
         with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
             loss, huber, cos = hybrid_loss(
@@ -669,7 +716,7 @@ for epoch in range(EPOCHS):
                 student_model.save_pretrained(save_path)
                 student_tokenizer.save_pretrained(save_path)
                 projection_state = projection.state_dict()
-                projection_path = os.path.join(save_path, "projection_layers.safetensors")
+                projection_path = os.path.join(save_path, "projection_layer.safetensors")
                 save_file(projection_state, projection_path)
 
                 projection_config_path = os.path.join(save_path, "projection_config.json")
@@ -720,7 +767,7 @@ for epoch in range(EPOCHS):
             student_model.save_pretrained(best_model_dir)
             student_tokenizer.save_pretrained(best_model_dir)
             projection_state = projection.state_dict()
-            projection_path = os.path.join(best_model_dir, "projection_layers.safetensors")
+            projection_path = os.path.join(best_model_dir, "projection_layer.safetensors")
             save_file(projection_state, projection_path)
 
             projection_config_path = os.path.join(best_model_dir, "projection_config.json")
@@ -740,7 +787,7 @@ student_model.save_pretrained(OUTPUT_DIR)
 student_tokenizer.save_pretrained(OUTPUT_DIR)
 
 projection_state = projection.state_dict()
-projection_path = os.path.join(OUTPUT_DIR, "projection_layers.safetensors")
+projection_path = os.path.join(OUTPUT_DIR, "projection_layer.safetensors")
 save_file(projection_state, projection_path)
 
 projection_config_path = os.path.join(OUTPUT_DIR, "projection_config.json")
