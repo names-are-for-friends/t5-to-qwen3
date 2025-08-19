@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q5-xxs-ALL/ultimate-q5-xxs-v1/checkpoint_step_500"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -38,10 +38,8 @@ DEFAULT_RESOLUTION = [512,512]
 DEFAULT_OUTPUT_FILE = "output/q5"
 APPEND_DATETIME = True
 
-T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
+T5_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5-xxl
 USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
-
-KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'img_in', 'txt_in', 'distilled_guidance_layer', 'final_layer']
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -944,9 +942,9 @@ class AutoEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
 
-# ========== Projection Layers ==========
-class ProjectionLayers(torch.nn.Module):
-    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=4096, num_layers=1):
+# ========== Projection Layer ==========
+class ProjectionLayer(torch.nn.Module):
+    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=1024, num_layers=1):
         super().__init__()
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
 
@@ -1225,10 +1223,10 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         raise FileNotFoundError(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
 
     # Look for the projection layers file
-    projection_file = os.path.join(qwen3_folder, "projection_layers.safetensors")
+    projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
     if not os.path.exists(projection_file):
-        logger.error(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layers.safetensors")
-        raise FileNotFoundError(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layers.safetensors")
+        logger.error(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
+        raise FileNotFoundError(f"projection layers file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
@@ -1250,7 +1248,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
     with open(projection_config_path, 'r') as file:
         projection_config = json.load(file)
 
-    projection = ProjectionLayers(
+    projection = ProjectionLayer(
         input_dim=projection_config["input_dim"],
         transformer_dim=projection_config["transformer_dim"],
         output_dim=projection_config["output_dim"],
@@ -1317,7 +1315,6 @@ if __name__ == "__main__":
     parser.add_argument('--output_file', type=str, default=DEFAULT_OUTPUT_FILE, help='Output filename (without extension)')
     parser.add_argument('--format', choices=['png', 'jpg'], default='png', help='Output format')
     parser.add_argument('--quality', type=int, default=95, help='JPEG quality')
-    parser.add_argument('--fp8', action='store_true', help='Use FP8 for Chroma and T5')
     parser.add_argument('--t5', action='store_true', help='Use T5 instead of Qwen for text embeddings')
     args = parser.parse_args()
 
@@ -1446,13 +1443,7 @@ if __name__ == "__main__":
 
     # Load Chroma model with memory optimization
     model = load_chroma_model(args.chroma_file)
-    if args.fp8:
-        logger.info("Converting to FP8")
-        model = model.cpu()  # Move to CPU for casting
-        cast_linear(model, torch.float8_e4m3fn, '')
-        model = model.to("cuda")
-    else:
-        model = model.to("cuda")  # Directly move to CUDA if not using FP8
+    model = model.to("cuda")  # Directly move to CUDA if not using FP8
 
     # Load VAE model
     ae = load_autoencoder(args.vae_file)
