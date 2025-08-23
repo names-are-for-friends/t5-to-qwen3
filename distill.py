@@ -34,11 +34,11 @@ EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
 BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1
-EPOCHS = 1
+EPOCHS = 50
 MAX_LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-5
 GRAD_CLIP = 1.0
-SAVE_EVERY_X_STEPS = 0
+SAVE_EVERY_X_STEPS = 500
 SAVE_EVERY_X_RESTARTS = 1
 PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_EPOCHS = 1
@@ -219,10 +219,10 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, huber_weight=0.70, cosine_weight=0.30):
+    def __init__(self, sequence_huber_weight=0.70, sequence_cosine_weight=0.30):
         super().__init__()
-        self.huber_weight = huber_weight
-        self.cosine_weight = cosine_weight
+        self.sequence_huber_weight = sequence_huber_weight
+        self.sequence_cosine_weight = sequence_cosine_weight
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
@@ -234,20 +234,27 @@ class HybridLoss(torch.nn.Module):
         teacher_output = teacher_output.to(dtype)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
-        huber_loss = self.huber(student_output, teacher_output)
-        huber_loss = huber_loss.mean(dim=-1)
-        huber_loss = (huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        teacher_mask_expanded = teacher_mask.unsqueeze(-1)
 
-        cos_sim = self.cos(student_output, teacher_output)
-        cos_loss = 1 - cos_sim
-        cos_loss = (cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        numerator_student = (student_output * teacher_mask_expanded).sum(dim=1)
+        numerator_teacher = (teacher_output * teacher_mask_expanded).sum(dim=1)
+        denominator = teacher_mask.sum(dim=1, keepdim=True) + 1e-8
+
+        student_pooled = numerator_student / denominator
+        teacher_pooled = numerator_teacher / denominator
+
+        sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
+
+        sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
+        sequence_cos_loss = (1 - sequence_cos_sim).mean()
 
         total_loss = (
-            self.huber_weight * huber_loss.mean() +
-            self.cosine_weight * cos_loss.mean()
+            self.sequence_huber_weight * sequence_huber_loss +
+            self.sequence_cosine_weight * sequence_cos_loss
         )
 
-        return total_loss, huber_loss.mean(), cos_loss.mean()
+        return total_loss, sequence_huber_loss, sequence_cos_loss
+
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -445,7 +452,7 @@ if os.path.exists(projection_path):
         projection.load_state_dict(state_dict)
     except Exception as e:
         print(f"Error loading projection layer: {e}")
-        print("Initializing new projection layer")
+        print("Initializing projection layer")
         projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
             transformer_dim=INTERMEDIATE_DIM,
@@ -468,8 +475,8 @@ sum_loss = sum(losses)
 normalized_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
-    huber_weight=normalized_losses[0],
-    cosine_weight=normalized_losses[1],
+    sequence_huber_weight=normalized_losses[0],
+    sequence_cosine_weight=normalized_losses[1],
 ).to(device, dtype=torch.bfloat16)
 
 # ========== Dataset and Dataloader ==========
@@ -561,7 +568,6 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         )
 
         # ========== Training Loop ==========
-        print("Starting training...")
         student_model.train()
 
         start_time = time.time()
