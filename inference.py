@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/checkpoint_step_500/"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/checkpoint_step_500"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -1423,9 +1423,7 @@ if __name__ == "__main__":
                 return_tensors="pt"
             )
             attention_mask = text_inputs_t5["attention_mask"]
-
-            if args.negative_prompt:
-                attention_mask_neg = text_inputs_neg_t5["attention_mask"]
+            attention_mask_neg = text_inputs_neg_t5["attention_mask"]
 
             del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5
 
