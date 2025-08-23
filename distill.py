@@ -47,8 +47,8 @@ SAVE_BEST_MODEL = True
 HUBER_LOSS = 0.70
 COSINE_LOSS = 0.30
 
-WARMUP_STEPS = 500
-RESTART_PERIOD_STEPS = 1501
+WARMUP_STEPS = 501
+RESTART_PERIOD_STEPS = 1150
 
 INTERMEDIATE_DIM = 1024 # We scale the output to this size before inputting it into the transformer encoder. Significantly affects the size of the projection layer and VRAM consumption during training
 FEED_FORWARD_DIM = 1024
@@ -528,6 +528,11 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         autocast_dtype = torch.bfloat16
         scaler = GradScaler('cuda', enabled=False)
 
+        global_step = 0
+        accumulation_step = 0
+        grad_norm = 0
+        restart_count = 0
+
         optimizer = torch.optim.AdamW(
             [p for p in student_model.parameters() if p.requires_grad] +
             list(projection.parameters()),
@@ -561,10 +566,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
 
         start_time = time.time()
         eval_delta_time = 0
-        global_step = 0
         best_loss = float('inf')
-        accumulation_step = 0
-        grad_norm = 0
         for epoch in range(EPOCHS):
             optimizer.zero_grad()
 
