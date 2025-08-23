@@ -6,7 +6,8 @@ import random
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler
+from torch.nn.utils import clip_grad_norm_
+from torch.amp import GradScaler
 from transformers import T5TokenizerFast, T5EncoderModel
 from safetensors.torch import save_file, load_file
 import numpy as np
@@ -14,141 +15,43 @@ from tqdm import tqdm
 import queue
 import threading
 import gc
+import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ========== Configuration ==========
-DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # The correct format is one prompt per line of the text file
+DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
 QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
 OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/"
 
-USE_CACHED_EMBEDDINGS = True # Embeddings are 4MB in size so multiply this by the dataset size for the total capacity required
+USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
-PREFETCH_FACTOR = 32
+PREFETCH_FACTOR = 16
 
-USE_SEPARATE_EVALUATION_DATASET = True # If disabled, we'll just use 10% of the main dataset, but using unseen data is a better test of generalisation
+USE_SEPARATE_EVALUATION_DATASET = True # Otherwise we take some of the main dataset, but best to use unseen data
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
-'''
-Recommendation w/ Qwen3 0.6B:
-24GB VRAM: BATCH SIZE = 64, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
-16GB VRAM: BATCH SIZE = 32, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
-12GB VRAM: BATCH SIZE = 16, GRAD ACCUM = 1, USE CACHED EMBEDDINGS = True
-'''
-BATCH_SIZE = 64 # Increasing this stabilises training by averaging the gradient, reducing the influence of outliers, but increases VRAM use and could somewhat inhibit useful learning from outliers. Generally we use as high as possible for VRAM budget
-GRAD_ACCUM_STEPS = 1 # Accumulates the gradient across x batches before averaging to simulate larger batch size; does nothing when set to 1
-EPOCHS = 1 # Number of runs over the full dataset
-LEARNING_RATE = 2e-4 # Rate of learning. Too low and you stunt the learning, too high and you make excessive gradients and blow up the weights
-MIN_LR = 2e-5 # Cosine scheduler reduces the learning rate towards this value over the run. This should help generalisation when using a sufficiently large dataset
-GRAD_CLIP = 1.0 # Gradients of excess size are clipped to avoid excessive gradients, which leads to mangled output and further gradient explosion. The displayed grad norm while training is the value before clipping; expect the earlier values to be in excess, but it should stabilise below 1 after a while
-SAVE_EVERY_X_STEPS = 50 # Save the model every x steps. Note that 1 step = 1 batch * grad_accum_steps
-PRINT_EVERY_X_STEPS = 1 # Print logging every x steps. Note that 1 step = 1 batch * grad_accum_steps
-EVAL_EVERY_EPOCHS = 1 # Evaluate every x epochs. This uses the evaluation dataset to test how the model performs - preferably on unseen data, so use a separate evaluation dataset
-SAVE_BEST_MODEL = True # Enabling this makes sure that you always get the model with the highest evaluation score saved in a subfolder, in addition to the other saved models
-'''
-Note that losses are calculated as percentages of the sum before being used
-Feel free to use any values so long as they are appropriately proportionate to each other;
-the learning rate won't get blown out by excessive values
-'''
-PER_TOKEN_HUBER_LOSS = 0.50 # Per-token huber loss is particularly important to match our projected Qwen3 embedding with the T5-xxl embedding given differing architecture & tokenization, but since it's one-to-one we can only compare with a uniform mask (the least attended of the two, usually the Qwen3 mask)
-SEQUENCE_HUBER_LOSS = 0.20 # Sequence-level loss provides a teacher-mask-to-student-mask alignment factor to the overall loss, hopefully keeping the total Qwen3 embedding aligned to the total T5-xxl embedding
-PER_TOKEN_COSINE_LOSS = 0.25 # Ditto for cosine loss, except this helps with directional alignment of vectors
-SEQUENCE_COSINE_LOSS = 0.05 # Looks lonely without a comment here
 
-QWEN_EMBEDDING_DIM = 1024 # Change for the hidden size of the model/features of the embedding, eg. 0.6B is 1024, 1.7B is 2048. Check model's config.json if unsure
-T5_ADDITIONAL_PADDING_ATTENTION = 1 # Train to match the expectations of the target image gen model. Chroma = 1, most Flux variants = 3
+BATCH_SIZE = 64
+GRAD_ACCUM_STEPS = 1
+EPOCHS = 1
+MAX_LEARNING_RATE = 1e-4
+MIN_LEARNING_RATE = 1e-5
+GRAD_CLIP = 1.0
+SAVE_EVERY_X_STEPS = 0
+SAVE_EVERY_X_RESTARTS = 1
+PRINT_EVERY_X_STEPS = 1
+EVAL_EVERY_EPOCHS = 1
+SAVE_BEST_MODEL = True
 
-# ========== Custom Prefetch DataLoader ==========
-class PrefetchDataLoader:
-    def __init__(self, dataloader, prefetch_factor=3):
-        self.dataloader = dataloader
-        self.prefetch_factor = prefetch_factor
-        self.queue = queue.Queue(maxsize=prefetch_factor)
-        self.thread = None
-        self.stop_event = threading.Event()
-        self._exception = None
-        self.restart_count = 0
-        self.max_restarts = 5  # Limit restarts to prevent infinite loops
+HUBER_LOSS = 0.70
+COSINE_LOSS = 0.30
 
-    def __iter__(self):
-        self.iterator = iter(self.dataloader)
-        self.stop_event.clear()
-        self._exception = None
-        self.restart_count = 0
-        self._start_prefetch()
-        return self
+WARMUP_STEPS = 500
+RESTART_PERIOD_STEPS = 1501
 
-    def __next__(self):
-        if self.thread is None or not self.thread.is_alive():
-            if self._exception:
-                raise self._exception
-            else:
-                self._start_prefetch()
-
-        try:
-            if self._exception:
-                raise self._exception
-
-            batch = self.queue.get(timeout=120)  # Increased timeout to 120 seconds
-            if isinstance(batch, Exception):
-                raise batch
-            return batch
-        except queue.Empty:
-            # Check if the thread is still alive but queue is empty
-            if self.thread and self.thread.is_alive():
-                return self.__next__()  # Retry
-            else:
-                raise StopIteration()
-        except Exception as e:
-            self._exception = e
-            raise e
-
-    def _prefetch_worker(self):
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    batch = next(self.iterator)
-                    if isinstance(batch, tuple):
-                        cleaned_batch = []
-                        for item in batch:
-                            if hasattr(item, 'detach'):
-                                cleaned_item = item.detach()
-                                cleaned_batch.append(cleaned_item)
-                            else:
-                                cleaned_batch.append(item)
-                        batch = tuple(cleaned_batch)
-                    try:
-                        self.queue.put(batch, block=False)
-                    except queue.Full:
-                        del batch
-                        continue
-
-                except StopIteration:
-                    break
-                except Exception as e:
-                    try:
-                        self.queue.put(e, block=False)
-                    except queue.Full:
-                        pass
-                    break
-        except Exception as e:
-            self._exception = e
-            try:
-                self.queue.put(e, block=False)
-            except queue.Full:
-                pass
-
-    def _start_prefetch(self):
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
-            self.thread.join(timeout=1)
-
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self.thread.start()
-        self.restart_count += 1
-        if self.restart_count > self.max_restarts:
-            raise RuntimeError(f"Prefetch thread restarted too many times ({self.max_restarts})")
+INTERMEDIATE_DIM = 1024 # We scale the output to this size before inputting it into the transformer encoder. Significantly affects the size of the projection layer and VRAM consumption during training
+FEED_FORWARD_DIM = 1024
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -159,25 +62,19 @@ class PreTokenizedDataset(Dataset):
             sample_rate = None
 
         with open(file_path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f.readlines() if line.strip()]
+            self.lines = [line.strip() for line in f.readlines() if line.strip()]
 
         if is_eval and sample_rate is not None:
-            lines = random.sample(lines, min(int(len(lines) * sample_rate), len(lines)))
+            self.lines = random.sample(self.lines, min(int(len(self.lines) * sample_rate), len(self.lines)))
 
-        self.student_input_ids = []
-        self.student_attention_mask = []
-        for line in lines:
-            student_inputs = student_tokenizer(
-                line,
-                padding="max_length",
-                truncation=True,
-                max_length=max_length
-            )
-            self.student_input_ids.append(student_inputs["input_ids"])
-            self.student_attention_mask.append(student_inputs["attention_mask"])
-
-        self.student_input_ids = torch.tensor(self.student_input_ids, dtype=torch.long)
-        self.student_attention_mask = torch.tensor(self.student_attention_mask, dtype=torch.long)
+        student_inputs = student_tokenizer(
+            self.lines,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+        self.student_input_ids = torch.tensor(student_inputs["input_ids"], dtype=torch.long)
+        self.student_attention_mask = torch.tensor(student_inputs["attention_mask"], dtype=torch.long)
 
         if use_cached_embeddings:
             base_name = os.path.basename(file_path)
@@ -187,21 +84,18 @@ class PreTokenizedDataset(Dataset):
             if os.path.exists(validation_file):
                 print(f"Loading cached embeddings from folder {cache_folder}")
                 self.cache_folder = cache_folder
-                self.num_samples = len(lines)
+                self.num_samples = len(self.lines)
                 self.hidden_dim = 4096
 
-                self.embedding_files = []
-                self.mask_files = []
-                for i in range(len(lines)):
-                    self.embedding_files.append(os.path.join(self.cache_folder, f"{i}.pt"))
-                    self.mask_files.append(os.path.join(self.cache_folder, f"{i}_mask.pt"))
+                self.embedding_files = [os.path.join(self.cache_folder, f"{i}.pt") for i in range(len(self.lines))]
+                self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
             else:
                 print(f"Generating and caching embeddings for {file_path}")
                 os.makedirs(cache_folder, exist_ok=True)
-                self.num_samples = len(lines)
+                self.num_samples = len(self.lines)
                 self.hidden_dim = teacher_model.config.hidden_size
 
-                for i, line in enumerate(tqdm(lines, desc="Generating embeddings")):
+                for i, line in enumerate(tqdm(self.lines, desc="Generating embeddings")):
                     teacher_inputs = teacher_tokenizer(
                         line,
                         padding="max_length",
@@ -228,31 +122,23 @@ class PreTokenizedDataset(Dataset):
                 print(f"Saved embeddings to folder {cache_folder}")
                 self.cache_folder = cache_folder
 
-                self.embedding_files = []
-                self.mask_files = []
-                for i in range(len(lines)):
-                    self.embedding_files.append(os.path.join(self.cache_folder, f"{i}.pt"))
-                    self.mask_files.append(os.path.join(self.cache_folder, f"{i}_mask.pt"))
+                self.embedding_files = [os.path.join(self.cache_folder, f"{i}.pt") for i in range(len(self.lines))]
+                self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
         else:
-            self.teacher_input_ids = []
-            self.teacher_attention_mask = []
-            for line in lines:
-                teacher_inputs = teacher_tokenizer(
-                    line,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=max_length
-                )
-                self.teacher_input_ids.append(teacher_inputs["input_ids"])
-                self.teacher_attention_mask.append(teacher_inputs["attention_mask"])
-
-            self.teacher_input_ids = torch.tensor(self.teacher_input_ids, dtype=torch.long)
-            self.teacher_attention_mask = torch.tensor(self.teacher_attention_mask, dtype=torch.long)
+            teacher_inputs = teacher_tokenizer(
+                self.lines,
+                padding="max_length",
+                truncation=True,
+                max_length=max_length
+            )
+            self.teacher_input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long)
+            self.teacher_attention_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
 
         self.use_cached_embeddings = use_cached_embeddings
+        self.line_index = list(range(len(self.lines)))
 
     def __len__(self):
-        return len(self.student_input_ids)
+        return len(self.lines)
 
     def __getitem__(self, idx):
         if self.use_cached_embeddings:
@@ -278,15 +164,12 @@ class PreTokenizedDataset(Dataset):
             if att_mask.dim() == 2 and att_mask.shape[0] == 1:
                 att_mask = att_mask.squeeze(0)
 
-            result = (
+            return (
                 self.student_input_ids[idx],
                 self.student_attention_mask[idx],
                 embeddings,
                 att_mask
             )
-
-            del embeddings, att_mask
-            return result
         else:
             return (
                 self.student_input_ids[idx],
@@ -295,21 +178,14 @@ class PreTokenizedDataset(Dataset):
                 self.teacher_attention_mask[idx]
             )
 
-# ========== T5 Mask Modification ==========
-def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=1):
-    seq_length = mask.sum(dim=-1)
-    batch_size = mask.shape[0]
+    def __enter__(self):
+        return self
 
-    modified_mask = mask.clone()
-
-    for i in range(batch_size):
-        current_seq_len = int(seq_length[i].item())
-        if current_seq_len < max_seq_length:
-            available_padding = max_seq_length - current_seq_len
-            tokens_to_unmask = min(num_extra_padding, available_padding)
-            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
-
-    return modified_mask
+    def __exit__(self, exc_type, exc_value, traceback):
+        if hasattr(self, 'file_handles'):
+            for file in self.file_handles:
+                file.close()
+            self.file_handles.clear()
 
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
@@ -343,69 +219,35 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, student_hidden_size=None, teacher_hidden_size=None,
-                 per_token_huber_weight=0.50, sequence_huber_weight=0.20,
-                 per_token_cosine_weight=0.25, sequence_cosine_weight=0.05):
+    def __init__(self, huber_weight=0.70, cosine_weight=0.30):
         super().__init__()
-        self.per_token_huber_weight = per_token_huber_weight
-        self.sequence_huber_weight = sequence_huber_weight
-        self.per_token_cosine_weight = per_token_cosine_weight
-        self.sequence_cosine_weight = sequence_cosine_weight
-
-        if student_hidden_size is not None and teacher_hidden_size is not None:
-            self.student_pooler = torch.nn.Linear(student_hidden_size, 1).to(torch.bfloat16)
-            self.teacher_pooler = torch.nn.Linear(teacher_hidden_size, 1).to(torch.bfloat16)
-        else:
-            raise ValueError("Hidden sizes must be specified for learnable pooling")
-
+        self.huber_weight = huber_weight
+        self.cosine_weight = cosine_weight
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
-    def forward(self, student_output, teacher_output, student_mask, teacher_mask):
+    def forward(self, student_output, teacher_output, teacher_mask):
         device = student_output.device
         dtype = torch.bfloat16
 
         student_output = student_output.to(dtype)
         teacher_output = teacher_output.to(dtype)
-        student_mask = student_mask.to(dtype).to(device)
         teacher_mask = teacher_mask.to(dtype).to(device)
 
-        per_token_huber_loss = self.huber(student_output, teacher_output)
-        per_token_huber_loss = per_token_huber_loss.mean(dim=-1)
-        per_token_huber_loss = (per_token_huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        huber_loss = self.huber(student_output, teacher_output)
+        huber_loss = huber_loss.mean(dim=-1)
+        huber_loss = (huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
 
-        per_token_cos_sim = self.cos(student_output, teacher_output)
-        per_token_cos_loss = 1 - per_token_cos_sim
-        per_token_cos_loss = (per_token_cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
-
-        # Learn attention weights for sequence-level pooling
-        student_logits = self.student_pooler(student_output).squeeze(-1)
-        teacher_logits = self.teacher_pooler(teacher_output).squeeze(-1)
-
-        # Apply masks
-        student_logits = student_logits.masked_fill(~student_mask.bool(), -1e9)
-        teacher_logits = teacher_logits.masked_fill(~teacher_mask.bool(), -1e9)
-
-        student_weights = torch.softmax(student_logits, dim=1)
-        teacher_weights = torch.softmax(teacher_logits, dim=1)
-
-        # Weighted pooling
-        student_pooled = (student_output * student_weights.unsqueeze(-1)).sum(dim=1)
-        teacher_pooled = (teacher_output * teacher_weights.unsqueeze(-1)).sum(dim=1)
-
-        # Sequence-level losses
-        sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
-        sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
-        sequence_cos_loss = (1 - sequence_cos_sim).mean()
+        cos_sim = self.cos(student_output, teacher_output)
+        cos_loss = 1 - cos_sim
+        cos_loss = (cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
 
         total_loss = (
-            self.per_token_huber_weight * per_token_huber_loss.mean() +
-            self.sequence_huber_weight * sequence_huber_loss +
-            self.per_token_cosine_weight * per_token_cos_loss.mean() +
-            self.sequence_cosine_weight * sequence_cos_loss
+            self.huber_weight * huber_loss.mean() +
+            self.cosine_weight * cos_loss.mean()
         )
 
-        return total_loss, per_token_huber_loss.mean(), sequence_huber_loss, per_token_cos_loss.mean(), sequence_cos_loss
+        return total_loss, huber_loss.mean(), cos_loss.mean()
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -415,10 +257,8 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
 
     total_losses = {
         'total': 0.0,
-        'per_token_huber': 0.0,
-        'sequence_huber': 0.0,
-        'per_token_cos': 0.0,
-        'sequence_cos': 0.0
+        'huber': 0.0,
+        'cos': 0.0
     }
 
     with torch.no_grad():
@@ -452,20 +292,17 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss = loss_fn(
+                loss, huber_loss, cos_loss = loss_fn(
                     projected_student,
                     teacher_hidden,
-                    s_att_mask,
                     t_att_mask
                 )
 
                 total_losses['total'] += loss.item()
-                total_losses['per_token_huber'] += per_token_huber_loss.item()
-                total_losses['sequence_huber'] += sequence_huber_loss.item()
-                total_losses['per_token_cos'] += per_token_cos_loss.item()
-                total_losses['sequence_cos'] += sequence_cos_loss.item()
+                total_losses['huber'] += huber_loss.item()
+                total_losses['cos'] += cos_loss.item()
 
-                del loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss, projected_student, student_hidden, student_outputs
+                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
                 del s_input_ids, s_att_mask, t_att_mask, t_embeddings
@@ -495,21 +332,6 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     return total_losses
 
 # ========== Miscellaneous Functions ==========
-def clip_gradients_individually(parameters, max_norm):
-    total_norm = 0
-    for p in parameters:
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1. / 2)
-
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for p in parameters:
-            if p.grad is not None:
-                p.grad.data.mul_(clip_coef)
-    return total_norm
-
 def get_memory_usage():
     if torch.cuda.is_available():
         memory = torch.cuda.mem_get_info()
@@ -535,21 +357,33 @@ def save_trained_model(save_path, model, tokenizer, projection, qwen_embedding_d
 def save_projection_config(projection_config_path, embedding_dim):
     projection_config = {
         "input_dim": embedding_dim,
-        "transformer_dim": embedding_dim,
+        "transformer_dim": INTERMEDIATE_DIM,
         "output_dim": 4096,
-        "dim_feedforward": embedding_dim,
+        "dim_feedforward": FEED_FORWARD_DIM,
         "num_layers": 1
     }
     with open(projection_config_path, "w") as f:
         json.dump(projection_config, f)
 
+def exit_dataloader():
+    train_dataloader = None
+    train_dataset = None
+    eval_dataloader = None
+    eval_dataset = None
+    del train_dataloader
+    del train_dataset
+    del eval_dataloader
+    del eval_dataset
+    gc.collect()
+
 # ========== Load Qwen3 Model ==========
+gc.collect
 print("Loading Qwen3 model...")
 student_model, student_tokenizer = FastLanguageModel.from_pretrained(
     QWEN3_MODEL_NAME,
     max_seq_length=512,
     load_in_4bit=False,
-    dtype=None,
+    dtype=torch.bfloat16,
     local_files_only=True,
     revision="main",
     full_finetuning=True
@@ -604,9 +438,9 @@ if os.path.exists(projection_path):
         state_dict = load_file(projection_path)
         projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
-            transformer_dim=qwen_embedding_dim,
+            transformer_dim=INTERMEDIATE_DIM,
             output_dim=4096,
-            dim_feedforward=qwen_embedding_dim
+            dim_feedforward=FEED_FORWARD_DIM
         )
         projection.load_state_dict(state_dict)
     except Exception as e:
@@ -614,32 +448,28 @@ if os.path.exists(projection_path):
         print("Initializing new projection layer")
         projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
-            transformer_dim=qwen_embedding_dim,
+            transformer_dim=INTERMEDIATE_DIM,
             output_dim=4096,
-            dim_feedforward=qwen_embedding_dim
+            dim_feedforward=FEED_FORWARD_DIM
         )
 else:
     print("Initializing projection layer")
     projection = ProjectionLayer(
         input_dim=qwen_embedding_dim,
-        transformer_dim=qwen_embedding_dim,
+        transformer_dim=INTERMEDIATE_DIM,
         output_dim=4096,
-        dim_feedforward=qwen_embedding_dim
+        dim_feedforward=FEED_FORWARD_DIM
     )
 
 projection.to(device, dtype=torch.bfloat16)
 
-losses = [PER_TOKEN_HUBER_LOSS, SEQUENCE_HUBER_LOSS, PER_TOKEN_COSINE_LOSS, SEQUENCE_COSINE_LOSS]
+losses = [HUBER_LOSS, COSINE_LOSS]
 sum_loss = sum(losses)
 normalized_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
-    student_hidden_size=4096,
-    teacher_hidden_size=4096,
-    per_token_huber_weight=normalized_losses[0],
-    sequence_huber_weight=normalized_losses[1],
-    per_token_cosine_weight=normalized_losses[2],
-    sequence_cosine_weight=normalized_losses[3]
+    huber_weight=normalized_losses[0],
+    cosine_weight=normalized_losses[1],
 ).to(device, dtype=torch.bfloat16)
 
 # ========== Dataset and Dataloader ==========
@@ -672,243 +502,239 @@ if USE_CACHED_EMBEDDINGS and teacher_model is not None:
     del teacher_model
     torch.cuda.empty_cache()
 
-base_train_dataloader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    pin_memory=True,
-    num_workers=0,
-    persistent_workers=False
-)
-
-base_eval_dataloader = DataLoader(
-    eval_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    pin_memory=True,
-    num_workers=0,
-    persistent_workers=False
-)
-
-train_dataloader = PrefetchDataLoader(base_train_dataloader, prefetch_factor=PREFETCH_FACTOR)
-eval_dataloader = PrefetchDataLoader(base_eval_dataloader, prefetch_factor=PREFETCH_FACTOR)
-
-# ========== Training Setup ==========
-autocast_dtype = torch.bfloat16
-scaler = GradScaler(enabled=False)
-
-optimizer = torch.optim.AdamW(
-    [p for p in student_model.parameters() if p.requires_grad] +
-    list(projection.parameters()) +
-    list(hybrid_loss.student_pooler.parameters()) +
-    list(hybrid_loss.teacher_pooler.parameters()),
-    lr=LEARNING_RATE,
-    betas=(0.9, 0.999),
-    weight_decay=0.01,
-    eps=1e-8
-)
-
-total_steps = (len(train_dataset) // GRAD_ACCUM_STEPS) * EPOCHS
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max=total_steps,
-    eta_min=MIN_LR,
-)
-
-# ========== Training Loop ==========
-print("Starting training with mixed precision and gradient accumulation...")
-student_model.train()
-
-gc.collect()
-torch.cuda.empty_cache()
-
-start_time = time.time()
-eval_delta_time = 0
-global_step = 0
-best_loss = float('inf')
-accumulation_step = 0
-grad_norm = 0
-
-for epoch in range(EPOCHS):
-    optimizer.zero_grad()
-
-    steps_completed_this_epoch = 0
-    accumulation_step = 0
-
-    print(f"Starting epoch {epoch + 1}/{EPOCHS}")
-    print(f"Total batches in epoch: {len(train_dataset)}")
-
-    for batch_idx, batch in enumerate(train_dataloader):
-        try:
-            s_input_ids, s_att_mask, t_embeddings, t_att_mask = batch
-            s_input_ids = s_input_ids.to(device)
-            s_att_mask = s_att_mask.to(device)
-            t_att_mask = t_att_mask.to(device)
-
-            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
-                student_outputs = student_model(
-                    input_ids=s_input_ids,
-                    attention_mask=s_att_mask,
-                    output_hidden_states=True
-                )
-                student_hidden = student_outputs.hidden_states[-1]
-                projected_student = projection(student_hidden)
-
-            if USE_CACHED_EMBEDDINGS:
-                teacher_hidden = t_embeddings.to(device).squeeze(1)
-            else:
-                t_input_ids, t_att_mask = t_embeddings, t_att_mask
-                with torch.no_grad():
-                    t_input_ids = t_input_ids.to(device)
-                    t_att_mask = t_att_mask.to(device)
-                    teacher_outputs = teacher_model(
-                        input_ids=t_input_ids,
-                        attention_mask=t_att_mask
-                    )
-                    teacher_hidden = teacher_outputs.last_hidden_state
-                    teacher_hidden = teacher_hidden.to(device)
-
-            t_att_mask = modify_mask_to_attend_padding(
-                t_att_mask,
-                t_att_mask.shape[-1],
-                num_extra_padding=T5_ADDITIONAL_PADDING_ATTENTION
-            )
-
-            loss, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss = hybrid_loss(
-                projected_student,
-                teacher_hidden,
-                s_att_mask,
-                t_att_mask
-            )
-
-            scaled_loss = loss / GRAD_ACCUM_STEPS
-            scaler.scale(scaled_loss).backward()
-            accumulation_step += 1
-
-            # Check if we've accumulated enough gradients or if this is the last batch
-            if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataset) - 1:
-                grad_norm = clip_gradients_individually(
-                    [p for p in student_model.parameters() if p.requires_grad] +
-                    list(projection.parameters()) +
-                    list(hybrid_loss.student_pooler.parameters()) +
-                    list(hybrid_loss.teacher_pooler.parameters()),
-                    max_norm=GRAD_CLIP
-                )
-
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                global_step += 1
-                steps_completed_this_epoch += 1
-                accumulation_step = 0
-
-                current_loss = loss.item()
-                current_per_token_huber = per_token_huber_loss.item()
-                current_sequence_huber = sequence_huber_loss.item()
-                current_per_token_cos = per_token_cos_loss.item()
-                current_sequence_cos = sequence_cos_loss.item()
-
-                del loss, scaled_loss, student_outputs, student_hidden, projected_student
-                del teacher_hidden, per_token_huber_loss, sequence_huber_loss, per_token_cos_loss, sequence_cos_loss
-                if 't_input_ids' in locals():
-                    del t_input_ids, t_att_mask, teacher_outputs
-
-                if SAVE_EVERY_X_STEPS > 0 and global_step % SAVE_EVERY_X_STEPS == 0:
-                    print(f"\nSaving checkpoint at step {global_step}")
-                    save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
-                    save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
-
-                if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
-                    elapsed = time.time() - start_time - eval_delta_time
-                    remaining_steps = total_steps - global_step
-                    eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
-                    vram_free, vram_total, vram_used = get_memory_usage()
-
-                    print(
-                        f"Epoch [{epoch + 1}/{EPOCHS}], "
-                        f"Batch [{batch_idx + 1}/{len(train_dataset)}], "
-                        f"Step: {global_step}/{total_steps}, "
-                        f"Total Loss: {current_loss:.6f}, "
-                        f"Per-Token Huber: {current_per_token_huber:.6f}, "
-                        f"Sequence Huber: {current_sequence_huber:.6f}, "
-                        f"Per-Token Cosine: {current_per_token_cos:.6f}, "
-                        f"Sequence Cosine: {current_sequence_cos:.6f}, "
-                        f"Grad Norm: {grad_norm:.6f}, "
-                        f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
-                        f"Elapsed: {elapsed/60:.1f} min, "
-                        f"ETA: {eta/60:.1f} min"
-                    )
-
-                if global_step % 100 == 0 or global_step == 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-            # Clean up variables after each batch
-            del s_input_ids, s_att_mask, t_att_mask, t_embeddings
-
-        except Exception as e:
-            print(f"Error in batch {batch_idx}: {e}")
-            # Clean up variables to prevent memory issues
-            if 'loss' in locals():
-                del loss
-            if 'scaled_loss' in locals():
-                del scaled_loss
-            if 'student_outputs' in locals():
-                del student_outputs
-            if 'student_hidden' in locals():
-                del student_hidden
-            if 'projected_student' in locals():
-                del projected_student
-            if 'teacher_hidden' in locals():
-                del teacher_hidden
-            if 'per_token_huber_loss' in locals():
-                del per_token_huber_loss
-            if 'sequence_huber_loss' in locals():
-                del sequence_huber_loss
-            if 'per_token_cos_loss' in locals():
-                del per_token_cos_loss
-            if 'sequence_cos_loss' in locals():
-                del sequence_cos_loss
-            if 't_input_ids' in locals():
-                del t_input_ids, t_att_mask, teacher_outputs
-            del s_input_ids, s_att_mask, t_att_mask, t_embeddings
-            # Reset accumulation step on error
-            accumulation_step = 0
-            optimizer.zero_grad()
-            continue
-
-    print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
-
-    if (epoch + 1) % EVAL_EVERY_EPOCHS == 0:
-        eval_start_time = time.time()
-
-        eval_metrics = evaluate_model(
-            student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype
+with train_dataset as train_ds, eval_dataset as eval_ds:
+    try:
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=min(4, os.cpu_count()//2) if torch.cuda.is_available() else 0,
+            persistent_workers=False,
+            prefetch_factor=PREFETCH_FACTOR,
         )
 
-        avg_eval_loss = eval_metrics['total']
-        print(f"\n[Validation] Epoch {epoch + 1}")
-        print(f"  Average Total Loss: {avg_eval_loss:.6f}")
-        print(f"  Per-Token Huber Loss: {eval_metrics['per_token_huber']:.6f}")
-        print(f"  Sequence Huber Loss: {eval_metrics['sequence_huber']:.6f}")
-        print(f"  Per-Token Cosine Loss: {eval_metrics['per_token_cos']:.6f}")
-        print(f"  Sequence Cosine Loss: {eval_metrics['sequence_cos']:.6f}")
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=min(4, os.cpu_count()//2) if torch.cuda.is_available() else 0,
+            persistent_workers=False,
+            prefetch_factor=PREFETCH_FACTOR,
+        )
+        total_steps = (len(train_dataloader) // GRAD_ACCUM_STEPS) * EPOCHS
+        # ========== Training Setup ==========
+        autocast_dtype = torch.bfloat16
+        scaler = GradScaler('cuda', enabled=False)
 
-        if SAVE_BEST_MODEL and avg_eval_loss < best_loss:
-            best_loss = avg_eval_loss
-            print(f"\n✅ New best model at loss {best_loss:.6f}, saving...")
-            best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
-            save_trained_model(best_model_dir, student_model, student_tokenizer, projection, qwen_embedding_dim)
+        optimizer = torch.optim.AdamW(
+            [p for p in student_model.parameters() if p.requires_grad] +
+            list(projection.parameters()),
+            lr=MAX_LEARNING_RATE,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8
+        )
 
-        eval_end_time = time.time()
-        eval_delta_time += (eval_end_time - eval_start_time)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=RESTART_PERIOD_STEPS,
+            T_mult=1,
+            eta_min=MIN_LEARNING_RATE,
+        )
+
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min((MIN_LEARNING_RATE / MAX_LEARNING_RATE) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE / MAX_LEARNING_RATE), 1.0)
+        )
+
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, scheduler],
+            milestones=[WARMUP_STEPS]
+        )
+
+        # ========== Training Loop ==========
+        print("Starting training...")
         student_model.train()
 
-# Clean up prefetch loaders
-train_dataloader.close()
-eval_dataloader.close()
+        start_time = time.time()
+        eval_delta_time = 0
+        global_step = 0
+        best_loss = float('inf')
+        accumulation_step = 0
+        grad_norm = 0
+        for epoch in range(EPOCHS):
+            optimizer.zero_grad()
+
+            steps_completed_this_epoch = 0
+            accumulation_step = 0
+
+            print(f"Starting epoch {epoch + 1}/{EPOCHS}")
+            print(f"Total batches in epoch: {len(train_dataloader)}")
+
+            for batch_idx, batch in enumerate(train_dataloader):
+                try:
+                    s_input_ids, s_att_mask, t_embeddings, t_att_mask = batch
+                    s_input_ids = s_input_ids.to(device)
+                    s_att_mask = s_att_mask.to(device)
+                    t_att_mask = t_att_mask.to(device)
+
+                    with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                        student_outputs = student_model(
+                            input_ids=s_input_ids,
+                            attention_mask=s_att_mask,
+                            output_hidden_states=True
+                        )
+                        student_hidden = student_outputs.hidden_states[-1]
+                        projected_student = projection(student_hidden)
+
+                    if USE_CACHED_EMBEDDINGS:
+                        teacher_hidden = t_embeddings.to(device).squeeze(1)
+                    else:
+                        t_input_ids, t_att_mask = t_embeddings, t_att_mask
+                        with torch.no_grad():
+                            t_input_ids = t_input_ids.to(device)
+                            t_att_mask = t_att_mask.to(device)
+                            teacher_outputs = teacher_model(
+                                input_ids=t_input_ids,
+                                attention_mask=t_att_mask
+                            )
+                            teacher_hidden = teacher_outputs.last_hidden_state
+                            teacher_hidden = teacher_hidden.to(device)
+
+                    loss, huber_loss, cos_loss = hybrid_loss(
+                        projected_student,
+                        teacher_hidden,
+                        t_att_mask
+                    )
+
+                    scaled_loss = loss / GRAD_ACCUM_STEPS
+                    scaler.scale(scaled_loss).backward()
+                    accumulation_step += 1
+
+                    if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataset) - 1:
+                        grad_norm = clip_grad_norm_(
+                            [p for p in student_model.parameters() if p.requires_grad] +
+                            list(projection.parameters()),
+                            max_norm=GRAD_CLIP
+                        )
+
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        optimizer.zero_grad()
+
+                        global_step += 1
+                        steps_completed_this_epoch += 1
+                        accumulation_step = 0
+
+                        current_loss = loss.item()
+                        current_huber = huber_loss.item()
+                        current_cos = cos_loss.item()
+
+                        if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
+                            elapsed = time.time() - start_time - eval_delta_time
+                            remaining_steps = total_steps - global_step
+                            eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
+                            vram_free, vram_total, vram_used = get_memory_usage()
+                            current_lr = scheduler.get_last_lr()[0]
+
+                            print(
+                                f"Epoch [{epoch + 1}/{EPOCHS}], "
+                                f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
+                                f"Step: {global_step}/{total_steps}, "
+                                f"Total Loss: {current_loss:.6f}, "
+                                f"Huber Loss: {current_huber:.6f}, "
+                                f"Cosine Loss: {current_cos:.6f}, "
+                                f"Grad Norm: {grad_norm:.6f}, "
+                                f"Learning Rate: {current_lr:.6f}, "
+                                f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
+                                f"Elapsed: {elapsed/60:.1f} min, "
+                                f"ETA: {eta/60:.1f} min"
+                            )
+
+                        if SAVE_EVERY_X_RESTARTS > 0 and global_step > WARMUP_STEPS and (global_step - WARMUP_STEPS) % RESTART_PERIOD_STEPS == 0:
+                            restart_count += 1
+                            if restart_count % SAVE_EVERY_X_RESTARTS == 0:
+                                print(f"\nSaving checkpoint at restart {restart_count}\n")
+                                save_path = os.path.join(OUTPUT_DIR, f"restart_{restart_count}")
+                                save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
+
+                        if SAVE_EVERY_X_STEPS > 0 and global_step % SAVE_EVERY_X_STEPS == 0:
+                            print(f"\nSaving checkpoint at step {global_step}")
+                            save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
+                            save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
+
+                        del loss, scaled_loss, student_outputs, student_hidden, projected_student
+                        del teacher_hidden, huber_loss, cos_loss
+                        if 't_input_ids' in locals():
+                            del t_input_ids, t_att_mask, teacher_outputs
+
+                    del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+
+                except Exception as e:
+                    print(f"Error in batch {batch_idx}: {e}")
+                    if 'loss' in locals():
+                        del loss
+                    if 'scaled_loss' in locals():
+                        del scaled_loss
+                    if 'student_outputs' in locals():
+                        del student_outputs
+                    if 'student_hidden' in locals():
+                        del student_hidden
+                    if 'projected_student' in locals():
+                        del projected_student
+                    if 'teacher_hidden' in locals():
+                        del teacher_hidden
+                    if 'huber_loss' in locals():
+                        del huber_loss
+                    if 'cos_loss' in locals():
+                        del cos_loss
+                    if 't_input_ids' in locals():
+                        del t_input_ids, t_att_mask, teacher_outputs
+                    del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+
+                    accumulation_step = 0
+                    optimizer.zero_grad()
+                    continue
+
+            print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
+
+            if (epoch + 1) % EVAL_EVERY_EPOCHS == 0:
+                eval_start_time = time.time()
+
+                eval_metrics = evaluate_model(
+                    student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype
+                )
+
+                avg_eval_loss = eval_metrics['total']
+                print(f"\n[Validation] Epoch {epoch + 1}")
+                print(f"  Average Total Loss: {avg_eval_loss:.6f}")
+                print(f"  Huber Loss: {eval_metrics['huber']:.6f}")
+                print(f"  Cosine Loss: {eval_metrics['cos']:.6f}")
+
+                if SAVE_BEST_MODEL and avg_eval_loss < best_loss:
+                    best_loss = avg_eval_loss
+                    print(f"\n✅ New best model at loss {best_loss:.6f}, saving...")
+                    best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
+                    save_trained_model(best_model_dir, student_model, student_tokenizer, projection, qwen_embedding_dim)
+
+                eval_end_time = time.time()
+                eval_delta_time += (eval_end_time - eval_start_time)
+                student_model.train()
+
+    except Exception as e:
+        print(f"Exception during training: {e}")
+        exit_dataloader()
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt: Closing dataloaders and exiting")
+        exit_dataloader()
+        sys.exit(1)
+    finally:
+        exit_dataloader()
 
 # ========== Save Final Model ==========
 print(f"\nSaving final model to {OUTPUT_DIR}...")
