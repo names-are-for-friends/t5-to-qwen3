@@ -16,6 +16,7 @@ import queue
 import threading
 import gc
 import sys
+import datetime
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -23,7 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
 QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
@@ -32,26 +33,73 @@ PREFETCH_FACTOR = 16
 USE_SEPARATE_EVALUATION_DATASET = True # Otherwise we take some of the main dataset, but best to use unseen data
 EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
+ENABLE_LOGGING = True
+WRITE_TO_LOG_EVERY_X_STEPS = 10
+
 BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1
-EPOCHS = 50
-MAX_LEARNING_RATE = 1e-4
-MIN_LEARNING_RATE = 1e-5
 GRAD_CLIP = 1.0
-SAVE_EVERY_X_STEPS = 500
+
+EPOCHS = 50
+
+MAX_LEARNING_RATE = 5e-5 # The peak learning rate at which we exit the warmup phase and enter the CosineAnnealingWarmRestarts scheduler
+MIN_LEARNING_RATE = 1e-5 # The initial learning rate when we begin, from which we warmup to the MAX_LEARNING_RATE
+
+SAVE_EVERY_X_STEPS = 0
 SAVE_EVERY_X_RESTARTS = 1
+SAVE_EVERY_X_EPOCHS = 1
+
 PRINT_EVERY_X_STEPS = 1
-EVAL_EVERY_EPOCHS = 1
+EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
 HUBER_LOSS = 0.70
 COSINE_LOSS = 0.30
+TOKEN_HUBER_LOSS = 1e-8 # Keep it tiny! Per-token loss is a bad overall target and use WILL result in dissolved grey noise output and a lot of wasted training time; it might however be potentially beneficial to preserve per-token similarity against the main sequence loss. Further testing is required to discern the ideal value or whether this is worth using. Note: if you set this to zero, it will actually be zeroed; we skip the loss calculation and simply set it as zero
+TOKEN_COSINE_LOSS = 1e-8 # Ditto to above. Also, note: for the logging we use SQ to refer to sequence loss and PT to refer to per-token
 
-WARMUP_STEPS = 501
-RESTART_PERIOD_STEPS = 1150
+WARMUP_STEPS = 501 # Set to 0 to disable warmup
+RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 
-INTERMEDIATE_DIM = 1024 # We scale the output to this size before inputting it into the transformer encoder. Significantly affects the size of the projection layer and VRAM consumption during training
 FEED_FORWARD_DIM = 1024
+TRANSFORMER_LAYERS = 1
+
+# ========== Experimental Configuration ==========
+'''
+These settings are largely untested! Be careful!
+'''
+SWAP_IDEALISED_EMBEDDINGS = False  # Experimental option. Swap teacher embeddings for "idealised" embeddings based on a different dataset. Will make a separate cache if caching enabled
+IDEALISED_DATASET_PATH = "/path/to/idealised_dataset.txt"
+
+SWAP_STUDENT_PROMPTS = False  # Experimental option. Swap student prompts for alternative prompts, for instance a translated version of the dataset
+ALTERNATIVE_STUDENT_DATASET_PATH = "/path/to/alternative_prompts.txt"  # Path to alternative prompts
+
+SWAP_IDEALISED_ALTERNATIVE_PROMPTS = False # Experimental option. If using alternative student prompts, also use alternative student idealised prompts
+IDEALISED_ALTERNATIVE_STUDENT_DATASET_PATH = "/path/to/alternative_idealised_prompts.txt"
+
+PRIMARY_DATASET_RATIO = 0.40
+IDEALISED_EMBEDDING_RATIO = 0.05
+IDEALISED_PROMPT_AND_EMBEDDING_RATIO = 0.40
+ALTERNATIVE_STUDENT_PROMPTS_RATIO = 0.07
+ALTERNATIVE_STUDENT_IDEALISED_RATIO = 0.01
+ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO = 0.07
+
+ENABLE_STUDENT_WORD_DROPOUT = True
+STUDENT_WORD_DROPOUT_RATIO = 0.02
+ENABLE_ALT_STUDENT_WORD_DROPOUT = False
+ALT_STUDENT_WORD_DROPOUT_RATIO = 0.1
+
+ENABLE_STUDENT_CHAR_DROPOUT = False
+STUDENT_CHAR_DROPOUT_RATIO = 0.1
+ENABLE_ALT_STUDENT_CHAR_DROPOUT = True
+ALT_STUDENT_CHAR_DROPOUT_RATIO = 0.001
+
+DEBUG_PRINT = False # Not fully implemented yet, but you'll get more verbose output in the terminal
+
+# ========== Debug Function ==========
+def debug(statement):
+    if DEBUG_PRINT:
+        print(f'{statement}')
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -67,14 +115,65 @@ class PreTokenizedDataset(Dataset):
         if is_eval and sample_rate is not None:
             self.lines = random.sample(self.lines, min(int(len(self.lines) * sample_rate), len(self.lines)))
 
-        student_inputs = student_tokenizer(
-            self.lines,
-            padding="max_length",
-            truncation=True,
-            max_length=max_length
-        )
-        self.student_input_ids = torch.tensor(student_inputs["input_ids"], dtype=torch.long)
-        self.student_attention_mask = torch.tensor(student_inputs["attention_mask"], dtype=torch.long)
+        if SWAP_STUDENT_PROMPTS:
+            with open(ALTERNATIVE_STUDENT_DATASET_PATH, "r", encoding="utf-8") as f:
+                self.alt_lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(self.alt_lines) < len(self.lines):
+                self.alt_lines += self.lines[len(self.alt_lines):]
+            elif len(self.alt_lines) > len(self.lines):
+                self.alt_lines = self.alt_lines[:len(self.lines)]
+        else:
+            self.alt_lines = self.lines
+
+        self.idealised_lines = []
+        if SWAP_IDEALISED_EMBEDDINGS:
+            with open(IDEALISED_DATASET_PATH, "r", encoding="utf-8") as f:
+                self.idealised_lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(self.idealised_lines) < len(self.lines):
+                self.idealised_lines += self.lines[len(self.idealised_lines):]
+            elif len(self.idealised_lines) > len(self.lines):
+                self.idealised_lines = self.idealised_lines[:len(self.lines)]
+
+        self.alt_idealised_lines = []
+        if SWAP_IDEALISED_ALTERNATIVE_PROMPTS:
+            with open(ALT_IDEALISED_STUDENT_DATASET_PATH, "r", encoding="utf-8") as f:
+                self.alt_idealised_lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(self.alt_idealised_lines) < len(self.lines):
+                self.alt_idealised_lines += self.lines[len(self.alt_idealised_lines):]
+            elif len(self.alt_idealised_lines) > len(self.lines):
+                self.alt_idealised_lines = self.alt_idealised_lines[:len(self.lines)]
+
+        ratios = [PRIMARY_DATASET_RATIO]
+        if SWAP_IDEALISED_EMBEDDINGS:
+            ratios.append(IDEALISED_EMBEDDING_RATIO)
+            ratios.append(IDEALISED_PROMPT_AND_EMBEDDING_RATIO)
+            if SWAP_STUDENT_PROMPTS:
+                ratios.append(ALTERNATIVE_STUDENT_PROMPTS_RATIO)
+                ratios.append(ALTERNATIVE_STUDENT_IDEALISED_RATIO)
+                if SWAP_IDEALISED_ALTERNATIVE_PROMPTS:
+                    ratios.append(ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO)
+        elif SWAP_STUDENT_PROMPTS:
+            ratios.append(0)
+            ratios.append(0)
+            ratios.append(ALTERNATIVE_STUDENT_PROMPTS_RATIO)
+
+            total = sum(ratios)
+            enabled_ratios = [r / total for r in ratios]
+        else:
+            enabled_ratios = []
+
+        self.enabled_ratios = enabled_ratios
+        self.num_ratios = len(enabled_ratios)
+
+        self.student_raw_lines = self.lines
+        self.teacher_raw_lines = self.lines
+        self.alt_student_raw_lines = self.alt_lines
+        self.idealised_teacher_raw_lines = self.idealised_lines
+        self.alt_idealised_student_raw_lines = self.alt_idealised_lines
+
+        self.student_tokenizer = student_tokenizer
+        self.teacher_tokenizer = teacher_tokenizer
+        self.max_length = max_length
 
         if use_cached_embeddings:
             base_name = os.path.basename(file_path)
@@ -89,6 +188,46 @@ class PreTokenizedDataset(Dataset):
 
                 self.embedding_files = [os.path.join(self.cache_folder, f"{i}.pt") for i in range(len(self.lines))]
                 self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
+
+                if SWAP_IDEALISED_EMBEDDINGS:
+                    idealised_base_name = os.path.basename(IDEALISED_DATASET_PATH)
+                    idealised_cache_folder = os.path.join(cache_path, idealised_base_name)
+                    idealised_validation_file = os.path.join(idealised_cache_folder, f"{idealised_base_name}.validation")
+
+                    if os.path.exists(idealised_validation_file):
+                        self.idealised_cache_folder = idealised_cache_folder
+                        self.idealised_embedding_files = [os.path.join(idealised_cache_folder, f"{i}.pt") for i in range(len(self.idealised_lines))]
+                        self.idealised_mask_files = [os.path.join(idealised_cache_folder, f"{i}_mask.pt") for i in range(len(self.idealised_lines))]
+                    else:
+                        print(f"Generating and caching idealised embeddings for {IDEALISED_DATASET_PATH}")
+                        os.makedirs(idealised_cache_folder, exist_ok=True)
+                        for i, line in enumerate(tqdm(self.idealised_lines, desc="Generating idealised embeddings")):
+                            teacher_inputs = teacher_tokenizer(
+                                line,
+                                padding="max_length",
+                                truncation=True,
+                                max_length=max_length
+                            )
+                            input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long).unsqueeze(0)
+                            att_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long).unsqueeze(0)
+
+                            with torch.no_grad():
+                                outputs = teacher_model(
+                                    input_ids=input_ids.to(teacher_model.device),
+                                    attention_mask=att_mask.to(teacher_model.device)
+                                )
+                                embeddings = outputs.last_hidden_state.cpu()
+
+                            embedding_file = os.path.join(idealised_cache_folder, f"{i}.pt")
+                            mask_file = os.path.join(idealised_cache_folder, f"{i}_mask.pt")
+                            torch.save(embeddings, embedding_file)
+                            torch.save(att_mask.cpu(), mask_file)
+
+                        with open(idealised_validation_file, "w") as f:
+                            pass
+                        self.idealised_cache_folder = idealised_cache_folder
+                        self.idealised_embedding_files = [os.path.join(idealised_cache_folder, f"{i}.pt") for i in range(len(self.idealised_lines))]
+                        self.idealised_mask_files = [os.path.join(idealised_cache_folder, f"{i}_mask.pt") for i in range(len(self.idealised_lines))]
             else:
                 print(f"Generating and caching embeddings for {file_path}")
                 os.makedirs(cache_folder, exist_ok=True)
@@ -125,14 +264,7 @@ class PreTokenizedDataset(Dataset):
                 self.embedding_files = [os.path.join(self.cache_folder, f"{i}.pt") for i in range(len(self.lines))]
                 self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
         else:
-            teacher_inputs = teacher_tokenizer(
-                self.lines,
-                padding="max_length",
-                truncation=True,
-                max_length=max_length
-            )
-            self.teacher_input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long)
-            self.teacher_attention_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
+            pass
 
         self.use_cached_embeddings = use_cached_embeddings
         self.line_index = list(range(len(self.lines)))
@@ -141,9 +273,104 @@ class PreTokenizedDataset(Dataset):
         return len(self.lines)
 
     def __getitem__(self, idx):
+        def apply_dropout(line, word_dropout_ratio, char_dropout_ratio):
+            if word_dropout_ratio > 0:
+                words = line.split()
+                kept_words = []
+                for word in words:
+                    if random.random() > word_dropout_ratio:
+                        kept_words.append(word)
+                line = " ".join(kept_words)
+
+            if char_dropout_ratio > 0:
+                chars = list(line)
+                kept_chars = []
+                for char in chars:
+                    if random.random() > char_dropout_ratio:
+                        kept_chars.append(char)
+                line = "".join(kept_chars)
+            return line
+
+        if self.enabled_ratios:
+            choice = random.choices(range(self.num_ratios), weights=self.enabled_ratios)[0]
+
+            if choice == 0:  # PRIMARY_DATASET_RATIO
+                debug("Student line from primary dataset:")
+                student_line = self.student_raw_lines[idx]
+                teacher_line = self.teacher_raw_lines[idx]
+                student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "original"
+
+            elif choice == 1:  # IDEALISED_EMBEDDING_RATIO
+                debug("Student line from primary dataset:")
+                student_line = self.student_raw_lines[idx]
+                teacher_line = self.idealised_teacher_raw_lines[idx]
+                student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "idealised"
+
+            elif choice == 2:  # IDEALISED_PROMPT_AND_EMBEDDING_RATIO
+                debug("Student line from idealised dataset:")
+                student_line = self.idealised_teacher_raw_lines[idx]
+                teacher_line = self.idealised_teacher_raw_lines[idx]
+                student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "idealised"
+
+            elif choice == 3:  # ALTERNATIVE_STUDENT_PROMPTS_RATIO
+                debug("Student line from alternative dataset:")
+                student_line = self.alt_student_raw_lines[idx]
+                teacher_line = self.teacher_raw_lines[idx]
+                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "original"
+
+            elif choice == 4:  # ALTERNATIVE_STUDENT_IDEALISED_RATIO
+                debug("Student line from alternative dataset:")
+                student_line = self.alt_student_raw_lines[idx]
+                teacher_line = self.idealised_teacher_raw_lines[idx]
+                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "idealised"
+
+            elif choice == 5:  # ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO
+                debug("Student line from alternative idealised dataset:")
+                student_line = self.alt_idealised_student_raw_lines[idx]
+                teacher_line = self.idealised_teacher_raw_lines[idx]
+                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
+                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
+                teacher_type = "idealised"
+
+        else:
+            debug("Student line from primary dataset:")
+            student_line = self.student_raw_lines[idx]
+            teacher_line = self.teacher_raw_lines[idx]
+            student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
+            student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
+            teacher_type = "original"
+
+        student_line = apply_dropout(student_line, student_dropout_word, student_dropout_char)
+        debug(student_line)
+        debug("Teacher line:")
+        debug(teacher_line)
+
+        student_inputs = self.student_tokenizer(
+            student_line,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length
+        )
+        student_input_ids = torch.tensor(student_inputs["input_ids"], dtype=torch.long)
+        student_attention_mask = torch.tensor(student_inputs["attention_mask"], dtype=torch.long)
+
         if self.use_cached_embeddings:
-            embeddings = torch.load(self.embedding_files[idx], map_location='cpu')
-            att_mask = torch.load(self.mask_files[idx], map_location='cpu')
+            if teacher_type == "idealised" and hasattr(self, 'idealised_embedding_files'):
+                embeddings = torch.load(self.idealised_embedding_files[idx], map_location='cpu')
+                att_mask = torch.load(self.idealised_mask_files[idx], map_location='cpu')
+            else:
+                embeddings = torch.load(self.embedding_files[idx], map_location='cpu')
+                att_mask = torch.load(self.mask_files[idx], map_location='cpu')
 
             if embeddings.shape[1] < self.max_length:
                 pad_length = self.max_length - embeddings.shape[1]
@@ -165,17 +392,26 @@ class PreTokenizedDataset(Dataset):
                 att_mask = att_mask.squeeze(0)
 
             return (
-                self.student_input_ids[idx],
-                self.student_attention_mask[idx],
+                student_input_ids,
+                student_attention_mask,
                 embeddings,
                 att_mask
             )
         else:
+            teacher_inputs = self.teacher_tokenizer(
+                teacher_line,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_length
+            )
+            teacher_input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long)
+            teacher_attention_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
+
             return (
-                self.student_input_ids[idx],
-                self.student_attention_mask[idx],
-                self.teacher_input_ids[idx],
-                self.teacher_attention_mask[idx]
+                student_input_ids,
+                student_attention_mask,
+                teacher_input_ids,
+                teacher_attention_mask
             )
 
     def __enter__(self):
@@ -189,10 +425,8 @@ class PreTokenizedDataset(Dataset):
 
 # ========== Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, transformer_dim, output_dim=4096, dim_feedforward=None, num_layers=1):
+    def __init__(self, input_dim, transformer_dim, output_dim=4096, dim_feedforward=2048, num_layers=1):
         super().__init__()
-        if dim_feedforward is None:
-            dim_feedforward = transformer_dim
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
 
         transformer_layer = torch.nn.TransformerEncoderLayer(
@@ -219,10 +453,13 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, sequence_huber_weight=0.70, sequence_cosine_weight=0.30):
+    def __init__(self, sequence_huber_weight=0.70, sequence_cosine_weight=0.30,
+                 token_huber_weight=1e-6, token_cosine_weight=1e-6):
         super().__init__()
         self.sequence_huber_weight = sequence_huber_weight
         self.sequence_cosine_weight = sequence_cosine_weight
+        self.token_huber_weight = token_huber_weight
+        self.token_cosine_weight = token_cosine_weight
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
@@ -244,17 +481,30 @@ class HybridLoss(torch.nn.Module):
         teacher_pooled = numerator_teacher / denominator
 
         sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
-
         sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
         sequence_cos_loss = (1 - sequence_cos_sim).mean()
 
+        token_huber_loss = 0.0
+        token_cos_loss = 0.0
+
+        if self.token_huber_weight > 0:
+            token_huber_loss = self.huber(student_output, teacher_output)
+            token_huber_loss = token_huber_loss.mean(dim=-1)
+            token_huber_loss = (token_huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+
+        if self.token_cosine_weight > 0:
+            token_cos_sim = self.cos(student_output, teacher_output)
+            token_cos_loss = 1 - token_cos_sim
+            token_cos_loss = (token_cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+
         total_loss = (
             self.sequence_huber_weight * sequence_huber_loss +
-            self.sequence_cosine_weight * sequence_cos_loss
+            self.sequence_cosine_weight * sequence_cos_loss +
+            self.token_huber_weight * token_huber_loss.mean() +
+            self.token_cosine_weight * token_cos_loss.mean()
         )
 
-        return total_loss, sequence_huber_loss, sequence_cos_loss
-
+        return total_loss, sequence_huber_loss, sequence_cos_loss, token_huber_loss.mean(), token_cos_loss.mean()
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -265,7 +515,9 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     total_losses = {
         'total': 0.0,
         'huber': 0.0,
-        'cos': 0.0
+        'cos': 0.0,
+        'token_huber': 0.0,
+        'token_cos': 0.0
     }
 
     with torch.no_grad():
@@ -299,7 +551,7 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, huber_loss, cos_loss = loss_fn(
+                loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = loss_fn(
                     projected_student,
                     teacher_hidden,
                     t_att_mask
@@ -308,8 +560,10 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                 total_losses['total'] += loss.item()
                 total_losses['huber'] += huber_loss.item()
                 total_losses['cos'] += cos_loss.item()
+                total_losses['token_huber'] += token_huber_loss.item()
+                total_losses['token_cos'] += token_cos_loss.item()
 
-                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs
+                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs, token_cos_loss, token_huber_loss
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
                 del s_input_ids, s_att_mask, t_att_mask, t_embeddings
@@ -364,10 +618,10 @@ def save_trained_model(save_path, model, tokenizer, projection, qwen_embedding_d
 def save_projection_config(projection_config_path, embedding_dim):
     projection_config = {
         "input_dim": embedding_dim,
-        "transformer_dim": INTERMEDIATE_DIM,
+        "transformer_dim": embedding_dim,
         "output_dim": 4096,
         "dim_feedforward": FEED_FORWARD_DIM,
-        "num_layers": 1
+        "num_layers": TRANSFORMER_LAYERS,
     }
     with open(projection_config_path, "w") as f:
         json.dump(projection_config, f)
@@ -382,6 +636,24 @@ def exit_dataloader():
     del eval_dataloader
     del eval_dataset
     gc.collect()
+
+def get_logging():
+    log_line = (
+        f"Epoch [{epoch + 1}/{EPOCHS}], "
+        f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
+        f"Step: {global_step}/{total_steps}, "
+        f"Total Loss: {current_loss:.6f}, "
+        f"SQ Huber Loss: {current_huber:.6f}, "
+        f"SQ Cosine Loss: {current_cos:.6f}, "
+        f"PT Huber Loss: {current_token_huber:.6f}, "
+        f"PT Cosine Loss: {current_token_cos:.6f}, "
+        f"Grad Norm: {grad_norm:.6f}, "
+        f"Learning Rate: {current_lr:.6f}, "
+        f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
+        f"Elapsed: {elapsed/60:.1f} min, "
+        f"ETA: {eta/60:.1f} min"
+    )
+    return log_line
 
 # ========== Load Qwen3 Model ==========
 gc.collect
@@ -445,9 +717,10 @@ if os.path.exists(projection_path):
         state_dict = load_file(projection_path)
         projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
-            transformer_dim=INTERMEDIATE_DIM,
+            transformer_dim=qwen_embedding_dim,
             output_dim=4096,
-            dim_feedforward=FEED_FORWARD_DIM
+            dim_feedforward=FEED_FORWARD_DIM,
+            num_layers=TRANSFORMER_LAYERS,
         )
         projection.load_state_dict(state_dict)
     except Exception as e:
@@ -455,28 +728,32 @@ if os.path.exists(projection_path):
         print("Initializing projection layer")
         projection = ProjectionLayer(
             input_dim=qwen_embedding_dim,
-            transformer_dim=INTERMEDIATE_DIM,
+            transformer_dim=qwen_embedding_dim,
             output_dim=4096,
-            dim_feedforward=FEED_FORWARD_DIM
+            dim_feedforward=FEED_FORWARD_DIM,
+            num_layers=TRANSFORMER_LAYERS,
         )
 else:
     print("Initializing projection layer")
     projection = ProjectionLayer(
         input_dim=qwen_embedding_dim,
-        transformer_dim=INTERMEDIATE_DIM,
+        transformer_dim=qwen_embedding_dim,
         output_dim=4096,
-        dim_feedforward=FEED_FORWARD_DIM
+        dim_feedforward=FEED_FORWARD_DIM,
+        num_layers=TRANSFORMER_LAYERS,
     )
 
 projection.to(device, dtype=torch.bfloat16)
 
-losses = [HUBER_LOSS, COSINE_LOSS]
+losses = [HUBER_LOSS, COSINE_LOSS, TOKEN_HUBER_LOSS, TOKEN_COSINE_LOSS]
 sum_loss = sum(losses)
-normalized_losses = [loss / sum_loss for loss in losses]
+normalised_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
-    sequence_huber_weight=normalized_losses[0],
-    sequence_cosine_weight=normalized_losses[1],
+    sequence_huber_weight=normalised_losses[0],
+    sequence_cosine_weight=normalised_losses[1],
+    token_huber_weight=normalised_losses[2],
+    token_cosine_weight=normalised_losses[3]
 ).to(device, dtype=torch.bfloat16)
 
 # ========== Dataset and Dataloader ==========
@@ -540,6 +817,14 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         grad_norm = 0
         restart_count = 0
 
+        if ENABLE_LOGGING:
+            log_dir = os.path.join(OUTPUT_DIR, "logging")
+            current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            log_filename = f"training_log_{current_time}.txt"
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, log_filename)
+            log_lines = []
+
         optimizer = torch.optim.AdamW(
             [p for p in student_model.parameters() if p.requires_grad] +
             list(projection.parameters()),
@@ -549,12 +834,20 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             eps=1e-8
         )
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=RESTART_PERIOD_STEPS,
-            T_mult=1,
-            eta_min=MIN_LEARNING_RATE,
-        )
+        if RESTART_PERIOD_STEPS == 0:
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=1.0,
+                total_iters=total_steps - WARMUP_STEPS
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=RESTART_PERIOD_STEPS,
+                T_mult=1,
+                eta_min=MIN_LEARNING_RATE,
+            )
 
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
@@ -612,7 +905,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             teacher_hidden = teacher_outputs.last_hidden_state
                             teacher_hidden = teacher_hidden.to(device)
 
-                    loss, huber_loss, cos_loss = hybrid_loss(
+                    loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = hybrid_loss(
                         projected_student,
                         teacher_hidden,
                         t_att_mask
@@ -641,6 +934,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         current_loss = loss.item()
                         current_huber = huber_loss.item()
                         current_cos = cos_loss.item()
+                        current_token_huber = token_huber_loss.item()
+                        current_token_cos = token_cos_loss.item()
 
                         if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
                             elapsed = time.time() - start_time - eval_delta_time
@@ -648,35 +943,30 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
                             vram_free, vram_total, vram_used = get_memory_usage()
                             current_lr = scheduler.get_last_lr()[0]
-
-                            print(
-                                f"Epoch [{epoch + 1}/{EPOCHS}], "
-                                f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
-                                f"Step: {global_step}/{total_steps}, "
-                                f"Total Loss: {current_loss:.6f}, "
-                                f"Huber Loss: {current_huber:.6f}, "
-                                f"Cosine Loss: {current_cos:.6f}, "
-                                f"Grad Norm: {grad_norm:.6f}, "
-                                f"Learning Rate: {current_lr:.6f}, "
-                                f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
-                                f"Elapsed: {elapsed/60:.1f} min, "
-                                f"ETA: {eta/60:.1f} min"
-                            )
-
-                        if SAVE_EVERY_X_RESTARTS > 0 and global_step > WARMUP_STEPS and (global_step - WARMUP_STEPS) % RESTART_PERIOD_STEPS == 0:
-                            restart_count += 1
-                            if restart_count % SAVE_EVERY_X_RESTARTS == 0:
-                                print(f"\nSaving checkpoint at restart {restart_count}\n")
-                                save_path = os.path.join(OUTPUT_DIR, f"restart_{restart_count}")
-                                save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
+                            print(get_logging())
 
                         if SAVE_EVERY_X_STEPS > 0 and global_step % SAVE_EVERY_X_STEPS == 0:
-                            print(f"\nSaving checkpoint at step {global_step}")
+                            print(f"\nSaving checkpoint at step {global_step}\n")
                             save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
                             save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
 
-                        del loss, scaled_loss, student_outputs, student_hidden, projected_student
-                        del teacher_hidden, huber_loss, cos_loss
+                        if (global_step + 1) > WARMUP_STEPS and ((global_step + 1) - WARMUP_STEPS) % RESTART_PERIOD_STEPS == 0:
+                            next_restart = restart_count + 1
+                            if SAVE_EVERY_X_RESTARTS > 0 and next_restart % SAVE_EVERY_X_RESTARTS == 0:
+                                print(f"\nSaving checkpoint at restart {next_restart}\n")
+                                save_path = os.path.join(OUTPUT_DIR, f"restart_{next_restart}")
+                                save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
+                            restart_count += 1
+
+                        if ENABLE_LOGGING:
+                            log_lines.append(get_logging())
+                            if global_step % WRITE_TO_LOG_EVERY_X_STEPS == 0:
+                                with open(log_file, "a") as f:
+                                    for line in log_lines:
+                                        f.write(line + "\n")
+                                log_lines.clear()
+
+                        del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss, token_cos_loss, token_huber_loss
                         if 't_input_ids' in locals():
                             del t_input_ids, t_att_mask, teacher_outputs
 
@@ -710,7 +1000,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
 
             print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
 
-            if (epoch + 1) % EVAL_EVERY_EPOCHS == 0:
+            next_epoch = epoch + 1
+            if next_epoch % SAVE_EVERY_X_EPOCHS == 0:
+                print(f"\nSaving checkpoint at epoch {next_epoch}\n")
+                save_path = os.path.join(OUTPUT_DIR, f"epoch_{next_epoch}")
+                save_trained_model(best_model_dir, student_model, student_tokenizer, projection, qwen_embedding_dim)
+
+            if next_epoch % EVAL_EVERY_X_EPOCHS == 0:
                 eval_start_time = time.time()
 
                 eval_metrics = evaluate_model(
