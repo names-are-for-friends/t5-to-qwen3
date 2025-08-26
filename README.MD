@@ -8,7 +8,7 @@ linear_in (1024) -> transformer (1024) -> upscale (1024-4096) -> activation (409
 
 Simply, we take the transformer's ability to project sequentially, and the dimensional upscaling & granular refinement of the linear upscale and activation layers respectively, to approximate the T5-xxl output.
 
-Of course, we also use the T5-xxl attention mask exclusively for both loss calculation and inference, since we are projecting to match the T5-xxl sequence.
+Of course, we also use the T5-xxl attention mask exclusively for both loss calculation and (post-training) inference, since we are projecting to match the T5-xxl sequence.
 
 ### Quick installation
 ---
