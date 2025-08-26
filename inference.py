@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/ultimate-q3-xxs-v1/checkpoint_step_500"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_12"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -40,6 +40,7 @@ APPEND_DATETIME = True
 
 T5_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5-xxl
 USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
+QWEN_WITH_T5_MASK_ADDITIONAL_ATTENTION = 1 # The current training method encourages sequential projection beyond the T5 mask. For now, experiment with this
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -1427,6 +1428,10 @@ if __name__ == "__main__":
 
             del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5
 
+            use_t5 = True
+
+            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
+
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
 
@@ -1465,7 +1470,7 @@ if __name__ == "__main__":
 
     # Adjust output filename if requested
     if APPEND_DATETIME:
-        current_time = datetime.datetime.now().strftime("%Y%m%d%M%S")
+        current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         base_name = args.output_file
         output_filename = f"{base_name}_{current_time}.{args.format}"
     else:
