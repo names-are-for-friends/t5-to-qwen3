@@ -19,7 +19,7 @@ pip install -r requirements.txt
 
 You're recommended to use a 3.11 Python venv, as that's what I've been using. Configuration options are provided at the top of both scripts. You can pass a --t5 flag to the inference script to use T5-xxl instead.
 
-## Credit
+### Credit
 ---
 - [lodestone-rock](https://huggingface.co/lodestones) for the inference script and the Chroma image generation model
 - [Qwen](https://huggingface.co/Qwen) for the Qwen large language models
