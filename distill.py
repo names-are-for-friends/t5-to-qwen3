@@ -17,6 +17,8 @@ import threading
 import gc
 import sys
 import datetime
+import math
+import requests
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -42,8 +44,8 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 50
 
-MAX_LEARNING_RATE = 5e-5 # The peak learning rate at which we exit the warmup phase and enter the CosineAnnealingWarmRestarts scheduler
-MIN_LEARNING_RATE = 1e-5 # The initial learning rate when we begin, from which we warmup to the MAX_LEARNING_RATE
+MAX_LEARNING_RATE = 8e-5
+MIN_LEARNING_RATE = 1e-5
 
 SAVE_EVERY_X_STEPS = 0
 SAVE_EVERY_X_RESTARTS = 1
@@ -53,10 +55,10 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.70
-COSINE_LOSS = 0.30
-TOKEN_HUBER_LOSS = 1e-8 # Keep it tiny! Per-token loss is a bad overall target and use WILL result in dissolved grey noise output and a lot of wasted training time; it might however be potentially beneficial to preserve per-token similarity against the main sequence loss. Further testing is required to discern the ideal value or whether this is worth using. Note: if you set this to zero, it will actually be zeroed; we skip the loss calculation and simply set it as zero
-TOKEN_COSINE_LOSS = 1e-8 # Ditto to above. Also, note: for the logging we use SQ to refer to sequence loss and PT to refer to per-token
+HUBER_LOSS = 0.50
+COSINE_LOSS = 0.20
+TOKEN_HUBER_LOSS = 0.25 # New: pegged this to the student mask. I think perhaps applying this to the more noisy projected content was causing degradation of output. Needs further testing thought
+TOKEN_COSINE_LOSS = 0.05
 
 WARMUP_STEPS = 501 # Set to 0 to disable warmup
 RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
@@ -64,42 +66,77 @@ RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 FEED_FORWARD_DIM = 1024
 TRANSFORMER_LAYERS = 1
 
-# ========== Experimental Configuration ==========
+# ========== Translation Configuration ==========
 '''
-These settings are largely untested! Be careful!
+You can hook in to a local LibreTranslate server to perform on-the-fly translation of the student prompt:
+https://github.com/LibreTranslate/LibreTranslate
+If the API URL can't be connected to, this will be disabled automatically
+Impact on training speed and resources should be low, it's a relatively minor CPU load and a small amount of RAM
+Training on English prompts DOES benefit multilingual ability, but it needs a little extra push
 '''
-SWAP_IDEALISED_EMBEDDINGS = False  # Experimental option. Swap teacher embeddings for "idealised" embeddings based on a different dataset. Will make a separate cache if caching enabled
-IDEALISED_DATASET_PATH = "/path/to/idealised_dataset.txt"
+ENABLE_ON_THE_FLY_TRANSLATION = True
+TRANSLATION_API_URL = "http://localhost:5000/translate"
 
-SWAP_STUDENT_PROMPTS = False  # Experimental option. Swap student prompts for alternative prompts, for instance a translated version of the dataset
-ALTERNATIVE_STUDENT_DATASET_PATH = "/path/to/alternative_prompts.txt"  # Path to alternative prompts
+ENGLISH_PROMPT_RATIO = 0.80
+TRANSLATED_PROMPT_RATIO = 0.20
 
-SWAP_IDEALISED_ALTERNATIVE_PROMPTS = False # Experimental option. If using alternative student prompts, also use alternative student idealised prompts
-IDEALISED_ALTERNATIVE_STUDENT_DATASET_PATH = "/path/to/alternative_idealised_prompts.txt"
+SUPPORTED_LANGUAGES = {
+    "zh": 0.20,    # Chinese
+    "hi": 0.10,    # Hindi
+    "es": 0.10,    # Spanish
+    "ar": 0.08,    # Arabic
+    "fr": 0.08,    # French
+    "bn": 0.07,    # Bengali
+    "pt": 0.07,    # Portuguese
+    "ru": 0.07,    # Russian
+    "id": 0.07,    # Indonesian
+    "ja": 0.07,    # Japanese
+    "ur": 0.05,    # Urdu
+    "ko": 0.05,    # Korean
+    "de": 0.05,    # German
+}
 
-PRIMARY_DATASET_RATIO = 0.40
-IDEALISED_EMBEDDING_RATIO = 0.05
-IDEALISED_PROMPT_AND_EMBEDDING_RATIO = 0.40
-ALTERNATIVE_STUDENT_PROMPTS_RATIO = 0.07
-ALTERNATIVE_STUDENT_IDEALISED_RATIO = 0.01
-ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO = 0.07
+# ========== Advanced Configuration ==========
+'''
+Features that may or may not help, but have at least been tested somewhat
+The theory of the enhanced dataset and dropout is mostly to encourage sequential projection
+Dropout should slightly bias towards projection forwards
+The enhanced dataset largely consists of prompts ~2x or more the length of the student prompt, but with related concepts
+(Though the prompt enhancement model isn't very good, hence "noisy detail" lol)
+My hope is that this will encourage a projection of noisy detail into the back end of the embedding
+We can then test if expanding the mask to cover this noisy detail has any benefit or not
+'''
+ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
+ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
+
+UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.48 # No swapping
+ENHANCED_TEACHER_EMBEDDING_RATIO = 0.04 # Teacher prompt or embedding is swapped for enhanced
+ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.48 # Teacher and student prompt or embedding is swapped for enhanced
 
 ENABLE_STUDENT_WORD_DROPOUT = True
-STUDENT_WORD_DROPOUT_RATIO = 0.02
-ENABLE_ALT_STUDENT_WORD_DROPOUT = False
-ALT_STUDENT_WORD_DROPOUT_RATIO = 0.1
+STUDENT_WORD_DROPOUT_RATIO = 0.05
 
-ENABLE_STUDENT_CHAR_DROPOUT = False
-STUDENT_CHAR_DROPOUT_RATIO = 0.1
-ENABLE_ALT_STUDENT_CHAR_DROPOUT = True
-ALT_STUDENT_CHAR_DROPOUT_RATIO = 0.001
+DISABLE_DROPOUT_FOR_UNSPACED_LANGUAGES = True
+UNSPACED_LANGUAGES = ["zh", "ja", "ko"]
 
-DEBUG_PRINT = False # Not fully implemented yet, but you'll get more verbose output in the terminal
+# ========== Experimental Configuration ==========
+'''
+These settings largely exist for testing purposes and could break things
+'''
+USE_STUDENT_MASK_FOR_TOKEN_LOSS = True
+USE_STUDENT_TEACHER_MASK_INSTEAD_OF_TEACHER_MASK_FOR_SEQUENCE_LOSS = False
+SKIP_TOKEN_LOSS_IF_ENHANCED_TEACHER_AND_NORMAL_STUDENT = True
+SKIP_TOKEN_LOSS_IF_DROPOUT_APPLIED = False
+SKIP_TOKEN_LOSS_FOR_TRANSLATED_PROMPTS = True
+
+DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
 
 # ========== Debug Function ==========
-def debug(statement):
+def debug(description, variable=None):
     if DEBUG_PRINT:
-        print(f'{statement}')
+        print(f'{description}')
+        if variable is not None:
+            print(f'{variable}')
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
@@ -115,61 +152,30 @@ class PreTokenizedDataset(Dataset):
         if is_eval and sample_rate is not None:
             self.lines = random.sample(self.lines, min(int(len(self.lines) * sample_rate), len(self.lines)))
 
-        if SWAP_STUDENT_PROMPTS:
-            with open(ALTERNATIVE_STUDENT_DATASET_PATH, "r", encoding="utf-8") as f:
-                self.alt_lines = [line.strip() for line in f.readlines() if line.strip()]
-            if len(self.alt_lines) < len(self.lines):
-                self.alt_lines += self.lines[len(self.alt_lines):]
-            elif len(self.alt_lines) > len(self.lines):
-                self.alt_lines = self.alt_lines[:len(self.lines)]
+        self.enhanced_lines = []
+        if ENHANCED_DATASET:
+            with open(ENHANCED_DATASET_PATH, "r", encoding="utf-8") as f:
+                self.enhanced_lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(self.enhanced_lines) < len(self.lines):
+                self.enhanced_lines += self.lines[len(self.enhanced_lines):]
+            elif len(self.enhanced_lines) > len(self.lines):
+                self.enhanced_lines = self.enhanced_lines[:len(self.lines)]
+
+        ratios = [UNTAMPERED_STUDENT_AND_TEACHER_RATIO]
+        if ENHANCED_DATASET:
+            ratios.append(ENHANCED_TEACHER_EMBEDDING_RATIO)
+            ratios.append(ENHANCED_STUDENT_AND_TEACHER_RATIO)
         else:
-            self.alt_lines = self.lines
-
-        self.idealised_lines = []
-        if SWAP_IDEALISED_EMBEDDINGS:
-            with open(IDEALISED_DATASET_PATH, "r", encoding="utf-8") as f:
-                self.idealised_lines = [line.strip() for line in f.readlines() if line.strip()]
-            if len(self.idealised_lines) < len(self.lines):
-                self.idealised_lines += self.lines[len(self.idealised_lines):]
-            elif len(self.idealised_lines) > len(self.lines):
-                self.idealised_lines = self.idealised_lines[:len(self.lines)]
-
-        self.alt_idealised_lines = []
-        if SWAP_IDEALISED_ALTERNATIVE_PROMPTS:
-            with open(ALT_IDEALISED_STUDENT_DATASET_PATH, "r", encoding="utf-8") as f:
-                self.alt_idealised_lines = [line.strip() for line in f.readlines() if line.strip()]
-            if len(self.alt_idealised_lines) < len(self.lines):
-                self.alt_idealised_lines += self.lines[len(self.alt_idealised_lines):]
-            elif len(self.alt_idealised_lines) > len(self.lines):
-                self.alt_idealised_lines = self.alt_idealised_lines[:len(self.lines)]
-
-        ratios = [PRIMARY_DATASET_RATIO]
-        if SWAP_IDEALISED_EMBEDDINGS:
-            ratios.append(IDEALISED_EMBEDDING_RATIO)
-            ratios.append(IDEALISED_PROMPT_AND_EMBEDDING_RATIO)
-            if SWAP_STUDENT_PROMPTS:
-                ratios.append(ALTERNATIVE_STUDENT_PROMPTS_RATIO)
-                ratios.append(ALTERNATIVE_STUDENT_IDEALISED_RATIO)
-                if SWAP_IDEALISED_ALTERNATIVE_PROMPTS:
-                    ratios.append(ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO)
-        elif SWAP_STUDENT_PROMPTS:
             ratios.append(0)
             ratios.append(0)
-            ratios.append(ALTERNATIVE_STUDENT_PROMPTS_RATIO)
 
-            total = sum(ratios)
-            enabled_ratios = [r / total for r in ratios]
-        else:
-            enabled_ratios = []
+        self.enabled_ratios = ratios
 
-        self.enabled_ratios = enabled_ratios
-        self.num_ratios = len(enabled_ratios)
+        self.num_ratios = len(self.enabled_ratios)
 
         self.student_raw_lines = self.lines
         self.teacher_raw_lines = self.lines
-        self.alt_student_raw_lines = self.alt_lines
-        self.idealised_teacher_raw_lines = self.idealised_lines
-        self.alt_idealised_student_raw_lines = self.alt_idealised_lines
+        self.enhanced_teacher_raw_lines = self.enhanced_lines
 
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
@@ -189,19 +195,19 @@ class PreTokenizedDataset(Dataset):
                 self.embedding_files = [os.path.join(self.cache_folder, f"{i}.pt") for i in range(len(self.lines))]
                 self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
 
-                if SWAP_IDEALISED_EMBEDDINGS:
-                    idealised_base_name = os.path.basename(IDEALISED_DATASET_PATH)
-                    idealised_cache_folder = os.path.join(cache_path, idealised_base_name)
-                    idealised_validation_file = os.path.join(idealised_cache_folder, f"{idealised_base_name}.validation")
+                if ENHANCED_DATASET:
+                    enhanced_base_name = os.path.basename(ENHANCED_DATASET_PATH)
+                    enhanced_cache_folder = os.path.join(cache_path, enhanced_base_name)
+                    enhanced_validation_file = os.path.join(enhanced_cache_folder, f"{enhanced_base_name}.validation")
 
-                    if os.path.exists(idealised_validation_file):
-                        self.idealised_cache_folder = idealised_cache_folder
-                        self.idealised_embedding_files = [os.path.join(idealised_cache_folder, f"{i}.pt") for i in range(len(self.idealised_lines))]
-                        self.idealised_mask_files = [os.path.join(idealised_cache_folder, f"{i}_mask.pt") for i in range(len(self.idealised_lines))]
+                    if os.path.exists(enhanced_validation_file):
+                        self.enhanced_cache_folder = enhanced_cache_folder
+                        self.enhanced_embedding_files = [os.path.join(enhanced_cache_folder, f"{i}.pt") for i in range(len(self.enhanced_lines))]
+                        self.enhanced_mask_files = [os.path.join(enhanced_cache_folder, f"{i}_mask.pt") for i in range(len(self.enhanced_lines))]
                     else:
-                        print(f"Generating and caching idealised embeddings for {IDEALISED_DATASET_PATH}")
-                        os.makedirs(idealised_cache_folder, exist_ok=True)
-                        for i, line in enumerate(tqdm(self.idealised_lines, desc="Generating idealised embeddings")):
+                        print(f"Generating and caching enhanced embeddings for {ENHANCED_DATASET_PATH}")
+                        os.makedirs(enhanced_cache_folder, exist_ok=True)
+                        for i, line in enumerate(tqdm(self.enhanced_lines, desc="Generating enhanced embeddings")):
                             teacher_inputs = teacher_tokenizer(
                                 line,
                                 padding="max_length",
@@ -218,16 +224,16 @@ class PreTokenizedDataset(Dataset):
                                 )
                                 embeddings = outputs.last_hidden_state.cpu()
 
-                            embedding_file = os.path.join(idealised_cache_folder, f"{i}.pt")
-                            mask_file = os.path.join(idealised_cache_folder, f"{i}_mask.pt")
+                            embedding_file = os.path.join(enhanced_cache_folder, f"{i}.pt")
+                            mask_file = os.path.join(enhanced_cache_folder, f"{i}_mask.pt")
                             torch.save(embeddings, embedding_file)
                             torch.save(att_mask.cpu(), mask_file)
 
-                        with open(idealised_validation_file, "w") as f:
+                        with open(enhanced_validation_file, "w") as f:
                             pass
-                        self.idealised_cache_folder = idealised_cache_folder
-                        self.idealised_embedding_files = [os.path.join(idealised_cache_folder, f"{i}.pt") for i in range(len(self.idealised_lines))]
-                        self.idealised_mask_files = [os.path.join(idealised_cache_folder, f"{i}_mask.pt") for i in range(len(self.idealised_lines))]
+                        self.enhanced_cache_folder = enhanced_cache_folder
+                        self.enhanced_embedding_files = [os.path.join(enhanced_cache_folder, f"{i}.pt") for i in range(len(self.enhanced_lines))]
+                        self.enhanced_mask_files = [os.path.join(enhanced_cache_folder, f"{i}_mask.pt") for i in range(len(self.enhanced_lines))]
             else:
                 print(f"Generating and caching embeddings for {file_path}")
                 os.makedirs(cache_folder, exist_ok=True)
@@ -273,7 +279,7 @@ class PreTokenizedDataset(Dataset):
         return len(self.lines)
 
     def __getitem__(self, idx):
-        def apply_dropout(line, word_dropout_ratio, char_dropout_ratio):
+        def apply_dropout(line, word_dropout_ratio):
             if word_dropout_ratio > 0:
                 words = line.split()
                 kept_words = []
@@ -281,82 +287,59 @@ class PreTokenizedDataset(Dataset):
                     if random.random() > word_dropout_ratio:
                         kept_words.append(word)
                 line = " ".join(kept_words)
-
-            if char_dropout_ratio > 0:
-                chars = list(line)
-                kept_chars = []
-                for char in chars:
-                    if random.random() > char_dropout_ratio:
-                        kept_chars.append(char)
-                line = "".join(kept_chars)
             return line
 
         if self.enabled_ratios:
             choice = random.choices(range(self.num_ratios), weights=self.enabled_ratios)[0]
 
             if choice == 0:  # PRIMARY_DATASET_RATIO
-                debug("Student line from primary dataset:")
+                debug("\n-----\nStudent line from primary dataset:")
                 student_line = self.student_raw_lines[idx]
                 teacher_line = self.teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
                 teacher_type = "original"
 
-            elif choice == 1:  # IDEALISED_EMBEDDING_RATIO
-                debug("Student line from primary dataset:")
+            elif choice == 1:  # ENHANCED_EMBEDDING_RATIO
+                debug("\n-----\nStudent line from primary dataset:")
                 student_line = self.student_raw_lines[idx]
-                teacher_line = self.idealised_teacher_raw_lines[idx]
+                teacher_line = self.enhanced_teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
-                teacher_type = "idealised"
+                teacher_type = "enhanced"
 
-            elif choice == 2:  # IDEALISED_PROMPT_AND_EMBEDDING_RATIO
-                debug("Student line from idealised dataset:")
-                student_line = self.idealised_teacher_raw_lines[idx]
-                teacher_line = self.idealised_teacher_raw_lines[idx]
+            elif choice == 2:  # ENHANCED_PROMPT_AND_EMBEDDING_RATIO
+                debug("\n-----\nStudent line from enhanced dataset:")
+                student_line = self.enhanced_teacher_raw_lines[idx]
+                teacher_line = self.enhanced_teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
-                teacher_type = "idealised"
+                teacher_type = "enhanced"
+            else:
+                debug("\n-----\nERROR: Student line invalid choice selection!")
 
-            elif choice == 3:  # ALTERNATIVE_STUDENT_PROMPTS_RATIO
-                debug("Student line from alternative dataset:")
-                student_line = self.alt_student_raw_lines[idx]
-                teacher_line = self.teacher_raw_lines[idx]
-                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
-                teacher_type = "original"
+        is_translated = False
+        if ENABLE_ON_THE_FLY_TRANSLATION:
+            lang_choice = random.choices(["en", "translated"], weights=[ENGLISH_PROMPT_RATIO, TRANSLATED_PROMPT_RATIO])[0]
+            if lang_choice == "translated":
+                target_lang = random.choices(list(SUPPORTED_LANGUAGES.keys()),
+                                            weights=list(SUPPORTED_LANGUAGES.values()))[0]
+                student_line = translate_text(student_line, target_lang=target_lang, api_url=TRANSLATION_API_URL)
+                if student_line is None:
+                    pass
+                else:
+                    is_translated = True
 
-            elif choice == 4:  # ALTERNATIVE_STUDENT_IDEALISED_RATIO
-                debug("Student line from alternative dataset:")
-                student_line = self.alt_student_raw_lines[idx]
-                teacher_line = self.idealised_teacher_raw_lines[idx]
-                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
-                teacher_type = "idealised"
+                if DISABLE_DROPOUT_FOR_UNSPACED_LANGUAGES and target_lang in UNSPACED_LANGUAGES:
+                    student_dropout_word = 0
+                else:
+                    student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
 
-            elif choice == 5:  # ALTERNATIVE_STUDENT_IDEALISED_PROMPTS_AND_EMBEDDINGS_RATIO
-                debug("Student line from alternative idealised dataset:")
-                student_line = self.alt_idealised_student_raw_lines[idx]
-                teacher_line = self.idealised_teacher_raw_lines[idx]
-                student_dropout_word = ALT_STUDENT_WORD_DROPOUT_RATIO if ENABLE_ALT_STUDENT_WORD_DROPOUT else 0
-                student_dropout_char = ALT_STUDENT_CHAR_DROPOUT_RATIO if ENABLE_ALT_STUDENT_CHAR_DROPOUT else 0
-                teacher_type = "idealised"
+        student_line = apply_dropout(student_line, student_dropout_word)
 
-        else:
-            debug("Student line from primary dataset:")
-            student_line = self.student_raw_lines[idx]
-            teacher_line = self.teacher_raw_lines[idx]
-            student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
-            student_dropout_char = STUDENT_CHAR_DROPOUT_RATIO if ENABLE_STUDENT_CHAR_DROPOUT else 0
-            teacher_type = "original"
-
-        student_line = apply_dropout(student_line, student_dropout_word, student_dropout_char)
         debug(student_line)
-        debug("Teacher line:")
-        debug(teacher_line)
+        debug("\nTeacher line:", teacher_line)
+        debug("-----")
 
         student_inputs = self.student_tokenizer(
-            student_line,
+            text=student_line,
             padding="max_length",
             truncation=True,
             max_length=self.max_length
@@ -364,10 +347,36 @@ class PreTokenizedDataset(Dataset):
         student_input_ids = torch.tensor(student_inputs["input_ids"], dtype=torch.long)
         student_attention_mask = torch.tensor(student_inputs["attention_mask"], dtype=torch.long)
 
+        # Tokenize student line with teacher tokenizer to get student_teacher_mask
+        student_teacher_inputs = self.teacher_tokenizer(
+            text=student_line,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length
+        )
+        student_teacher_mask = torch.tensor(student_teacher_inputs["attention_mask"], dtype=torch.long)
+
+        # Tokenize teacher line with teacher tokenizer to get teacher_mask
+        teacher_inputs = self.teacher_tokenizer(
+            text=teacher_line,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length
+        )
+        teacher_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
+
+        skip_token_loss_flag = False
+        if SKIP_TOKEN_LOSS_IF_ENHANCED_TEACHER_AND_NORMAL_STUDENT and teacher_type == "enhanced" and choice == 1:
+            skip_token_loss_flag = True
+        if SKIP_TOKEN_LOSS_IF_DROPOUT_APPLIED and student_dropout_word > 0:
+            skip_token_loss_flag = True
+        if SKIP_TOKEN_LOSS_FOR_TRANSLATED_PROMPTS and is_translated:
+            skip_token_loss_flag = True
+
         if self.use_cached_embeddings:
-            if teacher_type == "idealised" and hasattr(self, 'idealised_embedding_files'):
-                embeddings = torch.load(self.idealised_embedding_files[idx], map_location='cpu')
-                att_mask = torch.load(self.idealised_mask_files[idx], map_location='cpu')
+            if teacher_type == "enhanced" and hasattr(self, 'enhanced_embedding_files'):
+                embeddings = torch.load(self.enhanced_embedding_files[idx], map_location='cpu')
+                att_mask = torch.load(self.enhanced_mask_files[idx], map_location='cpu')
             else:
                 embeddings = torch.load(self.embedding_files[idx], map_location='cpu')
                 att_mask = torch.load(self.mask_files[idx], map_location='cpu')
@@ -395,15 +404,11 @@ class PreTokenizedDataset(Dataset):
                 student_input_ids,
                 student_attention_mask,
                 embeddings,
-                att_mask
+                teacher_mask,
+                student_teacher_mask,
+                skip_token_loss_flag
             )
         else:
-            teacher_inputs = self.teacher_tokenizer(
-                teacher_line,
-                padding="max_length",
-                truncation=True,
-                max_length=self.max_length
-            )
             teacher_input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long)
             teacher_attention_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
 
@@ -411,7 +416,9 @@ class PreTokenizedDataset(Dataset):
                 student_input_ids,
                 student_attention_mask,
                 teacher_input_ids,
-                teacher_attention_mask
+                teacher_mask,
+                student_teacher_mask,
+                skip_token_loss_flag
             )
 
     def __enter__(self):
@@ -453,8 +460,8 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, sequence_huber_weight=0.70, sequence_cosine_weight=0.30,
-                 token_huber_weight=1e-6, token_cosine_weight=1e-6):
+    def __init__(self, sequence_huber_weight=0.50, sequence_cosine_weight=0.20,
+                 token_huber_weight=0.25, token_cosine_weight=0.05):
         super().__init__()
         self.sequence_huber_weight = sequence_huber_weight
         self.sequence_cosine_weight = sequence_cosine_weight
@@ -463,48 +470,72 @@ class HybridLoss(torch.nn.Module):
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
-    def forward(self, student_output, teacher_output, teacher_mask):
+    def forward(self, student_output, teacher_output, teacher_mask, student_teacher_mask, student_mask, skip_token_loss):
         device = student_output.device
         dtype = torch.bfloat16
 
         student_output = student_output.to(dtype)
         teacher_output = teacher_output.to(dtype)
-        teacher_mask = teacher_mask.to(dtype).to(device)
+        teacher_mask = teacher_mask.to(device)
+        student_mask = student_mask.to(device)
+        student_teacher_mask = student_teacher_mask.to(device)
 
-        teacher_mask_expanded = teacher_mask.unsqueeze(-1)
+        if USE_STUDENT_TEACHER_MASK_INSTEAD_OF_TEACHER_MASK_FOR_SEQUENCE_LOSS:
+            seq_mask = student_teacher_mask
+        else:
+            seq_mask = teacher_mask
 
-        numerator_student = (student_output * teacher_mask_expanded).sum(dim=1)
-        numerator_teacher = (teacher_output * teacher_mask_expanded).sum(dim=1)
-        denominator = teacher_mask.sum(dim=1, keepdim=True) + 1e-8
+        seq_mask_expanded = seq_mask.unsqueeze(-1)
+        student_teacher_mask_expanded = student_teacher_mask.unsqueeze(-1)
 
-        student_pooled = numerator_student / denominator
-        teacher_pooled = numerator_teacher / denominator
+        numerator_student = (student_output * seq_mask_expanded).sum(dim=1)
+        numerator_teacher = (teacher_output * seq_mask_expanded).sum(dim=1)
+        denominator_student = seq_mask.sum(dim=1, keepdim=True) + 1e-8
+        denominator_teacher = seq_mask.sum(dim=1, keepdim=True) + 1e-8
+
+        student_pooled = numerator_student / denominator_student
+        teacher_pooled = numerator_teacher / denominator_teacher
 
         sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
         sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
         sequence_cos_loss = (1 - sequence_cos_sim).mean()
 
-        token_huber_loss = 0.0
-        token_cos_loss = 0.0
+        token_huber_loss = torch.tensor(0.0, device=device)
+        token_cos_loss = torch.tensor(0.0, device=device)
 
-        if self.token_huber_weight > 0:
-            token_huber_loss = self.huber(student_output, teacher_output)
-            token_huber_loss = token_huber_loss.mean(dim=-1)
-            token_huber_loss = (token_huber_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        valid_indices = torch.where(~skip_token_loss)[0]
 
-        if self.token_cosine_weight > 0:
-            token_cos_sim = self.cos(student_output, teacher_output)
-            token_cos_loss = 1 - token_cos_sim
-            token_cos_loss = (token_cos_loss * teacher_mask).sum(dim=-1) / (teacher_mask.sum(dim=-1) + 1e-8)
+        if len(valid_indices) > 0:
+            student_output_valid = student_output[valid_indices]
+            teacher_output_valid = teacher_output[valid_indices]
+            student_mask_valid = student_mask[valid_indices]
+            student_teacher_mask_valid = student_teacher_mask[valid_indices]
+
+            token_huber_loss_valid = self.huber(student_output_valid, teacher_output_valid)
+            token_huber_loss_valid = token_huber_loss_valid.mean(dim=-1)
+            if USE_STUDENT_MASK_FOR_TOKEN_LOSS:
+                token_huber_loss_valid = (token_huber_loss_valid * student_mask_valid).sum(dim=-1) / (student_mask_valid.sum(dim=-1) + 1e-8)
+            else:
+                token_huber_loss_valid = (token_huber_loss_valid * student_teacher_mask_valid).sum(dim=-1) / (student_teacher_mask_valid.sum(dim=-1) + 1e-8)
+
+            token_cos_sim_valid = self.cos(student_output_valid, teacher_output_valid)
+            token_cos_loss_valid = 1 - token_cos_sim_valid
+            if USE_STUDENT_MASK_FOR_TOKEN_LOSS:
+                token_cos_loss_valid = (token_cos_loss_valid * student_mask_valid).sum(dim=-1) / (student_mask_valid.sum(dim=-1) + 1e-8)
+            else:
+                token_cos_loss_valid = (token_cos_loss_valid * student_teacher_mask_valid).sum(dim=-1) / (student_teacher_mask_valid.sum(dim=-1) + 1e-8)
+
+            token_huber_loss = token_huber_loss_valid.mean()
+            token_cos_loss = token_cos_loss_valid.mean()
 
         total_loss = (
             self.sequence_huber_weight * sequence_huber_loss +
             self.sequence_cosine_weight * sequence_cos_loss +
-            self.token_huber_weight * token_huber_loss.mean() +
-            self.token_cosine_weight * token_cos_loss.mean()
+            self.token_huber_weight * token_huber_loss +
+            self.token_cosine_weight * token_cos_loss
         )
 
-        return total_loss, sequence_huber_loss, sequence_cos_loss, token_huber_loss.mean(), token_cos_loss.mean()
+        return total_loss, sequence_huber_loss, sequence_cos_loss, token_huber_loss, token_cos_loss
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -523,15 +554,20 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             try:
-                s_input_ids, s_att_mask, t_embeddings, t_att_mask = batch
+                if USE_CACHED_EMBEDDINGS:
+                    s_input_ids, s_mask, t_embeddings, t_mask, s_t_mask, skip_token_loss = batch
+                else:
+                    s_input_ids, s_mask, t_input_ids, t_mask, s_t_mask, skip_token_loss = batch
+
                 s_input_ids = s_input_ids.to(device)
-                s_att_mask = s_att_mask.to(device)
-                t_att_mask = t_att_mask.to(device)
+                s_mask = s_mask.to(device)
+                t_mask = t_mask.to(device)
+                s_t_mask = s_t_mask.to(device)
 
                 with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                     student_outputs = model(
                         input_ids=s_input_ids,
-                        attention_mask=s_att_mask,
+                        attention_mask=s_mask,
                         output_hidden_states=True
                     )
                     student_hidden = student_outputs.hidden_states[-1]
@@ -540,13 +576,11 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                 if USE_CACHED_EMBEDDINGS:
                     teacher_hidden = t_embeddings.to(device).squeeze(1)
                 else:
-                    t_input_ids, t_att_mask = t_embeddings, t_att_mask
+                    t_input_ids = t_input_ids.to(device)
                     with torch.no_grad():
-                        t_input_ids = t_input_ids.to(device)
-                        t_att_mask = t_att_mask.to(device)
                         teacher_outputs = teacher_model(
                             input_ids=t_input_ids,
-                            attention_mask=t_att_mask
+                            attention_mask=t_mask
                         )
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
@@ -554,7 +588,10 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                 loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = loss_fn(
                     projected_student,
                     teacher_hidden,
-                    t_att_mask
+                    t_mask,
+                    s_t_mask,
+                    s_mask,
+                    skip_token_loss
                 )
 
                 total_losses['total'] += loss.item()
@@ -566,7 +603,11 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                 del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs, token_cos_loss, token_huber_loss
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
-                del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+                del s_input_ids, s_mask, t_mask, s_t_mask
+                if USE_CACHED_EMBEDDINGS:
+                    del t_embeddings
+                else:
+                    del t_input_ids
 
             except Exception as e:
                 if 'projected_student' in locals():
@@ -579,7 +620,11 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                     del teacher_hidden
                 if 'teacher_outputs' in locals():
                     del teacher_outputs
-                del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+                del s_input_ids, s_mask, t_mask, s_t_mask
+                if USE_CACHED_EMBEDDINGS:
+                    del t_embeddings
+                else:
+                    del t_input_ids
                 raise e
 
     num_batches = len(dataloader)
@@ -591,6 +636,30 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     loss_fn.train()
 
     return total_losses
+
+# ========== Translation Function ==========
+def translate_text(text, source_lang="en", target_lang="zh", api_url="http://localhost:5000/translate"):
+    url = api_url
+
+    payload = {
+        "q": text,
+        "source": source_lang,
+        "target": target_lang,
+        "format": "text"
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(url, data=json.dumps(payload), headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data["translatedText"]
+    except Exception as e:
+        print(f"Error during translation: {e}")
+        return None
 
 # ========== Miscellaneous Functions ==========
 def get_memory_usage():
@@ -686,6 +755,19 @@ except Exception as e:
     print(f"Error loading Qwen config: {e}")
     qwen_embedding_dim = 1024
 
+# ========== Check for Translation API ==========
+if ENABLE_ON_THE_FLY_TRANSLATION:
+    try:
+        response = requests.get(TRANSLATION_API_URL.replace("/translate", ""))
+        if response.status_code != 200:
+            print(f"Warning: Translation server at {TRANSLATION_API_URL} is not available!")
+            print("Disabling on-the-fly translation.")
+            ENABLE_ON_THE_FLY_TRANSLATION = False
+    except Exception as e:
+        print(f"Warning: Translation server at {TRANSLATION_API_URL} is not available: {e}")
+        print("Disabling on-the-fly translation.")
+        ENABLE_ON_THE_FLY_TRANSLATION = False
+
 # ========== Load T5 Teacher Model ==========
 teacher_model = None
 if not USE_CACHED_EMBEDDINGS:
@@ -700,7 +782,10 @@ else:
     base_name = os.path.basename(DATASET_PATH)
     cache_folder = os.path.join(CACHE_PATH, base_name)
     validation_file = os.path.join(cache_folder, f"{base_name}.validation")
-    if not os.path.exists(validation_file):
+    enhanced_base_name = os.path.basename(ENHANCED_DATASET_PATH)
+    enhanced_cache_folder = os.path.join(CACHE_PATH, enhanced_base_name)
+    enhanced_validation_file = os.path.join(enhanced_cache_folder, f"{enhanced_base_name}.validation")
+    if not os.path.exists(validation_file) or (ENHANCED_DATASET and not os.path.exists(enhanced_validation_file)):
         teacher_model = T5EncoderModel.from_pretrained(
         T5_MODEL_NAME,
         torch_dtype=torch.bfloat16,
@@ -834,6 +919,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             eps=1e-8
         )
 
+        # Custom scheduler with restart learning rate
         if RESTART_PERIOD_STEPS == 0:
             scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
@@ -877,15 +963,20 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
 
             for batch_idx, batch in enumerate(train_dataloader):
                 try:
-                    s_input_ids, s_att_mask, t_embeddings, t_att_mask = batch
+                    if USE_CACHED_EMBEDDINGS:
+                        s_input_ids, s_mask, t_embeddings, t_mask, s_t_mask, skip_token_loss = batch
+                    else:
+                        s_input_ids, s_mask, t_input_ids, t_mask, s_t_mask, skip_token_loss = batch
+
                     s_input_ids = s_input_ids.to(device)
-                    s_att_mask = s_att_mask.to(device)
-                    t_att_mask = t_att_mask.to(device)
+                    s_mask = s_mask.to(device)
+                    t_mask = t_mask.to(device)
+                    s_t_mask = s_t_mask.to(device)
 
                     with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                         student_outputs = student_model(
                             input_ids=s_input_ids,
-                            attention_mask=s_att_mask,
+                            attention_mask=s_mask,
                             output_hidden_states=True
                         )
                         student_hidden = student_outputs.hidden_states[-1]
@@ -894,13 +985,11 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                     if USE_CACHED_EMBEDDINGS:
                         teacher_hidden = t_embeddings.to(device).squeeze(1)
                     else:
-                        t_input_ids, t_att_mask = t_embeddings, t_att_mask
+                        t_input_ids = t_input_ids.to(device)
                         with torch.no_grad():
-                            t_input_ids = t_input_ids.to(device)
-                            t_att_mask = t_att_mask.to(device)
                             teacher_outputs = teacher_model(
                                 input_ids=t_input_ids,
-                                attention_mask=t_att_mask
+                                attention_mask=t_mask
                             )
                             teacher_hidden = teacher_outputs.last_hidden_state
                             teacher_hidden = teacher_hidden.to(device)
@@ -908,7 +997,10 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                     loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = hybrid_loss(
                         projected_student,
                         teacher_hidden,
-                        t_att_mask
+                        t_mask,
+                        s_t_mask,
+                        s_mask,
+                        skip_token_loss
                     )
 
                     scaled_loss = loss / GRAD_ACCUM_STEPS
@@ -968,9 +1060,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
 
                         del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss, token_cos_loss, token_huber_loss
                         if 't_input_ids' in locals():
-                            del t_input_ids, t_att_mask, teacher_outputs
+                            del t_input_ids, teacher_outputs
 
-                    del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+                    del s_input_ids, s_mask, t_mask, s_t_mask
+                    if USE_CACHED_EMBEDDINGS:
+                        del t_embeddings
+                    else:
+                        del t_input_ids
 
                 except Exception as e:
                     print(f"Error in batch {batch_idx}: {e}")
@@ -991,8 +1087,12 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                     if 'cos_loss' in locals():
                         del cos_loss
                     if 't_input_ids' in locals():
-                        del t_input_ids, t_att_mask, teacher_outputs
-                    del s_input_ids, s_att_mask, t_att_mask, t_embeddings
+                        del t_input_ids, teacher_outputs
+                    del s_input_ids, s_mask, t_mask, s_t_mask
+                    if USE_CACHED_EMBEDDINGS:
+                        del t_embeddings
+                    else:
+                        del t_input_ids
 
                     accumulation_step = 0
                     optimizer.zero_grad()
@@ -1004,14 +1104,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             if next_epoch % SAVE_EVERY_X_EPOCHS == 0:
                 print(f"\nSaving checkpoint at epoch {next_epoch}\n")
                 save_path = os.path.join(OUTPUT_DIR, f"epoch_{next_epoch}")
-                save_trained_model(best_model_dir, student_model, student_tokenizer, projection, qwen_embedding_dim)
+                save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
 
             if next_epoch % EVAL_EVERY_X_EPOCHS == 0:
                 eval_start_time = time.time()
 
                 eval_metrics = evaluate_model(
-                    student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype
-                )
+                    student_model, eval_dataloader, projection, hybrid_loss, device, autocast_dtype)
 
                 avg_eval_loss = eval_metrics['total']
                 print(f"\n[Validation] Epoch {epoch + 1}")
