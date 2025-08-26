@@ -1,4 +1,4 @@
-### T5-to-Qwen
+# T5-to-Qwen
 ---
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
@@ -10,7 +10,7 @@ Simply, we take the transformer's ability to project sequentially, and the dimen
 
 Of course, we also use the T5-xxl attention mask exclusively for both loss calculation and inference, since we are projecting to match the T5-xxl sequence.
 
-# Quick installation:
+### Quick installation:
 
 '''
 pip install torch --extra-index-url https://download.pytorch.org/whl/cu129
