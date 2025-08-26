@@ -29,4 +29,5 @@ You're recommended to use a 3.11 Python venv, as that's what I've been using. Co
 - [Google](https://huggingface.co/google) for the original T5-xxl model
 - [DeepSeek](https://huggingface.co/deepseek-ai) for their R1 0528 model, which I used to generate some code used here
 - [unsloth](https://huggingface.co/unsloth) for the VRAM-efficient Qwen3 training
+
 And especially, thanks to those continuing to release open-source code and open-weight models with permissive licensing for the community!
