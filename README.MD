@@ -20,7 +20,9 @@ Currently, the script is only tested on Linux, so I don't know if there are any 
 
 Provided default settings will run on 24GB VRAM with cached T5-xxl embeddings. If you have 16GB of VRAM, try reducing the batch size to 32, and for 12GB, a batch size of 16 should work.
 
-You're recommended to use a 3.11 Python venv, as that's what I've been using. Configuration options are provided at the top of both scripts. You can pass a --t5 flag to the inference script to use T5-xxl instead.
+You're recommended to use a 3.11 Python venv, as that's what I've been using. 
+
+Configuration options are provided at the top of both scripts. You can pass a --t5 flag to the inference script to use T5-xxl instead.
 
 ### Credit
 ---
