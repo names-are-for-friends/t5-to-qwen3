@@ -1,5 +1,5 @@
 # T5-to-Qwen
----
+
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
 In order to address the challenge of sequential, feature size and general 'form' mismatch, a small projection layer is trained. The arrangement by default when using the 0.6B parameter model is:
