@@ -44,7 +44,7 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 50
 
-MAX_LEARNING_RATE = 8e-5
+MAX_LEARNING_RATE = 7e-5
 MIN_LEARNING_RATE = 1e-5
 
 SAVE_EVERY_X_STEPS = 0
@@ -55,46 +55,14 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.50
-COSINE_LOSS = 0.20
-TOKEN_HUBER_LOSS = 0.25 # New: pegged this to the student mask. I think perhaps applying this to the more noisy projected content was causing degradation of output. Needs further testing thought
-TOKEN_COSINE_LOSS = 0.05
+HUBER_LOSS = 0.70
+COSINE_LOSS = 0.30
 
 WARMUP_STEPS = 501 # Set to 0 to disable warmup
 RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 
-FEED_FORWARD_DIM = 1024
+FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
-
-# ========== Translation Configuration ==========
-'''
-You can hook in to a local LibreTranslate server to perform on-the-fly translation of the student prompt:
-https://github.com/LibreTranslate/LibreTranslate
-If the API URL can't be connected to, this will be disabled automatically
-Impact on training speed and resources should be low, it's a relatively minor CPU load and a small amount of RAM
-Training on English prompts DOES benefit multilingual ability, but it needs a little extra push
-'''
-ENABLE_ON_THE_FLY_TRANSLATION = True
-TRANSLATION_API_URL = "http://localhost:5000/translate"
-
-ENGLISH_PROMPT_RATIO = 0.80
-TRANSLATED_PROMPT_RATIO = 0.20
-
-SUPPORTED_LANGUAGES = {
-    "zh": 0.20,    # Chinese
-    "hi": 0.10,    # Hindi
-    "es": 0.10,    # Spanish
-    "ar": 0.08,    # Arabic
-    "fr": 0.08,    # French
-    "bn": 0.07,    # Bengali
-    "pt": 0.07,    # Portuguese
-    "ru": 0.07,    # Russian
-    "id": 0.07,    # Indonesian
-    "ja": 0.07,    # Japanese
-    "ur": 0.05,    # Urdu
-    "ko": 0.05,    # Korean
-    "de": 0.05,    # German
-}
 
 # ========== Advanced Configuration ==========
 '''
@@ -110,24 +78,12 @@ ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in acc
 ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
 
 UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.48 # No swapping
-ENHANCED_TEACHER_EMBEDDING_RATIO = 0.04 # Teacher prompt or embedding is swapped for enhanced
+ENHANCED_TEACHER_EMBEDDING_RATIO = 0.04 # Teacher prompt or embedding is swapped for enhanced but the student is the same
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.48 # Teacher and student prompt or embedding is swapped for enhanced
 
 ENABLE_STUDENT_WORD_DROPOUT = True
-STUDENT_WORD_DROPOUT_RATIO = 0.05
-
-DISABLE_DROPOUT_FOR_UNSPACED_LANGUAGES = True
-UNSPACED_LANGUAGES = ["zh", "ja", "ko"]
-
-# ========== Experimental Configuration ==========
-'''
-These settings largely exist for testing purposes and could break things
-'''
-USE_STUDENT_MASK_FOR_TOKEN_LOSS = True
-USE_STUDENT_TEACHER_MASK_INSTEAD_OF_TEACHER_MASK_FOR_SEQUENCE_LOSS = False
-SKIP_TOKEN_LOSS_IF_ENHANCED_TEACHER_AND_NORMAL_STUDENT = True
-SKIP_TOKEN_LOSS_IF_DROPOUT_APPLIED = False
-SKIP_TOKEN_LOSS_FOR_TRANSLATED_PROMPTS = True
+STUDENT_WORD_DROPOUT_RATIO = 0.10
+SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
 
@@ -315,22 +271,8 @@ class PreTokenizedDataset(Dataset):
             else:
                 debug("\n-----\nERROR: Student line invalid choice selection!")
 
-        is_translated = False
-        if ENABLE_ON_THE_FLY_TRANSLATION:
-            lang_choice = random.choices(["en", "translated"], weights=[ENGLISH_PROMPT_RATIO, TRANSLATED_PROMPT_RATIO])[0]
-            if lang_choice == "translated":
-                target_lang = random.choices(list(SUPPORTED_LANGUAGES.keys()),
-                                            weights=list(SUPPORTED_LANGUAGES.values()))[0]
-                student_line = translate_text(student_line, target_lang=target_lang, api_url=TRANSLATION_API_URL)
-                if student_line is None:
-                    pass
-                else:
-                    is_translated = True
-
-                if DISABLE_DROPOUT_FOR_UNSPACED_LANGUAGES and target_lang in UNSPACED_LANGUAGES:
-                    student_dropout_word = 0
-                else:
-                    student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
+        if choice == 1 and SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER == True:
+            student_dropout_word = 0
 
         student_line = apply_dropout(student_line, student_dropout_word)
 
@@ -365,14 +307,6 @@ class PreTokenizedDataset(Dataset):
         )
         teacher_mask = torch.tensor(teacher_inputs["attention_mask"], dtype=torch.long)
 
-        skip_token_loss_flag = False
-        if SKIP_TOKEN_LOSS_IF_ENHANCED_TEACHER_AND_NORMAL_STUDENT and teacher_type == "enhanced" and choice == 1:
-            skip_token_loss_flag = True
-        if SKIP_TOKEN_LOSS_IF_DROPOUT_APPLIED and student_dropout_word > 0:
-            skip_token_loss_flag = True
-        if SKIP_TOKEN_LOSS_FOR_TRANSLATED_PROMPTS and is_translated:
-            skip_token_loss_flag = True
-
         if self.use_cached_embeddings:
             if teacher_type == "enhanced" and hasattr(self, 'enhanced_embedding_files'):
                 embeddings = torch.load(self.enhanced_embedding_files[idx], map_location='cpu')
@@ -404,9 +338,7 @@ class PreTokenizedDataset(Dataset):
                 student_input_ids,
                 student_attention_mask,
                 embeddings,
-                teacher_mask,
-                student_teacher_mask,
-                skip_token_loss_flag
+                teacher_mask
             )
         else:
             teacher_input_ids = torch.tensor(teacher_inputs["input_ids"], dtype=torch.long)
@@ -417,8 +349,6 @@ class PreTokenizedDataset(Dataset):
                 student_attention_mask,
                 teacher_input_ids,
                 teacher_mask,
-                student_teacher_mask,
-                skip_token_loss_flag
             )
 
     def __enter__(self):
@@ -460,82 +390,44 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, sequence_huber_weight=0.50, sequence_cosine_weight=0.20,
+    def __init__(self, huber_weight=0.50, cosine_weight=0.20,
                  token_huber_weight=0.25, token_cosine_weight=0.05):
         super().__init__()
-        self.sequence_huber_weight = sequence_huber_weight
-        self.sequence_cosine_weight = sequence_cosine_weight
+        self.huber_weight = huber_weight
+        self.cosine_weight = cosine_weight
         self.token_huber_weight = token_huber_weight
         self.token_cosine_weight = token_cosine_weight
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
-    def forward(self, student_output, teacher_output, teacher_mask, student_teacher_mask, student_mask, skip_token_loss):
+    def forward(self, student_output, teacher_output, teacher_mask):
         device = student_output.device
         dtype = torch.bfloat16
 
         student_output = student_output.to(dtype)
         teacher_output = teacher_output.to(dtype)
         teacher_mask = teacher_mask.to(device)
-        student_mask = student_mask.to(device)
-        student_teacher_mask = student_teacher_mask.to(device)
 
-        if USE_STUDENT_TEACHER_MASK_INSTEAD_OF_TEACHER_MASK_FOR_SEQUENCE_LOSS:
-            seq_mask = student_teacher_mask
-        else:
-            seq_mask = teacher_mask
+        teacher_expanded = teacher_mask.unsqueeze(-1)
 
-        seq_mask_expanded = seq_mask.unsqueeze(-1)
-        student_teacher_mask_expanded = student_teacher_mask.unsqueeze(-1)
-
-        numerator_student = (student_output * seq_mask_expanded).sum(dim=1)
-        numerator_teacher = (teacher_output * seq_mask_expanded).sum(dim=1)
-        denominator_student = seq_mask.sum(dim=1, keepdim=True) + 1e-8
-        denominator_teacher = seq_mask.sum(dim=1, keepdim=True) + 1e-8
+        numerator_student = (student_output * teacher_mask_expanded).sum(dim=1)
+        numerator_teacher = (teacher_output * teacher_mask_expanded).sum(dim=1)
+        denominator_student = teacher_mask.sum(dim=1, keepdim=True) + 1e-8
+        denominator_teacher = teacher_mask.sum(dim=1, keepdim=True) + 1e-8
 
         student_pooled = numerator_student / denominator_student
         teacher_pooled = numerator_teacher / denominator_teacher
 
-        sequence_huber_loss = self.huber(student_pooled, teacher_pooled).mean()
-        sequence_cos_sim = self.cos(student_pooled, teacher_pooled)
-        sequence_cos_loss = (1 - sequence_cos_sim).mean()
-
-        token_huber_loss = torch.tensor(0.0, device=device)
-        token_cos_loss = torch.tensor(0.0, device=device)
-
-        valid_indices = torch.where(~skip_token_loss)[0]
-
-        if len(valid_indices) > 0:
-            student_output_valid = student_output[valid_indices]
-            teacher_output_valid = teacher_output[valid_indices]
-            student_mask_valid = student_mask[valid_indices]
-            student_teacher_mask_valid = student_teacher_mask[valid_indices]
-
-            token_huber_loss_valid = self.huber(student_output_valid, teacher_output_valid)
-            token_huber_loss_valid = token_huber_loss_valid.mean(dim=-1)
-            if USE_STUDENT_MASK_FOR_TOKEN_LOSS:
-                token_huber_loss_valid = (token_huber_loss_valid * student_mask_valid).sum(dim=-1) / (student_mask_valid.sum(dim=-1) + 1e-8)
-            else:
-                token_huber_loss_valid = (token_huber_loss_valid * student_teacher_mask_valid).sum(dim=-1) / (student_teacher_mask_valid.sum(dim=-1) + 1e-8)
-
-            token_cos_sim_valid = self.cos(student_output_valid, teacher_output_valid)
-            token_cos_loss_valid = 1 - token_cos_sim_valid
-            if USE_STUDENT_MASK_FOR_TOKEN_LOSS:
-                token_cos_loss_valid = (token_cos_loss_valid * student_mask_valid).sum(dim=-1) / (student_mask_valid.sum(dim=-1) + 1e-8)
-            else:
-                token_cos_loss_valid = (token_cos_loss_valid * student_teacher_mask_valid).sum(dim=-1) / (student_teacher_mask_valid.sum(dim=-1) + 1e-8)
-
-            token_huber_loss = token_huber_loss_valid.mean()
-            token_cos_loss = token_cos_loss_valid.mean()
+        huber_loss = self.huber(student_pooled, teacher_pooled).mean()
+        cos_sim = self.cos(student_pooled, teacher_pooled)
+        cos_loss = (1 - cos_sim).mean()
 
         total_loss = (
-            self.sequence_huber_weight * sequence_huber_loss +
-            self.sequence_cosine_weight * sequence_cos_loss +
-            self.token_huber_weight * token_huber_loss +
-            self.token_cosine_weight * token_cos_loss
+            self.huber_weight * huber_loss +
+            self.cosine_weight * cos_loss
         )
 
-        return total_loss, sequence_huber_loss, sequence_cos_loss, token_huber_loss, token_cos_loss
+        return total_loss, huber_loss, cos_loss
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -546,23 +438,20 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     total_losses = {
         'total': 0.0,
         'huber': 0.0,
-        'cos': 0.0,
-        'token_huber': 0.0,
-        'token_cos': 0.0
+        'cos': 0.0
     }
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             try:
                 if USE_CACHED_EMBEDDINGS:
-                    s_input_ids, s_mask, t_embeddings, t_mask, s_t_mask, skip_token_loss = batch
+                    s_input_ids, s_mask, t_embeddings, t_mask = batch
                 else:
-                    s_input_ids, s_mask, t_input_ids, t_mask, s_t_mask, skip_token_loss = batch
+                    s_input_ids, s_mask, t_input_ids, t_mask = batch
 
                 s_input_ids = s_input_ids.to(device)
-                s_mask = s_mask.to(device)
                 t_mask = t_mask.to(device)
-                s_t_mask = s_t_mask.to(device)
+                s_mask = s_mask.to(device)
 
                 with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                     student_outputs = model(
@@ -585,25 +474,20 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = loss_fn(
+                loss, huber_loss, cos_loss = loss_fn(
                     projected_student,
                     teacher_hidden,
-                    t_mask,
-                    s_t_mask,
-                    s_mask,
-                    skip_token_loss
+                    t_mask
                 )
 
                 total_losses['total'] += loss.item()
                 total_losses['huber'] += huber_loss.item()
                 total_losses['cos'] += cos_loss.item()
-                total_losses['token_huber'] += token_huber_loss.item()
-                total_losses['token_cos'] += token_cos_loss.item()
 
-                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs, token_cos_loss, token_huber_loss
+                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
-                del s_input_ids, s_mask, t_mask, s_t_mask
+                del s_input_ids, s_mask, t_mask
                 if USE_CACHED_EMBEDDINGS:
                     del t_embeddings
                 else:
@@ -620,7 +504,7 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                     del teacher_hidden
                 if 'teacher_outputs' in locals():
                     del teacher_outputs
-                del s_input_ids, s_mask, t_mask, s_t_mask
+                del s_input_ids, s_mask, t_mask
                 if USE_CACHED_EMBEDDINGS:
                     del t_embeddings
                 else:
@@ -636,30 +520,6 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
     loss_fn.train()
 
     return total_losses
-
-# ========== Translation Function ==========
-def translate_text(text, source_lang="en", target_lang="zh", api_url="http://localhost:5000/translate"):
-    url = api_url
-
-    payload = {
-        "q": text,
-        "source": source_lang,
-        "target": target_lang,
-        "format": "text"
-    }
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.post(url, data=json.dumps(payload), headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return data["translatedText"]
-    except Exception as e:
-        print(f"Error during translation: {e}")
-        return None
 
 # ========== Miscellaneous Functions ==========
 def get_memory_usage():
@@ -712,10 +572,8 @@ def get_logging():
         f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
         f"Step: {global_step}/{total_steps}, "
         f"Total Loss: {current_loss:.6f}, "
-        f"SQ Huber Loss: {current_huber:.6f}, "
-        f"SQ Cosine Loss: {current_cos:.6f}, "
-        f"PT Huber Loss: {current_token_huber:.6f}, "
-        f"PT Cosine Loss: {current_token_cos:.6f}, "
+        f"Huber Loss: {current_huber:.6f}, "
+        f"Cosine Loss: {current_cos:.6f}, "
         f"Grad Norm: {grad_norm:.6f}, "
         f"Learning Rate: {current_lr:.6f}, "
         f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
@@ -754,19 +612,6 @@ try:
 except Exception as e:
     print(f"Error loading Qwen config: {e}")
     qwen_embedding_dim = 1024
-
-# ========== Check for Translation API ==========
-if ENABLE_ON_THE_FLY_TRANSLATION:
-    try:
-        response = requests.get(TRANSLATION_API_URL.replace("/translate", ""))
-        if response.status_code != 200:
-            print(f"Warning: Translation server at {TRANSLATION_API_URL} is not available!")
-            print("Disabling on-the-fly translation.")
-            ENABLE_ON_THE_FLY_TRANSLATION = False
-    except Exception as e:
-        print(f"Warning: Translation server at {TRANSLATION_API_URL} is not available: {e}")
-        print("Disabling on-the-fly translation.")
-        ENABLE_ON_THE_FLY_TRANSLATION = False
 
 # ========== Load T5 Teacher Model ==========
 teacher_model = None
@@ -830,15 +675,13 @@ else:
 
 projection.to(device, dtype=torch.bfloat16)
 
-losses = [HUBER_LOSS, COSINE_LOSS, TOKEN_HUBER_LOSS, TOKEN_COSINE_LOSS]
+losses = [HUBER_LOSS, COSINE_LOSS]
 sum_loss = sum(losses)
 normalised_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
-    sequence_huber_weight=normalised_losses[0],
-    sequence_cosine_weight=normalised_losses[1],
-    token_huber_weight=normalised_losses[2],
-    token_cosine_weight=normalised_losses[3]
+    huber_weight=normalised_losses[0],
+    cosine_weight=normalised_losses[1]
 ).to(device, dtype=torch.bfloat16)
 
 # ========== Dataset and Dataloader ==========
@@ -964,14 +807,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             for batch_idx, batch in enumerate(train_dataloader):
                 try:
                     if USE_CACHED_EMBEDDINGS:
-                        s_input_ids, s_mask, t_embeddings, t_mask, s_t_mask, skip_token_loss = batch
+                        s_input_ids, s_mask, t_embeddings, t_mask = batch
                     else:
-                        s_input_ids, s_mask, t_input_ids, t_mask, s_t_mask, skip_token_loss = batch
+                        s_input_ids, s_mask, t_input_ids, t_mask = batch
 
                     s_input_ids = s_input_ids.to(device)
                     s_mask = s_mask.to(device)
                     t_mask = t_mask.to(device)
-                    s_t_mask = s_t_mask.to(device)
 
                     with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                         student_outputs = student_model(
@@ -994,13 +836,10 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             teacher_hidden = teacher_outputs.last_hidden_state
                             teacher_hidden = teacher_hidden.to(device)
 
-                    loss, huber_loss, cos_loss, token_huber_loss, token_cos_loss = hybrid_loss(
+                    loss, huber_loss, cos_loss = hybrid_loss(
                         projected_student,
                         teacher_hidden,
                         t_mask,
-                        s_t_mask,
-                        s_mask,
-                        skip_token_loss
                     )
 
                     scaled_loss = loss / GRAD_ACCUM_STEPS
@@ -1026,8 +865,6 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         current_loss = loss.item()
                         current_huber = huber_loss.item()
                         current_cos = cos_loss.item()
-                        current_token_huber = token_huber_loss.item()
-                        current_token_cos = token_cos_loss.item()
 
                         if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
                             elapsed = time.time() - start_time - eval_delta_time
@@ -1058,11 +895,11 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                                         f.write(line + "\n")
                                 log_lines.clear()
 
-                        del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss, token_cos_loss, token_huber_loss
+                        del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss
                         if 't_input_ids' in locals():
                             del t_input_ids, teacher_outputs
 
-                    del s_input_ids, s_mask, t_mask, s_t_mask
+                    del s_input_ids, s_mask, t_mask
                     if USE_CACHED_EMBEDDINGS:
                         del t_embeddings
                     else:
@@ -1088,7 +925,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         del cos_loss
                     if 't_input_ids' in locals():
                         del t_input_ids, teacher_outputs
-                    del s_input_ids, s_mask, t_mask, s_t_mask
+                    del s_input_ids, s_mask, t_mask
                     if USE_CACHED_EMBEDDINGS:
                         del t_embeddings
                     else:
