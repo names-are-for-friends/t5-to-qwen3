@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_12"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_2"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -1430,7 +1430,7 @@ if __name__ == "__main__":
 
             use_t5 = True
 
-            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
+            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_ATTENTION
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
