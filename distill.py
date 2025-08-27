@@ -62,8 +62,6 @@ RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
 
-SHUFFLE_DATASET = True # If set to false, reduces the read overhead by sequentially reading, but reduces randomness. Should be less necessary with the enhanced dataset randomly swapping samples
-
 # ========== Advanced Configuration ==========
 '''
 Features that may or may not help, but have at least been tested somewhat
@@ -82,8 +80,8 @@ UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.48 # No swapping
 ENHANCED_TEACHER_EMBEDDING_RATIO = 0.04 # Teacher prompt or embedding is swapped for enhanced but the student is the same
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.48 # Teacher and student prompt or embedding is swapped for enhanced
 
-ENABLE_STUDENT_WORD_DROPOUT = True
-STUDENT_WORD_DROPOUT_RATIO = 0.05
+ENABLE_STUDENT_WORD_DROPOUT = True # Removes words from the student prompt according to the below ratio
+STUDENT_WORD_DROPOUT_RATIO = 0.05 # This probability is applied on a per-word basis. Words are defined as any section delineated by spaces
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
@@ -720,7 +718,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=BATCH_SIZE,
-            shuffle=SHUFFLE_DATASET,
+            shuffle=True,
             pin_memory=True,
             num_workers=min(4, os.cpu_count()//2) if torch.cuda.is_available() else 0,
             persistent_workers=False,
