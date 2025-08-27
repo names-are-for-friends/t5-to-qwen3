@@ -17,16 +17,14 @@ import threading
 import gc
 import sys
 import datetime
-import math
-import requests
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_7"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v2/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
@@ -44,7 +42,7 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 50
 
-MAX_LEARNING_RATE = 7e-5
+MAX_LEARNING_RATE = 6e-5
 MIN_LEARNING_RATE = 1e-5
 
 SAVE_EVERY_X_STEPS = 0
@@ -64,15 +62,18 @@ RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
 
+SHUFFLE_DATASET = True # If set to false, reduces the read overhead by sequentially reading, but reduces randomness. Should be less necessary with the enhanced dataset randomly swapping samples
+
 # ========== Advanced Configuration ==========
 '''
 Features that may or may not help, but have at least been tested somewhat
 The theory of the enhanced dataset and dropout is mostly to encourage sequential projection
 Dropout should slightly bias towards projection forwards
 The enhanced dataset largely consists of prompts ~2x or more the length of the student prompt, but with related concepts
-(Though the prompt enhancement model isn't very good, hence "noisy detail" lol)
-My hope is that this will encourage a projection of noisy detail into the back end of the embedding
-We can then test if expanding the mask to cover this noisy detail has any benefit or not
+(Though the prompt enhancement model isn't very good and it's only a few items per batch as set by default, hence "noisy detail" lol)
+My hope is that this will encourage a projection of gradually more noisy detail into the back end of the embedding
+We can then test if expanding the mask to uncover this detail has any benefit or not
+Perhaps we could expand the average useful surface area of the embedding?
 '''
 ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
 ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
@@ -82,7 +83,7 @@ ENHANCED_TEACHER_EMBEDDING_RATIO = 0.04 # Teacher prompt or embedding is swapped
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.48 # Teacher and student prompt or embedding is swapped for enhanced
 
 ENABLE_STUDENT_WORD_DROPOUT = True
-STUDENT_WORD_DROPOUT_RATIO = 0.10
+STUDENT_WORD_DROPOUT_RATIO = 0.05
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
@@ -408,7 +409,7 @@ class HybridLoss(torch.nn.Module):
         teacher_output = teacher_output.to(dtype)
         teacher_mask = teacher_mask.to(device)
 
-        teacher_expanded = teacher_mask.unsqueeze(-1)
+        teacher_mask_expanded = teacher_mask.unsqueeze(-1)
 
         numerator_student = (student_output * teacher_mask_expanded).sum(dim=1)
         numerator_teacher = (teacher_output * teacher_mask_expanded).sum(dim=1)
@@ -719,7 +720,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=BATCH_SIZE,
-            shuffle=False,
+            shuffle=SHUFFLE_DATASET,
             pin_memory=True,
             num_workers=min(4, os.cpu_count()//2) if torch.cuda.is_available() else 0,
             persistent_workers=False,
