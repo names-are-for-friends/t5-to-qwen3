@@ -42,8 +42,8 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 50
 
-MAX_LEARNING_RATE = 15e-5
-MIN_LEARNING_RATE = 1e-5
+MAX_LEARNING_RATE = 2e-4
+MIN_LEARNING_RATE = 2e-5
 
 SAVE_EVERY_X_STEPS = 0
 SAVE_EVERY_X_RESTARTS = 1
@@ -53,11 +53,11 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.99
-COSINE_LOSS = 0.01
+HUBER_LOSS = 0.7
+COSINE_LOSS = 0.3
 
-WARMUP_STEPS = 1 # Set to 0 to disable warmup
-RESTART_PERIOD_STEPS = 10 # Set to 0 to use linear scheduler instead
+WARMUP_STEPS = 501 # Set to 0 to disable warmup
+RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 
 # ========== Advanced Configuration ==========
 ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
@@ -281,16 +281,6 @@ class PreTokenizedDataset(Dataset):
         student_input_ids = torch.tensor(student_inputs["input_ids"], dtype=torch.long)
         student_attention_mask = torch.tensor(student_inputs["attention_mask"], dtype=torch.long)
 
-        # Tokenize student line with teacher tokenizer to get student_teacher_mask
-        student_teacher_inputs = self.teacher_tokenizer(
-            text=student_line,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length
-        )
-        student_teacher_mask = torch.tensor(student_teacher_inputs["attention_mask"], dtype=torch.long)
-
-        # Tokenize teacher line with teacher tokenizer to get teacher_mask
         teacher_inputs = self.teacher_tokenizer(
             text=teacher_line,
             padding="max_length",
