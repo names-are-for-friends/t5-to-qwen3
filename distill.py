@@ -23,8 +23,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_7"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v2/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v8/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v9/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
@@ -42,7 +42,7 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 50
 
-MAX_LEARNING_RATE = 6e-5
+MAX_LEARNING_RATE = 15e-5
 MIN_LEARNING_RATE = 1e-5
 
 SAVE_EVERY_X_STEPS = 0
@@ -53,26 +53,13 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.70
-COSINE_LOSS = 0.30
+HUBER_LOSS = 0.99
+COSINE_LOSS = 0.01
 
-WARMUP_STEPS = 501 # Set to 0 to disable warmup
-RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
-
-FEED_FORWARD_DIM = 4096
-TRANSFORMER_LAYERS = 1
+WARMUP_STEPS = 1 # Set to 0 to disable warmup
+RESTART_PERIOD_STEPS = 10 # Set to 0 to use linear scheduler instead
 
 # ========== Advanced Configuration ==========
-'''
-Features that may or may not help, but have at least been tested somewhat
-The theory of the enhanced dataset and dropout is mostly to encourage sequential projection
-Dropout should slightly bias towards projection forwards
-The enhanced dataset largely consists of prompts ~2x or more the length of the student prompt, but with related concepts
-(Though the prompt enhancement model isn't very good and it's only a few items per batch as set by default, hence "noisy detail" lol)
-My hope is that this will encourage a projection of gradually more noisy detail into the back end of the embedding
-We can then test if expanding the mask to uncover this detail has any benefit or not
-Perhaps we could expand the average useful surface area of the embedding?
-'''
 ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
 ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
 
@@ -83,6 +70,12 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.48 # Teacher and student prompt or embedd
 ENABLE_STUDENT_WORD_DROPOUT = True # Removes words from the student prompt according to the below ratio
 STUDENT_WORD_DROPOUT_RATIO = 0.05 # This probability is applied on a per-word basis. Words are defined as any section delineated by spaces
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
+
+TRAIN_PROJECTION = True
+TRAIN_MODEL = True
+
+FEED_FORWARD_DIM = 4096
+TRANSFORMER_LAYERS = 1
 
 DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
 
@@ -389,13 +382,10 @@ class ProjectionLayer(torch.nn.Module):
 
 # ========== Hybrid Loss ==========
 class HybridLoss(torch.nn.Module):
-    def __init__(self, huber_weight=0.50, cosine_weight=0.20,
-                 token_huber_weight=0.25, token_cosine_weight=0.05):
+    def __init__(self, huber_weight=0.50, cosine_weight=0.20):
         super().__init__()
         self.huber_weight = huber_weight
         self.cosine_weight = cosine_weight
-        self.token_huber_weight = token_huber_weight
-        self.token_cosine_weight = token_cosine_weight
         self.huber = torch.nn.HuberLoss(reduction='none')
         self.cos = torch.nn.CosineSimilarity(dim=-1)
 
@@ -752,9 +742,19 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             log_file = os.path.join(log_dir, log_filename)
             log_lines = []
 
+        model_parameters = []
+        projection_parameters = []
+        if TRAIN_MODEL == True:
+            model_parameters = [p for p in student_model.parameters() if p.requires_grad]
+        if TRAIN_PROJECTION == True:
+            projection_parameters = list(projection.parameters())
+        if TRAIN_MODEL == False and TRAIN_PROJECTION == False:
+            print("You can't disable both model and projection training! Enabling model training...")
+            model_parameters = [p for p in student_model.parameters() if p.requires_grad]
+
         optimizer = torch.optim.AdamW(
-            [p for p in student_model.parameters() if p.requires_grad] +
-            list(projection.parameters()),
+            model_parameters +
+            projection_parameters,
             lr=MAX_LEARNING_RATE,
             betas=(0.9, 0.999),
             weight_decay=0.01,
@@ -847,15 +847,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
 
                     if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataset) - 1:
                         grad_norm = clip_grad_norm_(
-                            [p for p in student_model.parameters() if p.requires_grad] +
-                            list(projection.parameters()),
+                            model_parameters +
+                            projection_parameters,
                             max_norm=GRAD_CLIP
                         )
 
                         scaler.step(optimizer)
                         scaler.update()
-                        scheduler.step()
-                        optimizer.zero_grad()
 
                         global_step += 1
                         steps_completed_this_epoch += 1
@@ -865,12 +863,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         current_huber = huber_loss.item()
                         current_cos = cos_loss.item()
 
+                        elapsed = time.time() - start_time - eval_delta_time
+                        remaining_steps = total_steps - global_step
+                        eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
+                        vram_free, vram_total, vram_used = get_memory_usage()
+                        current_lr = scheduler.get_last_lr()[0]
+
                         if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
-                            elapsed = time.time() - start_time - eval_delta_time
-                            remaining_steps = total_steps - global_step
-                            eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
-                            vram_free, vram_total, vram_used = get_memory_usage()
-                            current_lr = scheduler.get_last_lr()[0]
                             print(get_logging())
 
                         if SAVE_EVERY_X_STEPS > 0 and global_step % SAVE_EVERY_X_STEPS == 0:
@@ -878,7 +877,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
                             save_trained_model(save_path, student_model, student_tokenizer, projection, qwen_embedding_dim)
 
-                        if (global_step + 1) > WARMUP_STEPS and ((global_step + 1) - WARMUP_STEPS) % RESTART_PERIOD_STEPS == 0:
+                        if global_step > WARMUP_STEPS and (global_step - WARMUP_STEPS) % RESTART_PERIOD_STEPS == 0:
                             next_restart = restart_count + 1
                             if SAVE_EVERY_X_RESTARTS > 0 and next_restart % SAVE_EVERY_X_RESTARTS == 0:
                                 print(f"\nSaving checkpoint at restart {next_restart}\n")
@@ -893,6 +892,9 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                                     for line in log_lines:
                                         f.write(line + "\n")
                                 log_lines.clear()
+
+                        scheduler.step()
+                        optimizer.zero_grad()
 
                         del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss
                         if 't_input_ids' in locals():
