@@ -2,13 +2,7 @@
 
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
-In order to address the challenge of sequential, feature size and general 'form' mismatch, a small projection layer is trained. The arrangement by default when using the 0.6B parameter model is:
-
-linear_in (1024) -> transformer (1024) -> upscale (1024-4096) -> activation (4096) -> linear_out (4096)
-
-Simply, we take the transformer's ability to project sequentially, and the dimensional upscaling & granular refinement of the linear upscale and activation layers respectively, to approximate the T5-xxl output.
-
-Of course, we also use the T5-xxl attention mask exclusively for both loss calculation and (post-training) inference, since we are projecting to match the T5-xxl sequence.
+Work-in-progress. Currently finding the best approach for losses & projection. Don't expect this to necessarily work perfectly as-is, though you can get coherent images at least. Sequence losses on their own will get you coherent images, but prompt recognition is obviously limited, so I'm working on the right approach for per-token losses.
 
 ### Quick installation
 ---
