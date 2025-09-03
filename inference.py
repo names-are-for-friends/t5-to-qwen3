@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/q3-xxs-ALL/q3-xxs-v1/restart_2"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v1/checkpoint_step_500/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -38,9 +38,9 @@ DEFAULT_RESOLUTION = [512,512]
 DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
-T5_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5-xxl
+T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
 USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
-QWEN_WITH_T5_MASK_ADDITIONAL_ATTENTION = 1 # The current training method encourages sequential projection beyond the T5 mask. For now, experiment with this
+QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0 # The current training method encourages sequential projection beyond the T5 mask
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -1351,15 +1351,18 @@ if __name__ == "__main__":
             return_tensors="pt"
         ).to(t5_model.device)
 
+        attention_mask = text_inputs["attention_mask"]
+        attention_mask_neg = text_inputs_neg["attention_mask"]
+
         with torch.no_grad():
             embed = t5_model(
                 input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
+                attention_mask=attention_mask,
             ).last_hidden_state
 
             embed_neg = t5_model(
                 input_ids=text_inputs_neg["input_ids"],
-                attention_mask=text_inputs_neg["attention_mask"],
+                attention_mask=attention_mask_neg,
             ).last_hidden_state
 
         text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
@@ -1387,10 +1390,13 @@ if __name__ == "__main__":
             return_tensors="pt"
         ).to(qwen3_model.device)
 
+        attention_mask = text_inputs["attention_mask"]
+        attention_mask_neg = text_inputs_neg["attention_mask"]
+
         with torch.no_grad():
             output = qwen3_model(
                 input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
+                attention_mask=attention_mask,
                 output_hidden_states=True
             )
             embed = output.hidden_states[-1]  # Last hidden state
@@ -1400,7 +1406,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             output_neg = qwen3_model(
                 input_ids=text_inputs_neg["input_ids"],
-                attention_mask=text_inputs_neg["attention_mask"],
+                attention_mask=attention_mask_neg,
                 output_hidden_states=True
             )
             embed_neg = output_neg.hidden_states[-1]  # Last hidden state
@@ -1430,7 +1436,7 @@ if __name__ == "__main__":
 
             use_t5 = True
 
-            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_ATTENTION
+            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
@@ -1458,8 +1464,8 @@ if __name__ == "__main__":
         embed_neg,
         text_ids,
         neg_text_ids,
-        text_inputs.attention_mask,
-        text_inputs_neg.attention_mask,
+        attention_mask,
+        attention_mask_neg,
         args.seed,
         args.steps,
         args.cfg,
