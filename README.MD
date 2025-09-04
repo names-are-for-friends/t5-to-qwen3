@@ -1,8 +1,12 @@
 # T5-to-Qwen
 
+![Chwon](trans_pt_18e5_TM.png)
+_Our iconic mascot, Chwon_
+_(result of just 500 steps x 64 batch size of training from base Qwen3 0.6B Text Embedder, 1e-5->18e-5 warmup)_
+
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
-Work-in-progress. Currently finding the best approach for losses & projection. Don't expect this to necessarily work perfectly as-is, though you can get coherent images at least. Sequence losses on their own will get you coherent images, but prompt recognition is obviously limited, so I'm working on the right approach for per-token losses.
+After experimentation and deciding on my likely final training settings, the default settings in the script are the recommended settings that you should use for training. Note that when using the transformer->mlp projection, you should always use the T5-xxl mask for inference, since the transformer projection will match to the longer T5-xxl sequence. (If using dropout, you will likely project beyond the T5-xxl sequence, so test outputs with varying levels of additional attention).
 
 ### Quick installation
 ---
