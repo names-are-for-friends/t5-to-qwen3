@@ -21,17 +21,17 @@ import datetime
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ========== Configuration ==========
-DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
-T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v1/"
+DATASET_PATH = "/path/to/dataset.txt" # Each line of the dataset text file is taken as one prompt
+T5_MODEL_NAME = "/path/to/t5-xxl/"
+QWEN3_MODEL_NAME = "/path/to/qwen3/"
+OUTPUT_DIR = "/path/to/output/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
-CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
+CACHE_PATH = "/path/to/cache" # Cache is picked up on subsequent runs by reference to dataset file name
 PREFETCH_FACTOR = 32
 
 USE_SEPARATE_EVALUATION_DATASET = True # Otherwise we take some of the main dataset, but best to use unseen data
-EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
+EVALUATION_DATASET_PATH = "/path/to/eval.txt"
 
 ENABLE_LOGGING = True
 WRITE_TO_LOG_EVERY_X_STEPS = 10
@@ -42,7 +42,7 @@ GRAD_CLIP = 1.0
 
 EPOCHS = 1
 
-MAX_LEARNING_RATE = 1e-4
+MAX_LEARNING_RATE = 18e-5 # max 18e-5 w/ only pt, 13e-5 w/ both. max 8e-5 w/ only sq
 MIN_LEARNING_RATE = 1e-5
 
 SAVE_EVERY_X_STEPS = 500
@@ -53,70 +53,54 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-PER_TOKEN_HUBER_LOSS = 0.50
-PER_TOKEN_COSINE_LOSS = 0.20
-SEQUENCE_HUBER_LOSS = 0.20
-SEQUENCE_COSINE_LOSS = 0.10
+HUBER_LOSS = 0.70
+COSINE_LOSS = 0.30
 
 WARMUP_STEPS = 501 # Set to 0 to disable warmup
 RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
 
-SHUFFLE_DATASET = False # Random order probably better, but might incur bottlenecking due to random read overhead
+SHUFFLE_DATASET = True # Random order is better, but might incur bottlenecking due to random read overhead
 
 ENABLE_STUDENT_WORD_DROPOUT = False # Removes words from the student prompt according to the below ratio
-STUDENT_WORD_DROPOUT_RATIO = 0.00 # This probability is applied on a per-word basis. Words are defined as any section delineated by spaces
-SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
+STUDENT_WORD_DROPOUT_RATIO = 0.10 # This probability is applied on a per-word basis. Words are defined as any section delineated by spaces. Forces model to learn to infer from context, and encourages over-projection beyond the teacher mask
 
 TRAIN_PROJECTION = True
 TRAIN_MODEL = True
 
-USE_LINEAR_PROJECTION = True # Use a simple linear projection layer instead of the mlp -> transformer projection. Might be useful for initially training the model, then swapping in the full projection and training that with the model frozen
-USE_STUDENT_MASK_FOR_SEQUENCE_LOSS = True # Use the student mask for sequence loss. This is probably better for training with the linear projection, then you can swap to the teacher model when training the projection
+USE_MLP_PROJECTION = False # Use a mlp projection layer instead of the mlp -> transformer projection
+USE_STUDENT_MASK_FOR_SEQUENCE_LOSS = False # Use the student mask for sequence loss, or else use the teacher mask
 
-TOKEN_ALIGNMENT_WINDOW = 3 # We try to match tokens for per-token loss by matching identical text content, looking ahead by this many tokens
+TOKEN_ALIGNMENT_WINDOW = 10 # We try to match tokens for per-token loss by matching identical text content, looking ahead by this many tokens
 
 FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
 
 # ========== Experimental Configuration ==========
 '''
-Experimental or testing options that may or may not be beneficial
+The settings left here are likely not really useful, but I'm leaving them because
+I have the cached embeddings now and it'd be a pain to recache and that
 '''
-ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
-ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
+ENHANCED_DATASET = False # Will enable a secondary dataset that is swapped in according to the below ratios
+ENHANCED_DATASET_PATH = "/path/to/enhanced_dataset.txt"
 
 UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50 # No swapping
-ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00 # Teacher prompt or embedding is swapped for enhanced but the student is the same. I'm mostly using this to encourage some over-projection for experimental purposes, and I don't know how well it functions in reality
+ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00 # Teacher prompt or embedding is swapped for enhanced but the student is the same. Probably not useful, I just thought it'd be interesting as a test
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50 # Teacher and student prompt or embedding is swapped for enhanced
 
-DEBUG_PRINT = False # Mostly just prints out student/teacher prompt pairings atm
-
-# ========== Debug Function ==========
-def debug(description, variable=None):
-    if DEBUG_PRINT:
-        print(f'{description}')
-        if variable is not None:
-            print(f'{variable}')
+SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 # ========== Token Alignment ==========
 def ids_to_tokens(token_ids, tokenizer):
-    """Convert token IDs to their string representations"""
     return tokenizer.convert_ids_to_tokens(token_ids)
 
 def normalize_token(token):
-    """
-    Normalize tokens from different tokenizers to a comparable form.
-    """
-    # Remove common prefix markers
-    token = token.replace('Ġ', '')  # Qwen3 word prefix
-    token = token.replace('▁', '')  # T5 word prefix
+    token = token.replace('Ġ', '')
+    token = token.replace('▁', '')
 
-    # Remove other common prefix/suffix markers
     token = token.replace('▔', '')
     token = token.replace('▃', '')
     token = token.replace('�', '')
 
-    # Handle punctuation and special characters
     token = token.replace(' .', '.')
     token = token.replace(' ,', ',')
     token = token.replace(' !', '!')
@@ -124,7 +108,6 @@ def normalize_token(token):
     token = token.replace(' :', ':')
     token = token.replace(' ;', ';')
 
-    # Handle parentheses and brackets
     token = token.replace(' (', '(')
     token = token.replace(' )', ')')
     token = token.replace(' [', '[')
@@ -139,39 +122,24 @@ def normalize_token(token):
 def token_based_alignment(student_input_ids, teacher_input_ids,
                          student_tokenizer, teacher_tokenizer,
                          window_size=5):
-    """
-    Align tokens based on their textual content.
-
-    Args:
-        student_input_ids: Tensor of student token IDs
-        teacher_input_ids: Tensor of teacher token IDs
-        student_tokenizer: Student model tokenizer
-        teacher_tokenizer: Teacher model tokenizer
-        window_size: How many tokens to look ahead for matches
-    """
-    # Convert token IDs to tokens (strings)
     student_tokens = ids_to_tokens(student_input_ids.cpu().numpy(), student_tokenizer)
     teacher_tokens = ids_to_tokens(teacher_input_ids.cpu().numpy(), teacher_tokenizer)
 
     aligned_pairs = []
 
-    # Create normalized versions for comparison
     normalized_student = [normalize_token(token) for token in student_tokens]
     normalized_teacher = [normalize_token(token) for token in teacher_tokens]
 
     for i, norm_stu in enumerate(normalized_student):
-        # Skip special tokens (like padding, start, end tokens)
         if student_tokens[i] in [student_tokenizer.pad_token,
                                 student_tokenizer.bos_token,
                                 student_tokenizer.eos_token]:
             continue
 
-        # Search in a window around the current position
         start_j = max(0, i - window_size)
         end_j = min(len(teacher_tokens), i + window_size + 1)
 
         for j in range(start_j, end_j):
-            # Skip special tokens on teacher side too
             if teacher_tokens[j] in [teacher_tokenizer.pad_token,
                                     teacher_tokenizer.bos_token,
                                     teacher_tokenizer.eos_token]:
@@ -181,7 +149,7 @@ def token_based_alignment(student_input_ids, teacher_input_ids,
 
             if norm_stu == norm_tea:
                 aligned_pairs.append((i, j))
-                break  # take the first match
+                break
 
     return aligned_pairs
 
@@ -340,36 +308,27 @@ class PreTokenizedDataset(Dataset):
             choice = random.choices(range(self.num_ratios), weights=self.enabled_ratios)[0]
 
             if choice == 0:  # PRIMARY_DATASET_RATIO
-                debug("\n-----\nStudent line from primary dataset:")
                 student_line = self.student_raw_lines[idx]
                 teacher_line = self.teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
                 teacher_type = "original"
 
             elif choice == 1:  # ENHANCED_EMBEDDING_RATIO
-                debug("\n-----\nStudent line from primary dataset:")
                 student_line = self.student_raw_lines[idx]
                 teacher_line = self.enhanced_teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
                 teacher_type = "enhanced"
 
             elif choice == 2:  # ENHANCED_PROMPT_AND_EMBEDDING_RATIO
-                debug("\n-----\nStudent line from enhanced dataset:")
                 student_line = self.enhanced_teacher_raw_lines[idx]
                 teacher_line = self.enhanced_teacher_raw_lines[idx]
                 student_dropout_word = STUDENT_WORD_DROPOUT_RATIO if ENABLE_STUDENT_WORD_DROPOUT else 0
                 teacher_type = "enhanced"
-            else:
-                debug("\n-----\nERROR: Student line invalid choice selection!")
 
         if choice == 1 and SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER == True:
             student_dropout_word = 0
 
         student_line = apply_dropout(student_line, student_dropout_word)
-
-        debug(student_line)
-        debug("\nTeacher line:", teacher_line)
-        debug("-----")
 
         student_inputs = self.student_tokenizer(
             text=student_line,
@@ -444,14 +403,18 @@ class PreTokenizedDataset(Dataset):
                 file.close()
             self.file_handles.clear()
 
-# ========== Linear Projection Layer ==========
-class LinearProjectionLayer(torch.nn.Module):
+# ========== MLP Projection Layer ==========
+class MLPProjectionLayer(torch.nn.Module):
     def __init__(self, input_dim, output_dim=4096):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, output_dim)
+        self.linear_in = torch.nn.Linear(input_dim, output_dim)
+        self.activation = torch.nn.GELU()
+        self.linear_out = torch.nn.Linear(output_dim, output_dim)
 
     def forward(self, x):
-        x = self.linear(x)
+        x = self.linear_in(x)
+        x = self.activation(x)
+        x = self.linear_out(x)
         return x
 
 # ========== Transformer Projection Layer ==========
@@ -533,7 +496,6 @@ class HybridLoss(torch.nn.Module):
             if student_seq.size(0) == 0 or teacher_seq.size(0) == 0:
                 continue
 
-            # Use token-based alignment instead of greedy alignment
             path = token_based_alignment(
                 student_input_ids[i], teacher_input_ids[i],
                 self.student_tokenizer, self.teacher_tokenizer,
@@ -549,7 +511,6 @@ class HybridLoss(torch.nn.Module):
             teacher_aligned = []
             for pair in path:
                 stu_idx, tea_idx = pair
-                # We need to make sure we're not accessing out-of-bounds indices
                 if stu_idx < student_seq.size(0) and tea_idx < teacher_seq.size(0):
                     student_aligned.append(student_seq[stu_idx])
                     teacher_aligned.append(teacher_seq[tea_idx])
@@ -706,10 +667,11 @@ def save_trained_model(save_path, model, tokenizer, projection, qwen_embedding_d
     save_projection_config(projection_config_path, qwen_embedding_dim)
 
 def save_projection_config(projection_config_path, embedding_dim):
-    if USE_LINEAR_PROJECTION:
+    if USE_MLP_PROJECTION:
         projection_config = {
             "input_dim": embedding_dim,
             "output_dim": 4096,
+            "type": "MLP",
         }
     else:
         projection_config = {
@@ -718,6 +680,7 @@ def save_projection_config(projection_config_path, embedding_dim):
             "output_dim": 4096,
             "dim_feedforward": FEED_FORWARD_DIM,
             "num_layers": TRANSFORMER_LAYERS,
+            "type": "TRANSFORMER_MLP",
         }
     with open(projection_config_path, "w") as f:
         json.dump(projection_config, f)
@@ -811,12 +774,12 @@ else:
 # ========== Initialize or Load Projection Layer ==========
 projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layer.safetensors")
 
-if USE_LINEAR_PROJECTION:
+if USE_MLP_PROJECTION:
     if os.path.exists(projection_path):
         print("Loading existing projection layer from", projection_path)
         try:
             state_dict = load_file(projection_path)
-            projection = LinearProjectionLayer(
+            projection = MLPProjectionLayer(
                 input_dim=qwen_embedding_dim,
                 output_dim=4096,
             )
@@ -824,13 +787,13 @@ if USE_LINEAR_PROJECTION:
         except Exception as e:
             print(f"Error loading projection layer: {e}")
             print("Initializing projection layer")
-            projection = LinearProjectionLayer(
+            projection = MLPProjectionLayer(
                 input_dim=qwen_embedding_dim,
                 output_dim=4096,
             )
     else:
         print("Initializing projection layer")
-        projection = LinearProjectionLayer(
+        projection = MLPProjectionLayer(
             input_dim=qwen_embedding_dim,
             output_dim=4096,
         )
@@ -867,7 +830,7 @@ else:
             num_layers=TRANSFORMER_LAYERS,
         )
 
-losses = [SEQUENCE_HUBER_LOSS, SEQUENCE_COSINE_LOSS, PER_TOKEN_HUBER_LOSS, PER_TOKEN_COSINE_LOSS]
+losses = [0.00, 0.00, HUBER_LOSS, COSINE_LOSS]
 sum_loss = sum(losses)
 normalised_losses = [loss / sum_loss for loss in losses]
 
