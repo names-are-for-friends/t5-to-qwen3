@@ -1,6 +1,7 @@
 # T5-to-Qwen
 
 ![Chwon](trans_pt_18e5_TM.png)
+
 _Our iconic mascot, Chwon_
 _(result of just 500 steps x 64 batch size of training from base Qwen3 0.6B Text Embedder, 1e-5->18e-5 warmup)_
 
