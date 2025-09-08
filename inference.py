@@ -2,7 +2,7 @@ import json
 import math
 import torch
 from torch import Tensor, nn
-from torch.nn import Module
+from torch.nn import Module, Embedding
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, T5EncoderModel, T5TokenizerFast
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v1/checkpoint_step_500/"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v2/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -40,7 +40,7 @@ APPEND_DATETIME = True
 
 T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
 USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
-QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0 # The current training method encourages sequential projection beyond the T5 mask
+QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -946,9 +946,9 @@ class AutoEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
 
-# ========== Projection Layer ==========
+# ========== Transformer Projection Layer ==========
 class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim=1024, transformer_dim=1024, output_dim=4096, dim_feedforward=1024, num_layers=1):
+    def __init__(self, input_dim, transformer_dim, output_dim=4096, dim_feedforward=2048, num_layers=1):
         super().__init__()
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
 
@@ -1244,7 +1244,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         device_map="auto",
         trust_remote_code=True,
         attn_implementation="flash_attention_2"
-    )
+    ).to(device)
     model.eval()
 
     projection_config_path = os.path.join(DEFAULT_QWEN3_FOLDER, "projection_config.json")
@@ -1258,6 +1258,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         dim_feedforward=projection_config["dim_feedforward"],
         num_layers=projection_config["num_layers"]
     )
+
     projection_state = load_file(projection_file)
     projection.load_state_dict(projection_state)
     projection.to(model.device, dtype=torch.bfloat16)
@@ -1284,7 +1285,7 @@ def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
     tokenizer = T5TokenizerFast.from_pretrained(t5_folder)
 
     # Use flash attention for speed if available
-    model = T5EncoderModel.from_pretrained(t5_folder)
+    model = T5EncoderModel.from_pretrained(t5_folder).to(device)
     model.eval()
 
     return model, tokenizer
@@ -1328,6 +1329,9 @@ if __name__ == "__main__":
     else:
         use_t5 = False
 
+    device = 'cuda'
+    dtype = torch.bfloat16
+
     # Choose text embedder based on flag
     if use_t5:
         logger.info("Using T5-xxl for text embeddings")
@@ -1351,19 +1355,19 @@ if __name__ == "__main__":
             return_tensors="pt"
         ).to(t5_model.device)
 
-        attention_mask = text_inputs["attention_mask"]
-        attention_mask_neg = text_inputs_neg["attention_mask"]
+        attention_mask = text_inputs["attention_mask"].to(device).to(device)
+        attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
         with torch.no_grad():
             embed = t5_model(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=attention_mask,
-            ).last_hidden_state
+            ).last_hidden_state.to(device, dtype=dtype)
 
             embed_neg = t5_model(
                 input_ids=text_inputs_neg["input_ids"],
                 attention_mask=attention_mask_neg,
-            ).last_hidden_state
+            ).last_hidden_state.to(device, dtype=dtype)
 
         text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
@@ -1379,7 +1383,8 @@ if __name__ == "__main__":
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
+            return_offsets_mapping=True
         ).to(qwen3_model.device)
 
         text_inputs_neg = tokenizer(
@@ -1387,11 +1392,12 @@ if __name__ == "__main__":
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
+            return_offsets_mapping=True
         ).to(qwen3_model.device)
 
-        attention_mask = text_inputs["attention_mask"]
-        attention_mask_neg = text_inputs_neg["attention_mask"]
+        attention_mask = text_inputs["attention_mask"].to(device)
+        attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
         with torch.no_grad():
             output = qwen3_model(
@@ -1399,7 +1405,7 @@ if __name__ == "__main__":
                 attention_mask=attention_mask,
                 output_hidden_states=True
             )
-            embed = output.hidden_states[-1]  # Last hidden state
+            embed = output.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
         embed = projection(embed).to(qwen3_model.device)
 
@@ -1409,34 +1415,37 @@ if __name__ == "__main__":
                 attention_mask=attention_mask_neg,
                 output_hidden_states=True
             )
-            embed_neg = output_neg.hidden_states[-1]  # Last hidden state
+            embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
         embed_neg = projection(embed_neg).to(qwen3_model.device)
 
         if USE_T5_MASK_WITH_QWEN:
+
             tokenizer_t5 = T5TokenizerFast.from_pretrained(DEFAULT_T5_FOLDER)
             text_inputs_t5 = tokenizer_t5(
                 [args.positive_prompt],
                 padding="max_length",
                 max_length=args.max_length,
                 truncation=True,
-                return_tensors="pt"
-            )
+                return_tensors="pt",
+                return_offsets_mapping=True
+            ).to(device)
             text_inputs_neg_t5 = tokenizer_t5(
                 [args.negative_prompt],
                 padding="max_length",
                 max_length=args.max_length,
                 truncation=True,
-                return_tensors="pt"
-            )
-            attention_mask = text_inputs_t5["attention_mask"]
-            attention_mask_neg = text_inputs_neg_t5["attention_mask"]
-
-            del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5
+                return_tensors="pt",
+                return_offsets_mapping=True
+            ).to(device)
+            attention_mask = text_inputs_t5["attention_mask"].to(device)
+            attention_mask_neg = text_inputs_neg_t5["attention_mask"].to(device)
 
             use_t5 = True
 
             T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
+
+        del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5, text_inputs, text_inputs_neg, tokenizer
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
