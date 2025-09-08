@@ -21,29 +21,31 @@ import datetime
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ========== Configuration ==========
-DATASET_PATH = "/path/to/dataset.txt" # Each line of the dataset text file is taken as one prompt
-T5_MODEL_NAME = "/path/to/t5-xxl/"
-QWEN3_MODEL_NAME = "/path/to/qwen3/"
-OUTPUT_DIR = "/path/to/output/"
+DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
+T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v1/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v2/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
-CACHE_PATH = "/path/to/cache" # Cache is picked up on subsequent runs by reference to dataset file name
-PREFETCH_FACTOR = 32
+CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
+PREFETCH_FACTOR = 16
 
 USE_SEPARATE_EVALUATION_DATASET = True # Otherwise we take some of the main dataset, but best to use unseen data
-EVALUATION_DATASET_PATH = "/path/to/eval.txt"
+EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
 ENABLE_LOGGING = True
 WRITE_TO_LOG_EVERY_X_STEPS = 10
 
 BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1
-GRAD_CLIP = 1.0
+GRAD_CLIP = 5.0
 
 EPOCHS = 1
 
-MAX_LEARNING_RATE = 18e-5 # max 18e-5 w/ only pt, 13e-5 w/ both. max 8e-5 w/ only sq
-MIN_LEARNING_RATE = 1e-5
+MAX_LEARNING_RATE_MODEL = 1e-4
+MIN_LEARNING_RATE_MODEL = 1e-5
+MAX_LEARNING_RATE_PROJECTION = 5e-4
+MIN_LEARNING_RATE_PROJECTION = 1e-5
 
 SAVE_EVERY_X_STEPS = 500
 SAVE_EVERY_X_RESTARTS = 1
@@ -53,11 +55,12 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.70
-COSINE_LOSS = 0.30
+HUBER_LOSS = 0.50
+COSINE_LOSS = 0.50
 
-WARMUP_STEPS = 501 # Set to 0 to disable warmup
-RESTART_PERIOD_STEPS = 1150 # Set to 0 to use linear scheduler instead
+WARMUP_STEPS = 1000 # Set to 0 to disable warmup
+RESTART_PERIOD_STEPS = 1000 # Set to 0 to use linear scheduler instead
+ENABLE_ALIGNMENT_TRANSITION = True # Enable during first training run only. Aligns projection to expanded teacher attended area during warmup, then we switch to 1:1 per token losses once the relationship between projection student and target is patterned
 
 SHUFFLE_DATASET = True # Random order is better, but might incur bottlenecking due to random read overhead
 
@@ -67,10 +70,7 @@ STUDENT_WORD_DROPOUT_RATIO = 0.10 # This probability is applied on a per-word ba
 TRAIN_PROJECTION = True
 TRAIN_MODEL = True
 
-USE_MLP_PROJECTION = False # Use a mlp projection layer instead of the mlp -> transformer projection
-USE_STUDENT_MASK_FOR_SEQUENCE_LOSS = False # Use the student mask for sequence loss, or else use the teacher mask
-
-TOKEN_ALIGNMENT_WINDOW = 10 # We try to match tokens for per-token loss by matching identical text content, looking ahead by this many tokens
+TOKEN_ALIGNMENT_WINDOW = 5 # We try to match tokens for per-token loss during alignment transition by matching identical text content, looking ahead by this many tokens
 
 FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
@@ -80,8 +80,8 @@ TRANSFORMER_LAYERS = 1
 The settings left here are likely not really useful, but I'm leaving them because
 I have the cached embeddings now and it'd be a pain to recache and that
 '''
-ENHANCED_DATASET = False # Will enable a secondary dataset that is swapped in according to the below ratios
-ENHANCED_DATASET_PATH = "/path/to/enhanced_dataset.txt"
+ENHANCED_DATASET = True # Will enable a secondary dataset that is swapped in according to the below ratios
+ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
 
 UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50 # No swapping
 ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00 # Teacher prompt or embedding is swapped for enhanced but the student is the same. Probably not useful, I just thought it'd be interesting as a test
@@ -381,8 +381,6 @@ class PreTokenizedDataset(Dataset):
                 teacher_input_ids,
                 embeddings,
                 teacher_mask,
-                student_line,
-                teacher_line
             )
         else:
             return (
@@ -390,8 +388,6 @@ class PreTokenizedDataset(Dataset):
                 student_attention_mask,
                 teacher_input_ids,
                 teacher_mask,
-                student_line,
-                teacher_line
             )
 
     def __enter__(self):
@@ -402,20 +398,6 @@ class PreTokenizedDataset(Dataset):
             for file in self.file_handles:
                 file.close()
             self.file_handles.clear()
-
-# ========== MLP Projection Layer ==========
-class MLPProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, output_dim=4096):
-        super().__init__()
-        self.linear_in = torch.nn.Linear(input_dim, output_dim)
-        self.activation = torch.nn.GELU()
-        self.linear_out = torch.nn.Linear(output_dim, output_dim)
-
-    def forward(self, x):
-        x = self.linear_in(x)
-        x = self.activation(x)
-        x = self.linear_out(x)
-        return x
 
 # ========== Transformer Projection Layer ==========
 class TransformerProjectionLayer(torch.nn.Module):
@@ -446,41 +428,36 @@ class TransformerProjectionLayer(torch.nn.Module):
         return x
 
 # ========== Loss Function ==========
+def position_based_alignment(teacher_mask):
+    if teacher_mask.dtype != torch.bool:
+        teacher_mask = teacher_mask.bool()
+
+    attended_positions = torch.where(teacher_mask)[0]
+    aligned_pairs = [(pos.item(), pos.item()) for pos in attended_positions]
+    return aligned_pairs
+
 class HybridLoss(torch.nn.Module):
-    def __init__(self, student_hidden_size, teacher_hidden_size,
-                 huber_weight=0.4, cosine_weight=0.3, token_huber_weight=0.2, token_cosine_weight=0.1,
-                 huber_delta=1.0, student_tokenizer=None, teacher_tokenizer=None):
+    def __init__(self, huber_weight=0.7, cosine_weight=0.3, huber_delta=1.0,
+                 student_tokenizer=None, teacher_tokenizer=None,
+                 enable_alignment_transition=False, warmup_steps=501):
         super().__init__()
         self.huber_weight = huber_weight
         self.cosine_weight = cosine_weight
-        self.token_huber_weight = token_huber_weight
-        self.token_cosine_weight = token_cosine_weight
-
         self.huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction='none')
         self.cos_loss = torch.nn.CosineSimilarity(dim=-1)
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
+        self.enable_alignment_transition = enable_alignment_transition
+        self.warmup_steps = warmup_steps
+        self.global_step = 0
+
+    def update_global_step(self, step):
+        self.global_step = step
 
     def forward(self, student_output, teacher_output, student_mask, teacher_mask,
-                student_input_ids=None, teacher_input_ids=None, student_text=None, teacher_text=None):
+                student_input_ids=None, teacher_input_ids=None):
         device = student_output.device
         batch_size = student_output.size(0)
-
-        if student_mask.dtype != torch.bool:
-            student_mask = student_mask.bool()
-        if teacher_mask.dtype != torch.bool:
-            teacher_mask = teacher_mask.bool()
-        if USE_STUDENT_MASK_FOR_SEQUENCE_LOSS:
-            seq_student_mask = student_mask
-        else:
-            seq_student_mask = teacher_mask
-
-        student_pooled = (student_output * seq_student_mask.unsqueeze(-1)).sum(dim=1) / seq_student_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        teacher_pooled = (teacher_output * teacher_mask.unsqueeze(-1)).sum(dim=1) / teacher_mask.sum(dim=1, keepdim=True).clamp(min=1)
-
-        seq_huber = self.huber_loss(student_pooled, teacher_pooled).mean()
-        seq_cos_sim = self.cos_loss(student_pooled, teacher_pooled)
-        seq_cos_loss = (1 - seq_cos_sim).mean()
 
         token_huber = torch.tensor(0.0, device=device)
         token_cos_loss = torch.tensor(0.0, device=device)
@@ -488,35 +465,26 @@ class HybridLoss(torch.nn.Module):
         num_aligned_seqs = 0
 
         for i in range(batch_size):
-            student_valid = student_mask[i]
-            teacher_valid = teacher_mask[i]
-            student_seq = student_output[i][student_valid]
-            teacher_seq = teacher_output[i][teacher_valid]
+            if self.enable_alignment_transition and self.global_step < self.warmup_steps:
+                aligned_pairs = token_based_alignment(
+                    student_input_ids[i], teacher_input_ids[i],
+                    self.student_tokenizer, self.teacher_tokenizer,
+                    window_size=TOKEN_ALIGNMENT_WINDOW
+                )
+            else:
+                aligned_pairs = position_based_alignment(teacher_mask[i])
 
-            if student_seq.size(0) == 0 or teacher_seq.size(0) == 0:
-                continue
-
-            path = token_based_alignment(
-                student_input_ids[i], teacher_input_ids[i],
-                self.student_tokenizer, self.teacher_tokenizer,
-                window_size=TOKEN_ALIGNMENT_WINDOW
-            )
-
-            if len(path) == 0:
+            if len(aligned_pairs) == 0:
                 continue
 
             num_aligned_seqs += 1
 
             student_aligned = []
             teacher_aligned = []
-            for pair in path:
+            for pair in aligned_pairs:
                 stu_idx, tea_idx = pair
-                if stu_idx < student_seq.size(0) and tea_idx < teacher_seq.size(0):
-                    student_aligned.append(student_seq[stu_idx])
-                    teacher_aligned.append(teacher_seq[tea_idx])
-
-            if len(student_aligned) == 0:
-                continue
+                student_aligned.append(student_output[i, stu_idx])
+                teacher_aligned.append(teacher_output[i, tea_idx])
 
             student_aligned = torch.stack(student_aligned)
             teacher_aligned = torch.stack(teacher_aligned)
@@ -524,7 +492,7 @@ class HybridLoss(torch.nn.Module):
             token_huber += self.huber_loss(student_aligned, teacher_aligned).mean()
             token_cos_sim = self.cos_loss(student_aligned, teacher_aligned)
             token_cos_loss += (1 - token_cos_sim).mean()
-            num_aligned_tokens += len(path)
+            num_aligned_tokens += len(aligned_pairs)
 
         if num_aligned_seqs > 0:
             token_huber /= num_aligned_seqs
@@ -534,13 +502,11 @@ class HybridLoss(torch.nn.Module):
             token_cos_loss = torch.tensor(0.0, device=device)
 
         total_loss = (
-            self.huber_weight * seq_huber +
-            self.cosine_weight * seq_cos_loss +
-            self.token_huber_weight * token_huber +
-            self.token_cosine_weight * token_cos_loss
+            self.huber_weight * token_huber +
+            self.cosine_weight * token_cos_loss
         )
 
-        return total_loss, seq_huber, seq_cos_loss, token_huber, token_cos_loss, num_aligned_tokens
+        return total_loss, token_huber, token_cos_loss, num_aligned_tokens
 
 # ========== Evaluation Function ==========
 def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtype):
@@ -552,17 +518,15 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
         'total': 0.0,
         'huber': 0.0,
         'cos': 0.0,
-        't_huber': 0.0,
-        't_cosine': 0.0,
     }
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             try:
                 if USE_CACHED_EMBEDDINGS:
-                    s_input_ids, s_mask, t_input_ids, t_embeddings, t_mask, student_text, teacher_text = batch
+                    s_input_ids, s_mask, t_input_ids, t_embeddings, t_mask = batch
                 else:
-                    s_input_ids, s_mask, t_input_ids, t_mask, student_text, teacher_text = batch
+                    s_input_ids, s_mask, t_input_ids, t_mask = batch
 
                 s_input_ids = s_input_ids.to(device)
                 t_mask = t_mask.to(device)
@@ -589,24 +553,20 @@ def evaluate_model(model, dataloader, projection, loss_fn, device, autocast_dtyp
                         teacher_hidden = teacher_outputs.last_hidden_state
                         teacher_hidden = teacher_hidden.to(device)
 
-                loss, huber_loss, cos_loss, t_huber_loss, t_cos_loss, _ = loss_fn(
+                loss, huber_loss, cos_loss, _ = loss_fn(
                     projected_student,
                     teacher_hidden,
                     s_mask,
                     t_mask,
                     student_input_ids=s_input_ids,
                     teacher_input_ids=t_input_ids,
-                    student_text=student_text,
-                    teacher_text=teacher_text
                 )
 
                 total_losses['total'] += loss.item()
                 total_losses['huber'] += huber_loss.item()
                 total_losses['cos'] += cos_loss.item()
-                total_losses['t_huber'] += t_huber_loss.item()
-                total_losses['t_cosine'] += t_cos_loss.item()
 
-                del loss, huber_loss, cos_loss, t_huber_loss, t_cos_loss, projected_student, student_hidden, student_outputs
+                del loss, huber_loss, cos_loss, projected_student, student_hidden, student_outputs
                 if not USE_CACHED_EMBEDDINGS and 'teacher_hidden' in locals():
                     del teacher_hidden, teacher_outputs
                 del s_input_ids, s_mask, t_mask
@@ -667,21 +627,14 @@ def save_trained_model(save_path, model, tokenizer, projection, qwen_embedding_d
     save_projection_config(projection_config_path, qwen_embedding_dim)
 
 def save_projection_config(projection_config_path, embedding_dim):
-    if USE_MLP_PROJECTION:
-        projection_config = {
-            "input_dim": embedding_dim,
-            "output_dim": 4096,
-            "type": "MLP",
-        }
-    else:
-        projection_config = {
-            "input_dim": embedding_dim,
-            "transformer_dim": embedding_dim,
-            "output_dim": 4096,
-            "dim_feedforward": FEED_FORWARD_DIM,
-            "num_layers": TRANSFORMER_LAYERS,
-            "type": "TRANSFORMER_MLP",
-        }
+    projection_config = {
+        "input_dim": embedding_dim,
+        "transformer_dim": embedding_dim,
+        "output_dim": 4096,
+        "dim_feedforward": FEED_FORWARD_DIM,
+        "num_layers": TRANSFORMER_LAYERS,
+        "type": "TRANSFORMER_MLP",
+    }
     with open(projection_config_path, "w") as f:
         json.dump(projection_config, f)
 
@@ -702,13 +655,12 @@ def get_logging():
         f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
         f"Step: {global_step}/{total_steps}, "
         f"Total Loss: {current_loss:.6f}, "
-        f"PT Huber Loss: {current_t_huber:.6f}, "
-        f"PT Cosine Loss: {current_t_cos:.6f}, "
-        f"SQ Huber Loss: {current_huber:.6f}, "
-        f"SQ Cosine Loss: {current_cos:.6f}, "
-        f"Aligned Tokens: {num_aligned_tokens}, "
-        f"Grad Norm: {grad_norm:.6f}, "
-        f"Learning Rate: {current_lr:.6f}, "
+        f"Huber Loss: {current_huber:.6f}, "
+        f"Cosine Loss: {current_cos:.6f}, "
+        f"Grad Norm Model: {grad_norm_model:.6f}, "
+        f"Grad Norm Projection: {grad_norm_proj:.6f}, "
+        f"Model LR: {current_lr_model:.6f}, "
+        f"Projection LR: {current_lr_proj:.6f}, "
         f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
         f"Elapsed: {elapsed/60:.1f} min, "
         f"ETA: {eta/60:.1f} min"
@@ -774,53 +726,20 @@ else:
 # ========== Initialize or Load Projection Layer ==========
 projection_path = os.path.join(QWEN3_MODEL_NAME, "projection_layer.safetensors")
 
-if USE_MLP_PROJECTION:
-    if os.path.exists(projection_path):
-        print("Loading existing projection layer from", projection_path)
-        try:
-            state_dict = load_file(projection_path)
-            projection = MLPProjectionLayer(
-                input_dim=qwen_embedding_dim,
-                output_dim=4096,
-            )
-            projection.load_state_dict(state_dict)
-        except Exception as e:
-            print(f"Error loading projection layer: {e}")
-            print("Initializing projection layer")
-            projection = MLPProjectionLayer(
-                input_dim=qwen_embedding_dim,
-                output_dim=4096,
-            )
-    else:
-        print("Initializing projection layer")
-        projection = MLPProjectionLayer(
+if os.path.exists(projection_path):
+    print("Loading existing projection layer from", projection_path)
+    try:
+        state_dict = load_file(projection_path)
+        projection = TransformerProjectionLayer(
             input_dim=qwen_embedding_dim,
+            transformer_dim=qwen_embedding_dim,
             output_dim=4096,
+            dim_feedforward=FEED_FORWARD_DIM,
+            num_layers=TRANSFORMER_LAYERS,
         )
-else:
-    if os.path.exists(projection_path):
-        print("Loading existing projection layer from", projection_path)
-        try:
-            state_dict = load_file(projection_path)
-            projection = TransformerProjectionLayer(
-                input_dim=qwen_embedding_dim,
-                transformer_dim=qwen_embedding_dim,
-                output_dim=4096,
-                dim_feedforward=FEED_FORWARD_DIM,
-                num_layers=TRANSFORMER_LAYERS,
-            )
-            projection.load_state_dict(state_dict)
-        except Exception as e:
-            print(f"Error loading projection layer: {e}")
-            print("Initializing projection layer")
-            projection = TransformerProjectionLayer(
-                input_dim=qwen_embedding_dim,
-                transformer_dim=qwen_embedding_dim,
-                output_dim=4096,
-                dim_feedforward=FEED_FORWARD_DIM,
-                num_layers=TRANSFORMER_LAYERS,
-            )
-    else:
+        projection.load_state_dict(state_dict)
+    except Exception as e:
+        print(f"Error loading projection layer: {e}")
         print("Initializing projection layer")
         projection = TransformerProjectionLayer(
             input_dim=qwen_embedding_dim,
@@ -829,20 +748,27 @@ else:
             dim_feedforward=FEED_FORWARD_DIM,
             num_layers=TRANSFORMER_LAYERS,
         )
+else:
+    print("Initializing projection layer")
+    projection = TransformerProjectionLayer(
+        input_dim=qwen_embedding_dim,
+        transformer_dim=qwen_embedding_dim,
+        output_dim=4096,
+        dim_feedforward=FEED_FORWARD_DIM,
+        num_layers=TRANSFORMER_LAYERS,
+    )
 
-losses = [0.00, 0.00, HUBER_LOSS, COSINE_LOSS]
+losses = [HUBER_LOSS, COSINE_LOSS]
 sum_loss = sum(losses)
 normalised_losses = [loss / sum_loss for loss in losses]
 
 hybrid_loss = HybridLoss(
     huber_weight=normalised_losses[0],
     cosine_weight=normalised_losses[1],
-    token_huber_weight=normalised_losses[2],
-    token_cosine_weight=normalised_losses[3],
-    student_hidden_size=4096,
-    teacher_hidden_size=4096,
     student_tokenizer=student_tokenizer,
-    teacher_tokenizer=teacher_tokenizer
+    teacher_tokenizer=teacher_tokenizer,
+    enable_alignment_transition=ENABLE_ALIGNMENT_TRANSITION,
+    warmup_steps=WARMUP_STEPS
 ).to(device, dtype=torch.bfloat16)
 
 projection.to(device, dtype=torch.bfloat16)
@@ -925,38 +851,73 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             print("You can't disable both model and projection training! Enabling model training...")
             model_parameters = [p for p in student_model.parameters() if p.requires_grad]
 
-        optimizer = torch.optim.AdamW(
-            model_parameters +
-            projection_parameters,
-            lr=MAX_LEARNING_RATE,
+        model_optimizer = torch.optim.AdamW(
+            [p for p in student_model.parameters() if p.requires_grad],
+            lr=MAX_LEARNING_RATE_MODEL,
             betas=(0.9, 0.999),
             weight_decay=0.01,
             eps=1e-8
         )
 
+        projection_optimizer = torch.optim.AdamW(
+            list(projection.parameters()),
+            lr=MAX_LEARNING_RATE_PROJECTION,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8
+        )
+
+        # Model schedulers
         if RESTART_PERIOD_STEPS == 0:
-            scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
+            scheduler_model = torch.optim.lr_scheduler.LinearLR(
+                model_optimizer,
                 start_factor=1.0,
                 end_factor=1.0,
                 total_iters=total_steps - WARMUP_STEPS
             )
         else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer,
+            scheduler_model = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                model_optimizer,
                 T_0=RESTART_PERIOD_STEPS,
                 T_mult=1,
-                eta_min=MIN_LEARNING_RATE,
+                eta_min=MIN_LEARNING_RATE_MODEL,
             )
 
         if WARMUP_STEPS > 0:
-            warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lr_lambda=lambda step: min((MIN_LEARNING_RATE / MAX_LEARNING_RATE) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE / MAX_LEARNING_RATE), 1.0)
+            warmup_scheduler_model = torch.optim.lr_scheduler.LambdaLR(
+                model_optimizer,
+                lr_lambda=lambda step: min((MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL), 1.0)
             )
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, scheduler],
+            scheduler_model = torch.optim.lr_scheduler.SequentialLR(
+                model_optimizer,
+                schedulers=[warmup_scheduler_model, scheduler_model],
+                milestones=[WARMUP_STEPS]
+            )
+
+        # Projection schedulers
+        if RESTART_PERIOD_STEPS == 0:
+            scheduler_proj = torch.optim.lr_scheduler.LinearLR(
+                projection_optimizer,
+                start_factor=1.0,
+                end_factor=1.0,
+                total_iters=total_steps - WARMUP_STEPS
+            )
+        else:
+            scheduler_proj = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                projection_optimizer,
+                T_0=RESTART_PERIOD_STEPS,
+                T_mult=1,
+                eta_min=MIN_LEARNING_RATE_PROJECTION,
+            )
+
+        if WARMUP_STEPS > 0:
+            warmup_scheduler_proj = torch.optim.lr_scheduler.LambdaLR(
+                projection_optimizer,
+                lr_lambda=lambda step: min((MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION), 1.0)
+            )
+            scheduler_proj = torch.optim.lr_scheduler.SequentialLR(
+                projection_optimizer,
+                schedulers=[warmup_scheduler_proj, scheduler_proj],
                 milestones=[WARMUP_STEPS]
             )
 
@@ -967,7 +928,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         eval_delta_time = 0
         best_loss = float('inf')
         for epoch in range(EPOCHS):
-            optimizer.zero_grad()
+            model_optimizer.zero_grad()
+            projection_optimizer.zero_grad()
 
             steps_completed_this_epoch = 0
             accumulation_step = 0
@@ -978,9 +940,9 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             for batch_idx, batch in enumerate(train_dataloader):
                 try:
                     if USE_CACHED_EMBEDDINGS:
-                        s_input_ids, s_mask, t_input_ids, t_embeddings, t_mask, student_text, teacher_text = batch
+                        s_input_ids, s_mask, t_input_ids, t_embeddings, t_mask = batch
                     else:
-                        s_input_ids, s_mask, t_input_ids, t_mask, student_text, teacher_text = batch
+                        s_input_ids, s_mask, t_input_ids, t_mask = batch
 
                     s_input_ids = s_input_ids.to(device)
                     s_mask = s_mask.to(device)
@@ -1008,15 +970,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             teacher_hidden = teacher_hidden.to(device)
                             del teacher_outputs
 
-                    loss, huber_loss, cos_loss, t_huber_loss, t_cos_loss, num_aligned_tokens = hybrid_loss(
+                    loss, huber_loss, cos_loss, num_aligned_tokens = hybrid_loss(
                         projected_student,
                         teacher_hidden,
                         s_mask,
                         t_mask,
                         student_input_ids=s_input_ids,
-                        teacher_input_ids=t_input_ids,
-                        student_text=student_text,
-                        teacher_text=teacher_text
+                        teacher_input_ids=t_input_ids
                     )
 
                     scaled_loss = loss / GRAD_ACCUM_STEPS
@@ -1024,13 +984,17 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                     accumulation_step += 1
 
                     if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataset) - 1:
-                        grad_norm = clip_grad_norm_(
-                            model_parameters +
-                            projection_parameters,
+                        grad_norm_model = clip_grad_norm_(
+                            [p for p in student_model.parameters() if p.requires_grad],
+                            max_norm=GRAD_CLIP
+                        )
+                        grad_norm_proj = clip_grad_norm_(
+                            list(projection.parameters()),
                             max_norm=GRAD_CLIP
                         )
 
-                        scaler.step(optimizer)
+                        scaler.step(model_optimizer)
+                        scaler.step(projection_optimizer)
                         scaler.update()
 
                         global_step += 1
@@ -1040,14 +1004,13 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         current_loss = loss.item()
                         current_huber = huber_loss.item()
                         current_cos = cos_loss.item()
-                        current_t_huber = t_huber_loss.item()
-                        current_t_cos = t_cos_loss.item()
 
                         elapsed = time.time() - start_time - eval_delta_time
                         remaining_steps = total_steps - global_step
                         eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
                         vram_free, vram_total, vram_used = get_memory_usage()
-                        current_lr = scheduler.get_last_lr()[0]
+                        current_lr_model = scheduler_model.get_last_lr()[0]
+                        current_lr_proj = scheduler_proj.get_last_lr()[0]
 
                         if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
                             print(get_logging())
@@ -1074,10 +1037,12 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                                         f.write(line + "\n")
                                 log_lines.clear()
 
-                        scheduler.step()
-                        optimizer.zero_grad()
+                        scheduler_model.step()
+                        scheduler_proj.step()
+                        model_optimizer.zero_grad()
+                        projection_optimizer.zero_grad()
 
-                        del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss, t_huber_loss, t_cos_loss
+                        del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss
                         if 't_input_ids' in locals():
                             del t_input_ids
 
@@ -1105,10 +1070,6 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         del huber_loss
                     if 'cos_loss' in locals():
                         del cos_loss
-                    if 't_huber_loss' in locals():
-                        del t_huber_loss
-                    if 't_cos_loss' in locals():
-                        del t_cos_loss
                     if 't_input_ids' in locals():
                         del t_input_ids
                     del s_input_ids, s_mask, t_mask
@@ -1118,7 +1079,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         del t_input_ids
 
                     accumulation_step = 0
-                    optimizer.zero_grad()
+                    model_optimizer.zero_grad()
+                    projection_optimizer.zero_grad()
                     continue
 
             print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
@@ -1140,8 +1102,6 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                 print(f"  Average Total Loss: {avg_eval_loss:.6f}")
                 print(f"  Huber Loss: {eval_metrics['huber']:.6f}")
                 print(f"  Cosine Loss: {eval_metrics['cos']:.6f}")
-                print(f"  Token Huber Loss: {eval_metrics['t_huber']:.6f}")
-                print(f"  Token Cosine Loss: {eval_metrics['t_cosine']:.6f}")
 
                 if SAVE_BEST_MODEL and avg_eval_loss < best_loss:
                     best_loss = avg_eval_loss
