@@ -23,8 +23,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ========== Configuration ==========
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt" # Each line of the dataset text file is taken as one prompt
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v1/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v2/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v3/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v4/"
 
 USE_CACHED_EMBEDDINGS = True # Each T5-xxl embedding is cached; size per is 4MB so multiply by dataset size for capacity required
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2" # Cache is picked up on subsequent runs by reference to dataset file name
@@ -40,14 +40,14 @@ BATCH_SIZE = 64
 GRAD_ACCUM_STEPS = 1
 GRAD_CLIP = 5.0
 
-EPOCHS = 1
+EPOCHS = 5
 
-MAX_LEARNING_RATE_MODEL = 1e-4
+MAX_LEARNING_RATE_MODEL = 5e-5
 MIN_LEARNING_RATE_MODEL = 1e-5
-MAX_LEARNING_RATE_PROJECTION = 5e-4
+MAX_LEARNING_RATE_PROJECTION = 15e-5
 MIN_LEARNING_RATE_PROJECTION = 1e-5
 
-SAVE_EVERY_X_STEPS = 500
+SAVE_EVERY_X_STEPS = 0
 SAVE_EVERY_X_RESTARTS = 1
 SAVE_EVERY_X_EPOCHS = 1
 
@@ -55,22 +55,22 @@ PRINT_EVERY_X_STEPS = 1
 EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
-HUBER_LOSS = 0.50
-COSINE_LOSS = 0.50
+HUBER_LOSS = 0.70
+COSINE_LOSS = 0.30
 
-WARMUP_STEPS = 1000 # Set to 0 to disable warmup
+WARMUP_STEPS = 500 # Set to 0 to disable warmup
 RESTART_PERIOD_STEPS = 1000 # Set to 0 to use linear scheduler instead
-ENABLE_ALIGNMENT_TRANSITION = True # Enable during first training run only. Aligns projection to expanded teacher attended area during warmup, then we switch to 1:1 per token losses once the relationship between projection student and target is patterned
+ENABLE_ALIGNMENT_TRANSITION = True # Enable during first training run only. Aligns projection to expanded teacher attended area during warmup
 
-SHUFFLE_DATASET = True # Random order is better, but might incur bottlenecking due to random read overhead
+SHUFFLE_DATASET = False # Random order is better, but might incur bottlenecking due to random read overhead
 
 ENABLE_STUDENT_WORD_DROPOUT = False # Removes words from the student prompt according to the below ratio
 STUDENT_WORD_DROPOUT_RATIO = 0.10 # This probability is applied on a per-word basis. Words are defined as any section delineated by spaces. Forces model to learn to infer from context, and encourages over-projection beyond the teacher mask
 
 TRAIN_PROJECTION = True
-TRAIN_MODEL = True
+TRAIN_MODEL = False
 
-TOKEN_ALIGNMENT_WINDOW = 5 # We try to match tokens for per-token loss during alignment transition by matching identical text content, looking ahead by this many tokens
+TOKEN_ALIGNMENT_WINDOW = 5 # We try to match tokens for per-token loss by matching identical text content, looking ahead by this many tokens
 
 FEED_FORWARD_DIM = 4096
 TRANSFORMER_LAYERS = 1
@@ -650,6 +650,16 @@ def exit_dataloader():
     gc.collect()
 
 def get_logging():
+    model_gn_line = ""
+    model_lr_line = ""
+    proj_gn_line = ""
+    proj_lr_line = ""
+    if TRAIN_MODEL:
+        model_gn_line = f"Grad Norm Model: {grad_norm_model:.6f}, "
+        model_lr_line = f"Model LR: {current_lr_model:.6f}, "
+    if TRAIN_PROJECTION:
+        proj_gn_line = f"Grad Norm Projection: {grad_norm_proj:.6f}, "
+        proj_lr_line = f"Projection LR: {current_lr_proj:.6f}, "
     log_line = (
         f"Epoch [{epoch + 1}/{EPOCHS}], "
         f"Batch [{batch_idx + 1}/{len(train_dataloader)}], "
@@ -657,10 +667,10 @@ def get_logging():
         f"Total Loss: {current_loss:.6f}, "
         f"Huber Loss: {current_huber:.6f}, "
         f"Cosine Loss: {current_cos:.6f}, "
-        f"Grad Norm Model: {grad_norm_model:.6f}, "
-        f"Grad Norm Projection: {grad_norm_proj:.6f}, "
-        f"Model LR: {current_lr_model:.6f}, "
-        f"Projection LR: {current_lr_proj:.6f}, "
+        f"{model_gn_line}"
+        f"{proj_gn_line}"
+        f"{model_lr_line}"
+        f"{proj_lr_line}"
         f"VRAM Usage: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
         f"Elapsed: {elapsed/60:.1f} min, "
         f"ETA: {eta/60:.1f} min"
@@ -841,85 +851,74 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             log_file = os.path.join(log_dir, log_filename)
             log_lines = []
 
-        model_parameters = []
-        projection_parameters = []
-        if TRAIN_MODEL == True:
-            model_parameters = [p for p in student_model.parameters() if p.requires_grad]
-        if TRAIN_PROJECTION == True:
+        if TRAIN_MODEL:
+            model_optimizer = torch.optim.AdamW(
+                [p for p in student_model.parameters() if p.requires_grad],
+                lr=MAX_LEARNING_RATE_MODEL,
+                betas=(0.9, 0.999),
+                weight_decay=0.01,
+                eps=1e-8
+            )
+            if RESTART_PERIOD_STEPS == 0:
+                scheduler_model = torch.optim.lr_scheduler.LinearLR(
+                    model_optimizer,
+                    start_factor=1.0,
+                    end_factor=1.0,
+                    total_iters=total_steps - WARMUP_STEPS
+                )
+            else:
+                scheduler_model = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    model_optimizer,
+                    T_0=RESTART_PERIOD_STEPS,
+                    T_mult=1,
+                    eta_min=MIN_LEARNING_RATE_MODEL,
+                )
+
+            if WARMUP_STEPS > 0:
+                warmup_scheduler_model = torch.optim.lr_scheduler.LambdaLR(
+                    model_optimizer,
+                    lr_lambda=lambda step: min((MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL), 1.0)
+                )
+                scheduler_model = torch.optim.lr_scheduler.SequentialLR(
+                    model_optimizer,
+                    schedulers=[warmup_scheduler_model, scheduler_model],
+                    milestones=[WARMUP_STEPS]
+                )
+        if TRAIN_PROJECTION:
             projection_parameters = list(projection.parameters())
-        if TRAIN_MODEL == False and TRAIN_PROJECTION == False:
-            print("You can't disable both model and projection training! Enabling model training...")
-            model_parameters = [p for p in student_model.parameters() if p.requires_grad]
-
-        model_optimizer = torch.optim.AdamW(
-            [p for p in student_model.parameters() if p.requires_grad],
-            lr=MAX_LEARNING_RATE_MODEL,
-            betas=(0.9, 0.999),
-            weight_decay=0.01,
-            eps=1e-8
-        )
-
-        projection_optimizer = torch.optim.AdamW(
-            list(projection.parameters()),
-            lr=MAX_LEARNING_RATE_PROJECTION,
-            betas=(0.9, 0.999),
-            weight_decay=0.01,
-            eps=1e-8
-        )
-
-        # Model schedulers
-        if RESTART_PERIOD_STEPS == 0:
-            scheduler_model = torch.optim.lr_scheduler.LinearLR(
-                model_optimizer,
-                start_factor=1.0,
-                end_factor=1.0,
-                total_iters=total_steps - WARMUP_STEPS
-            )
-        else:
-            scheduler_model = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                model_optimizer,
-                T_0=RESTART_PERIOD_STEPS,
-                T_mult=1,
-                eta_min=MIN_LEARNING_RATE_MODEL,
+            projection_optimizer = torch.optim.AdamW(
+                list(projection.parameters()),
+                lr=MAX_LEARNING_RATE_PROJECTION,
+                betas=(0.9, 0.999),
+                weight_decay=0.01,
+                eps=1e-8
             )
 
-        if WARMUP_STEPS > 0:
-            warmup_scheduler_model = torch.optim.lr_scheduler.LambdaLR(
-                model_optimizer,
-                lr_lambda=lambda step: min((MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_MODEL / MAX_LEARNING_RATE_MODEL), 1.0)
-            )
-            scheduler_model = torch.optim.lr_scheduler.SequentialLR(
-                model_optimizer,
-                schedulers=[warmup_scheduler_model, scheduler_model],
-                milestones=[WARMUP_STEPS]
-            )
+            if RESTART_PERIOD_STEPS == 0:
+                scheduler_proj = torch.optim.lr_scheduler.LinearLR(
+                    projection_optimizer,
+                    start_factor=1.0,
+                    end_factor=1.0,
+                    total_iters=total_steps - WARMUP_STEPS
+                )
+            else:
+                scheduler_proj = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    projection_optimizer,
+                    T_0=RESTART_PERIOD_STEPS,
+                    T_mult=1,
+                    eta_min=MIN_LEARNING_RATE_PROJECTION,
+                )
 
-        # Projection schedulers
-        if RESTART_PERIOD_STEPS == 0:
-            scheduler_proj = torch.optim.lr_scheduler.LinearLR(
-                projection_optimizer,
-                start_factor=1.0,
-                end_factor=1.0,
-                total_iters=total_steps - WARMUP_STEPS
-            )
-        else:
-            scheduler_proj = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                projection_optimizer,
-                T_0=RESTART_PERIOD_STEPS,
-                T_mult=1,
-                eta_min=MIN_LEARNING_RATE_PROJECTION,
-            )
-
-        if WARMUP_STEPS > 0:
-            warmup_scheduler_proj = torch.optim.lr_scheduler.LambdaLR(
-                projection_optimizer,
-                lr_lambda=lambda step: min((MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION), 1.0)
-            )
-            scheduler_proj = torch.optim.lr_scheduler.SequentialLR(
-                projection_optimizer,
-                schedulers=[warmup_scheduler_proj, scheduler_proj],
-                milestones=[WARMUP_STEPS]
-            )
+            if WARMUP_STEPS > 0:
+                warmup_scheduler_proj = torch.optim.lr_scheduler.LambdaLR(
+                    projection_optimizer,
+                    lr_lambda=lambda step: min((MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION) + (step / (WARMUP_STEPS+1)) * (1 - MIN_LEARNING_RATE_PROJECTION / MAX_LEARNING_RATE_PROJECTION), 1.0)
+                )
+                scheduler_proj = torch.optim.lr_scheduler.SequentialLR(
+                    projection_optimizer,
+                    schedulers=[warmup_scheduler_proj, scheduler_proj],
+                    milestones=[WARMUP_STEPS]
+                )
 
         # ========== Training Loop ==========
         student_model.train()
@@ -928,8 +927,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         eval_delta_time = 0
         best_loss = float('inf')
         for epoch in range(EPOCHS):
-            model_optimizer.zero_grad()
-            projection_optimizer.zero_grad()
+            if TRAIN_MODEL: model_optimizer.zero_grad()
+            if TRAIN_PROJECTION: projection_optimizer.zero_grad()
 
             steps_completed_this_epoch = 0
             accumulation_step = 0
@@ -993,8 +992,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             max_norm=GRAD_CLIP
                         )
 
-                        scaler.step(model_optimizer)
-                        scaler.step(projection_optimizer)
+                        if TRAIN_MODEL: scaler.step(model_optimizer)
+                        if TRAIN_PROJECTION: scaler.step(projection_optimizer)
                         scaler.update()
 
                         global_step += 1
@@ -1009,8 +1008,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         remaining_steps = total_steps - global_step
                         eta = (elapsed / global_step) * remaining_steps if global_step > 0 else 0
                         vram_free, vram_total, vram_used = get_memory_usage()
-                        current_lr_model = scheduler_model.get_last_lr()[0]
-                        current_lr_proj = scheduler_proj.get_last_lr()[0]
+                        if TRAIN_MODEL: current_lr_model = scheduler_model.get_last_lr()[0]
+                        if TRAIN_PROJECTION: current_lr_proj = scheduler_proj.get_last_lr()[0]
 
                         if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
                             print(get_logging())
@@ -1037,10 +1036,12 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                                         f.write(line + "\n")
                                 log_lines.clear()
 
-                        scheduler_model.step()
-                        scheduler_proj.step()
-                        model_optimizer.zero_grad()
-                        projection_optimizer.zero_grad()
+                        if TRAIN_MODEL:
+                            scheduler_model.step()
+                            model_optimizer.zero_grad()
+                        if TRAIN_PROJECTION:
+                            scheduler_proj.step()
+                            projection_optimizer.zero_grad()
 
                         del loss, scaled_loss, student_outputs, student_hidden, projected_student, teacher_hidden, huber_loss, cos_loss
                         if 't_input_ids' in locals():
@@ -1079,8 +1080,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         del t_input_ids
 
                     accumulation_step = 0
-                    model_optimizer.zero_grad()
-                    projection_optimizer.zero_grad()
+                    if TRAIN_MODEL: model_optimizer.zero_grad()
+                    if TRAIN_PROJECTION: projection_optimizer.zero_grad()
                     continue
 
             print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
