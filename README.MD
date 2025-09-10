@@ -1,8 +1,6 @@
 # T5-to-Qwen
 
-![Chwon](trans_pt_18e5_TM.png)
-
-_Our iconic mascot, Chwon_
+![Qwen](1000+11000_teacher_5taw_15e5proj.png)
 
 ---
 
