@@ -8,6 +8,8 @@ A handy script for distillation training Qwen3 on T5-xxl output with an accompan
 
 Work-in-progress. Current approach: use token alignment (matching tokens in a sequential window by text content) and per-token losses for 500~1000 steps (64 batch size, adjust accordingly), then use 1:1 positional per-token alignment once the 1:1 projected-student-to-teacher-output relationship is patterned enough (token alignment won't work once the transformer shifts the embedding sequence out of alignment with the token sequence, after all). Results so far (5000 steps in) are promising, with prompt comprehension reliably increasing and clear text present in the output. Initial outputs will have some noise, but by 5000 steps noise seems to be gone, so we seem to have defeated the complete collapse that previously happened with solely 1:1 alignment.
 
+Update: on further testing, the output seems to collapse when training for a while - the warning sign for this is rising loss, I notice our huber loss floor went from below 2000 to over 3000. Running the token alignment should bring it back down again. I don't know if somehow the expanded area of the projected Qwen3 output becomes too noisy and requires some cleaning up via the less noisy student-mask-attended area. The actual semantic content of the embedding is sequentially shifted though, so only run this for ~100 steps (at 64 batch size) or loss will rise back up. I'll probably try testing different methods, like periodic cleaning or switching to token alignment for every n number of steps, to make the process more simple.
+
 ### Quick installation
 ---
 ```
