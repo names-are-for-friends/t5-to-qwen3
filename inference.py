@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v2/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v6/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -1224,12 +1224,6 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         logger.error(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
         raise FileNotFoundError(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
 
-    # Look for the projection layer file
-    projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
-    if not os.path.exists(projection_file):
-        logger.error(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
-        raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected file: projection_layer.safetensors")
-
     # Load tokenizer from the folder
     try:
         tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
@@ -1247,24 +1241,53 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
     ).to(device)
     model.eval()
 
-    projection_config_path = os.path.join(DEFAULT_QWEN3_FOLDER, "projection_config.json")
+    projection_config_path = os.path.join(qwen3_folder, "projection_config.json")
     with open(projection_config_path, 'r') as file:
         projection_config = json.load(file)
 
-    projection = ProjectionLayer(
-        input_dim=projection_config["input_dim"],
-        transformer_dim=projection_config["transformer_dim"],
-        output_dim=projection_config["output_dim"],
-        dim_feedforward=projection_config["dim_feedforward"],
-        num_layers=projection_config["num_layers"]
-    )
+    # Look for multiple projection layers: projection_layer_1.safetensors, projection_layer_2.safetensors, etc.
+    projection_files = []
+    i = 1
+    while True:
+        projection_file = os.path.join(qwen3_folder, f"projection_layer_{i}.safetensors")
+        if os.path.exists(projection_file):
+            projection_files.append(projection_file)
+            i += 1
+        else:
+            break
 
-    projection_state = load_file(projection_file)
-    projection.load_state_dict(projection_state)
-    projection.to(model.device, dtype=torch.bfloat16)
-    projection.eval()
+    # If no projection_layer_i.safetensors files were found, fall back to the legacy projection_layer.safetensors
+    if len(projection_files) == 0:
+        projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
+        if os.path.exists(projection_file):
+            projection_files = [projection_file]
+        else:
+            logger.error(f"Projection layer file not found in {qwen3_folder}. Expected files: projection_layer_*.safetensors or projection_layer.safetensors")
+            raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected files: projection_layer_*.safetensors or projection_layer.safetensors")
 
-    return model, projection, tokenizer
+    # Build the sequential projection module
+    projection_module = nn.Sequential()
+    input_dim = projection_config["input_dim"]
+    transformer_dim = projection_config["transformer_dim"]
+    for projection_file in projection_files:
+        layer = ProjectionLayer(
+            input_dim=input_dim,
+            transformer_dim=transformer_dim,
+            output_dim=projection_config["output_dim"],
+            dim_feedforward=projection_config["dim_feedforward"],
+            num_layers=projection_config["num_layers"]
+        )
+        state_dict = load_file(projection_file)
+        layer.load_state_dict(state_dict)
+        projection_module.append(layer)
+        # Input dimension for the next layer is the output dimension of the current layer
+        input_dim = projection_config["output_dim"]
+        transformer_dim = projection_config["subsequent_dim"]
+
+    projection_module.to(model.device, dtype=torch.bfloat16)
+    projection_module.eval()
+
+    return model, projection_module, tokenizer
 
 def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
     logger.info(f"Loading T5 model from {t5_folder}")
@@ -1375,7 +1398,7 @@ if __name__ == "__main__":
     else:
         logger.info("Using Qwen3 for text embeddings")
         # Load Qwen3 model and projection to CUDA first
-        qwen3_model, projection, tokenizer = load_qwen3_model(args.qwen3_folder)
+        qwen3_model, projection_module, tokenizer = load_qwen3_model(args.qwen3_folder)
 
         # Tokenize and create embeddings
         text_inputs = tokenizer(
@@ -1407,7 +1430,8 @@ if __name__ == "__main__":
             )
             embed = output.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        embed = projection(embed).to(qwen3_model.device)
+        # Pass through all projection layers
+        embed = projection_module(embed).to(qwen3_model.device)
 
         with torch.no_grad():
             output_neg = qwen3_model(
@@ -1417,7 +1441,7 @@ if __name__ == "__main__":
             )
             embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        embed_neg = projection(embed_neg).to(qwen3_model.device)
+        embed_neg = projection_module(embed_neg).to(qwen3_model.device)
 
         if USE_T5_MASK_WITH_QWEN:
 
@@ -1452,7 +1476,7 @@ if __name__ == "__main__":
 
     # Clear text models from CUDA memory
     if 'qwen3_model' in locals():
-        del qwen3_model, projection
+        del qwen3_model, projection_module
     else:
         del t5_model
     torch.cuda.empty_cache()
