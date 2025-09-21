@@ -73,7 +73,7 @@ ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
 
-SHUFFLE_DATASET = True # Random order is better but may introduce random read bottlenecking, especially if you have a crappy SMR drive (lol)
+SHUFFLE_DATASET = False # Random order is better but may introduce random read bottlenecking, especially if you have a crappy SMR drive (lol)
 
 TRAIN_PROJECTION = True
 TRAIN_MODEL = True
@@ -1870,7 +1870,10 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                     continue
 
             if AUTO_LAYER_INIT_TRAINING:
-                break
+                if restart_cycle > total_restarts:
+                    break
+                else:
+                    pass
             print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
             next_epoch = epoch + 1
             if next_epoch % SAVE_EVERY_X_EPOCHS == 0:
