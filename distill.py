@@ -66,9 +66,9 @@ TOKEN_COSINE_LOSS = 0.20
 SEQUENCE_HUBER_LOSS = 0.20
 SEQUENCE_COSINE_LOSS = 0.10
 
-WARMUP_STEPS = 500 # Warmup steps occur prior to the restart cycle
-RESTART_CYCLE_STEPS = 2000 #
-ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
+WARMUP_STEPS = 5 # Warmup steps occur prior and additional to the restart cycle steps
+RESTART_CYCLE_STEPS = 5 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
+ALIGNMENT_STEPS = 0 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
 
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
@@ -880,7 +880,7 @@ def get_projection_layers(restart_cycle, layers_to_load):
             input_dim = layer_config["input_dim"]
 
         # Handle output_dim="auto"
-        if layer_config.get("output_dim", "auto") == "auto" or layer_config["omit_output_mlp"]:
+        if layer_config.get("output_dim", "auto") == "auto" or layer_config.get("omit_output_mlp", False) == True or layer_config.get("omit_output_linear", False) == True:
             if layer_config["type"] == "mlp":
                 output_dim = layer_config["activation_dim"]
             elif layer_config["type"] == "transformer":
@@ -969,7 +969,8 @@ def get_projection_layers(restart_cycle, layers_to_load):
         final_mlp = MLPProjectionLayer(
             input_dim=output_dim,
             activation_dim=4096,
-            output_dim=4096
+            output_dim=4096,
+            omit_output_linear=False,
         )
         final_mlp.is_extra = True
         final_mlp.input_dim = output_dim
@@ -1348,15 +1349,32 @@ def save_trained_model(save_path, model, tokenizer, projection_layers, qwen_embe
 def save_projection_config(projection_config_path, embedding_dim):
     if AUTO_LAYER_INIT_TRAINING and restart_cycle <= total_restarts:
         projection_config = {
-            "layers": PROJECTION_LAYERS_CONFIG,
+            "layers": PROJECTION_LAYERS_CONFIG[:layers_to_load],
             "restart_cycle": restart_cycle,
         }
+        if len(projection_layers) > 0:
+            top_file_num = 0
+            for layer in projection_config["layers"]:
+                if layer["file_num"] >= top_file_num:
+                    top_file_num = layer["file_num"]+1
+            idx = len(projection_layers) - 1
+            if hasattr(projection_layers[idx], 'is_extra'):
+                projection_config["layers"].append(
+                    {
+                        "type": "mlp",
+                        "input_dim": "auto",
+                        "activation_dim": 4096,
+                        "output_dim": 4096,
+                        "omit_output_linear": False,
+                        "file_num": top_file_num,
+                    }
+                )
     else:
         projection_config = {
             "layers": PROJECTION_LAYERS_CONFIG,
         }
-        with open(projection_config_path, "w") as f:
-            json.dump(projection_config, f)
+    with open(projection_config_path, "w") as f:
+        json.dump(projection_config, f)
 
 def exit_dataloader():
     train_dataloader = None
