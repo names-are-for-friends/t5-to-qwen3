@@ -5,7 +5,7 @@ from torch import Tensor, nn
 from torch.nn import Module, Embedding
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoTokenizer, AutoModelForCausalLM, T5EncoderModel, T5TokenizerFast
+from transformers import AutoTokenizer, AutoModelForCausalLM, T5EncoderModel, T5TokenizerFast, AutoModel
 from typing import Callable, List, Tuple
 from dataclasses import dataclass
 import requests
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/QT-embedder-v6/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/initialized_model/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -946,12 +946,37 @@ class AutoEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
 
-# ========== Transformer Projection Layer ==========
-class ProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, transformer_dim, output_dim=4096, dim_feedforward=2048, num_layers=1):
+# ========== Projection Layers ==========
+class LinearProjectionLayer(torch.nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_dim, output_dim)
+        self.output_dim = output_dim
+
+    def forward(self, x):
+        return self.linear(x)
+
+class MLPProjectionLayer(torch.nn.Module):
+    def __init__(self, input_dim, activation_dim, output_dim, omit_output_linear=False):
+        super().__init__()
+        self.linear_in = torch.nn.Linear(input_dim, activation_dim)
+        self.activation = torch.nn.GELU()
+        if omit_output_linear:
+            self.linear_out = None
+        else:
+            self.linear_out = torch.nn.Linear(activation_dim, output_dim)
+
+    def forward(self, x):
+        x = self.linear_in(x)
+        x = self.activation(x)
+        if self.linear_out is not None:
+            x = self.linear_out(x)
+        return x
+
+class TransformerProjectionLayer(torch.nn.Module):
+    def __init__(self, input_dim, transformer_dim, output_dim, num_layers, dim_feedforward, omit_output_mlp=False, omit_output_linear=False):
         super().__init__()
         self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
-
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=transformer_dim,
             nhead=8,
@@ -960,19 +985,146 @@ class ProjectionLayer(torch.nn.Module):
             activation='gelu',
             batch_first=True
         )
-
         self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.upscale = torch.nn.Linear(transformer_dim, output_dim)
-        self.activation = torch.nn.GELU()
-        self.linear_out = torch.nn.Linear(output_dim, output_dim)
+        if omit_output_mlp:
+            self.linear = None
+        else:
+            self.linear = torch.nn.Linear(transformer_dim, output_dim)
+            self.activation = torch.nn.GELU()
+            if omit_output_linear:
+                self.linear_out = None
+            else:
+                self.linear_out = torch.nn.Linear(output_dim, output_dim)
 
     def forward(self, x):
         x = self.linear_in(x)
         x = self.transformer(x)
-        x = self.upscale(x)
-        x = self.activation(x)
-        x = self.linear_out(x)
+        if self.linear is not None:
+            x = self.linear(x)
+            x = self.activation(x)
+            if self.linear_out is not None:
+                x = self.linear_out(x)
         return x
+
+# ========== Projection Function ==========
+def get_projection_layers(restart_cycle, layers_to_load):
+    projection_layers = []
+    layers_to_load = len(PROJECTION_LAYERS_CONFIG)
+
+    output_dim_prev = None
+    for i in range(1, layers_to_load + 1):
+        layer_config = PROJECTION_LAYERS_CONFIG[i-1]
+        layer_num = layer_config["file_num"]
+        layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
+
+        # Determine input dim
+        if i == 1:
+            input_dim = qwen_embedding_dim
+        else:
+            input_dim = output_dim_prev
+
+        # Override if specified in config
+        if layer_config.get("input_dim", "auto") != "auto":
+            input_dim = layer_config["input_dim"]
+
+        # Handle output_dim="auto"
+        if layer_config.get("output_dim", "auto") == "auto" or layer_config["omit_output_mlp"]:
+            if layer_config["type"] == "mlp":
+                output_dim = layer_config["activation_dim"]
+            elif layer_config["type"] == "transformer":
+                output_dim = layer_config["transformer_dim"]
+            else:
+                if "output_dim" not in layer_config or layer_config["output_dim"] == "auto":
+                    raise ValueError("Linear layer must specify output_dim")
+                output_dim = layer_config["output_dim"]
+        else:
+            output_dim = layer_config["output_dim"]
+
+        output_dim_prev = output_dim
+
+        if file_num is not None:
+            if layer_config["file_num"] > file_num:
+                top_file_num = layer_config["file_num"]
+        else:
+            top_file_num = layer_config["file_num"]
+        file_num = layer_config["file_num"]
+
+        # Load or initialize layer based on type
+        if layer_config["type"] == "linear":
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = LinearProjectionLayer(
+                    input_dim=input_dim,
+                    output_dim=output_dim
+                )
+                projection_layer.load_state_dict(state_dict)
+            else:
+                projection_layer = LinearProjectionLayer(
+                    input_dim=input_dim,
+                    output_dim=output_dim
+                )
+        elif layer_config["type"] == "mlp":
+            activation_dim = layer_config["activation_dim"]
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = MLPProjectionLayer(
+                    input_dim=input_dim,
+                    activation_dim=activation_dim,
+                    output_dim=output_dim,
+                    omit_output_linear=layer_config.get("omit_output_linear", False)
+                )
+                projection_layer.load_state_dict(state_dict)
+            else:
+                projection_layer = MLPProjectionLayer(
+                    input_dim=input_dim,
+                    activation_dim=activation_dim,
+                    output_dim=output_dim,
+                    omit_output_linear=layer_config.get("omit_output_linear", False)
+                )
+        elif layer_config["type"] == "transformer":
+            transformer_dim = layer_config["transformer_dim"]
+            num_layers = layer_config["num_layers"]
+            dim_feedforward = layer_config["dim_feedforward"]
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = TransformerProjectionLayer(
+                    input_dim=input_dim,
+                    transformer_dim=transformer_dim,
+                    output_dim=output_dim,
+                    num_layers=num_layers,
+                    dim_feedforward=dim_feedforward,
+                    omit_output_mlp=layer_config.get("omit_output_mlp", False),
+                    omit_output_linear=layer_config.get("omit_output_linear", False)
+                )
+                projection_layer.load_state_dict(state_dict)
+            else:
+                projection_layer = TransformerProjectionLayer(
+                    input_dim=input_dim,
+                    transformer_dim=transformer_dim,
+                    output_dim=output_dim,
+                    num_layers=num_layers,
+                    dim_feedforward=dim_feedforward,
+                    omit_output_mlp=layer_config.get("omit_output_mlp", False),
+                    omit_output_linear=layer_config.get("omit_output_linear", False)
+                )
+        projection_layer.file_num = layer_config["file_num"]
+        projection_layer.output_dim = output_dim
+        projection_layers.append(projection_layer)
+
+    # Add final linear layer if output dim is not 4096
+    if output_dim != 4096:
+        print("Adding final MLP layer to match teacher dimension")
+        final_mlp = MLPProjectionLayer(
+            input_dim=output_dim,
+            activation_dim=4096,
+            output_dim=4096
+        )
+        final_mlp.is_extra = True
+        final_mlp.input_dim = output_dim
+        final_mlp.file_num = top_file_num+1
+        projection_layers.append(final_mlp)
+
+    return projection_layers, layers_to_load
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1215,23 +1367,84 @@ def load_autoencoder(vae_file: str) -> AutoEncoder:
     ae.to(torch.bfloat16)
     return ae
 
-def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
+def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
     logger.info(f"Loading Qwen3 model from {qwen3_folder}")
 
-    # Look for the model file
-    model_file = os.path.join(qwen3_folder, "model.safetensors")
-    if not os.path.exists(model_file):
-        logger.error(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
-        raise FileNotFoundError(f"Model file not found in {qwen3_folder}. Expected file: model.safetensors")
+    # Load model config
+    model_config_path = os.path.join(qwen3_folder, "config.json")
+    if not os.path.exists(model_config_path):
+        logger.error(f"Model config not found in {qwen3_folder}")
+        raise FileNotFoundError(f"Model config not found in {qwen3_folder}")
 
-    # Load tokenizer from the folder
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
-    except Exception as e:
-        logger.error(f"Failed to load tokenizer from {qwen3_folder}: {e}")
-        raise
+    with open(model_config_path, "r") as file:
+        model_config = json.load(file)
+    qwen_embedding_dim = model_config.get("hidden_size", 4096)
 
-    # Use flash attention for speed if available
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(qwen3_folder)
+
+    # Load projection config
+    projection_config_path = os.path.join(qwen3_folder, "projection_config.json")
+    if not os.path.exists(projection_config_path):
+        logger.error(f"Projection config not found in {qwen3_folder}")
+        raise FileNotFoundError(f"Projection config not found in {qwen3_folder}")
+
+    with open(projection_config_path, "r") as file:
+        projection_config = json.load(file)
+
+    # Build projection module
+    projection_module = nn.Sequential()
+    current_input_dim = qwen_embedding_dim
+
+    for layer_config in projection_config["layers"]:
+        # Resolve auto dimensions
+        if layer_config["input_dim"] == "auto":
+            layer_config["input_dim"] = current_input_dim
+        output_dim = layer_config.get("output_dim")
+
+        if output_dim == "auto":
+            if layer_config["type"] == "linear":
+                layer_config["output_dim"] = layer_config["input_dim"]
+            elif layer_config["type"] == "mlp":
+                layer_config["output_dim"] = layer_config["activation_dim"]
+            elif layer_config["type"] == "transformer":
+                layer_config["output_dim"] = layer_config["transformer_dim"]
+
+        # Create layer based on type
+        if layer_config["type"] == "linear":
+            layer = LinearProjectionLayer(
+                layer_config["input_dim"],
+                layer_config["output_dim"]
+            )
+        elif layer_config["type"] == "mlp":
+            layer = MLPProjectionLayer(
+                layer_config["input_dim"],
+                layer_config["activation_dim"],
+                layer_config["output_dim"],
+                layer_config.get("omit_output_linear", False)
+            )
+        elif layer_config["type"] == "transformer":
+            layer = TransformerProjectionLayer(
+                layer_config["input_dim"],
+                layer_config["transformer_dim"],
+                layer_config["output_dim"],
+                layer_config["num_layers"],
+                layer_config["dim_feedforward"],
+                layer_config.get("omit_output_linear", False),
+                layer_config.get("omit_output_mlp", False)
+            )
+
+        # Load weights if available
+        file_num = layer_config["file_num"]
+        layer_path = os.path.join(qwen3_folder, f"projection_layer_{file_num}.safetensors")
+        if os.path.exists(layer_path):
+            state_dict = load_file(layer_path)
+            layer.load_state_dict(state_dict)
+
+        projection_module.append(layer)
+        current_input_dim = layer_config["output_dim"]
+
+    # Load model
     model = AutoModelForCausalLM.from_pretrained(
         qwen3_folder,
         torch_dtype=torch.bfloat16,
@@ -1240,49 +1453,6 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module]:
         attn_implementation="flash_attention_2"
     ).to(device)
     model.eval()
-
-    projection_config_path = os.path.join(qwen3_folder, "projection_config.json")
-    with open(projection_config_path, 'r') as file:
-        projection_config = json.load(file)
-
-    # Look for multiple projection layers: projection_layer_1.safetensors, projection_layer_2.safetensors, etc.
-    projection_files = []
-    i = 1
-    while True:
-        projection_file = os.path.join(qwen3_folder, f"projection_layer_{i}.safetensors")
-        if os.path.exists(projection_file):
-            projection_files.append(projection_file)
-            i += 1
-        else:
-            break
-
-    # If no projection_layer_i.safetensors files were found, fall back to the legacy projection_layer.safetensors
-    if len(projection_files) == 0:
-        projection_file = os.path.join(qwen3_folder, "projection_layer.safetensors")
-        if os.path.exists(projection_file):
-            projection_files = [projection_file]
-        else:
-            logger.error(f"Projection layer file not found in {qwen3_folder}. Expected files: projection_layer_*.safetensors or projection_layer.safetensors")
-            raise FileNotFoundError(f"Projection layer file not found in {qwen3_folder}. Expected files: projection_layer_*.safetensors or projection_layer.safetensors")
-
-    # Build the sequential projection module
-    projection_module = nn.Sequential()
-    input_dim = projection_config["input_dim"]
-    transformer_dim = projection_config["transformer_dim"]
-    for projection_file in projection_files:
-        layer = ProjectionLayer(
-            input_dim=input_dim,
-            transformer_dim=transformer_dim,
-            output_dim=projection_config["output_dim"],
-            dim_feedforward=projection_config["dim_feedforward"],
-            num_layers=projection_config["num_layers"]
-        )
-        state_dict = load_file(projection_file)
-        layer.load_state_dict(state_dict)
-        projection_module.append(layer)
-        # Input dimension for the next layer is the output dimension of the current layer
-        input_dim = projection_config["output_dim"]
-        transformer_dim = projection_config["subsequent_dim"]
 
     projection_module.to(model.device, dtype=torch.bfloat16)
     projection_module.eval()
@@ -1478,7 +1648,7 @@ if __name__ == "__main__":
     if 'qwen3_model' in locals():
         del qwen3_model, projection_module
     else:
-        del t5_model
+        del model
     torch.cuda.empty_cache()
 
     # Load Chroma model with memory optimization
