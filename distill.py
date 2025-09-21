@@ -67,7 +67,7 @@ SEQUENCE_HUBER_LOSS = 0.20
 SEQUENCE_COSINE_LOSS = 0.10
 
 WARMUP_STEPS = 500 # Warmup steps occur prior to the restart cycle
-RESTART_CYCLE_STEPS = 2000
+RESTART_CYCLE_STEPS = 2000 #
 ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
 
 REPEAT_WARMUP_AFTER_RESTART = True
@@ -80,7 +80,7 @@ TRAIN_MODEL = True
 
 LOG_VRAM_USAGE = False
 
-AUTO_LAYER_INIT_TRAINING = False  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
+AUTO_LAYER_INIT_TRAINING = True  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
 AUTO_LAYER_INIT_TRAINING_LR_SCALER = 3.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
 '''
 Most of these are self explanatory. "auto" for input aligns to previous output dim, "auto" for output aligns to previous transformer dim
@@ -132,7 +132,7 @@ PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
         "input_dim": "auto",
-        "transformer_dim": 1024,
+        "transformer_dim": 2048,
         "output_dim": "auto",
         "num_layers": 1,
         "dim_feedforward": 2048,
@@ -165,31 +165,20 @@ PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
         "input_dim": "auto",
-        "transformer_dim": 2048,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 7,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
         "transformer_dim": 4096,
         "output_dim": "auto",
         "num_layers": 1,
         "dim_feedforward": 2048,
         "omit_output_mlp": False,
         "omit_output_linear": False,
-        "file_num": 8,
+        "file_num": 7,
     },
 ]
 
 # ========== Advanced Configuration ==========
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [] # Use the file_num, not the index
 
-ENHANCED_DATASET = False # You can use a second dataset file and swap embeddings. Of dubious use, but whatever
+ENHANCED_DATASET = True # You can use a second dataset file and swap embeddings. Of dubious use, but whatever
 ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
 
 UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50 # Both use normal prompt/embedding
@@ -203,6 +192,8 @@ ENABLE_STUDENT_TOKEN_DROPOUT = False # Teachers the model to generally infer com
 STUDENT_TOKEN_DROPOUT_RATIO = 0.10
 
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True # No reason to dropout in this event
+
+TOKEN_ALIGNMENT_WINDOW = 5
 
 # ========== Dataset Class ==========
 class PreTokenizedDataset(Dataset):
