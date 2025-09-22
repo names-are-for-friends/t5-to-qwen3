@@ -61,14 +61,14 @@ Token loss compares tokens 1:1 (or with token alignment), sequence loss uses mea
 Token loss is most useful for strict prompt following, so I use it as the main loss condition
 Sequence loss seems to help as a secondary loss condition with aesthetic quality and some aspects of prompt following
 '''
-TOKEN_HUBER_LOSS = 0.50
-TOKEN_COSINE_LOSS = 0.20
-SEQUENCE_HUBER_LOSS = 0.20
-SEQUENCE_COSINE_LOSS = 0.10
+TOKEN_HUBER_LOSS = 0.70
+TOKEN_COSINE_LOSS = 0.30
+SEQUENCE_HUBER_LOSS = 0.00
+SEQUENCE_COSINE_LOSS = 0.00
 
-WARMUP_STEPS = 5 # Warmup steps occur prior and additional to the restart cycle steps
-RESTART_CYCLE_STEPS = 5 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
-ALIGNMENT_STEPS = 0 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
+WARMUP_STEPS = 500 # Warmup steps occur prior and additional to the restart cycle steps
+RESTART_CYCLE_STEPS = 1500 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
+ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
 
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
@@ -80,8 +80,8 @@ TRAIN_MODEL = True
 
 LOG_VRAM_USAGE = False
 
-AUTO_LAYER_INIT_TRAINING = True  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
-AUTO_LAYER_INIT_TRAINING_LR_SCALER = 3.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
+AUTO_LAYER_INIT_TRAINING = False  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
+AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
 '''
 Most of these are self explanatory. "auto" for input aligns to previous output dim, "auto" for output aligns to previous transformer dim
 Using file_num you can bolt on new layers anywhere in the chain
@@ -1763,6 +1763,12 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         if TRAIN_MODEL: model_optimizer.zero_grad()
                         if TRAIN_PROJECTION: projection_optimizer.zero_grad()
 
+                        # Reset gradients for projection layers
+                        if TRAIN_PROJECTION:
+                            for param in projection_parameters:
+                                if param.grad is not None:
+                                    param.grad = None
+
                         current_loss = loss.item()
                         if TOKEN_COSINE_LOSS <= 0 and TOKEN_HUBER_LOSS <= 0:
                             current_huber = 0
@@ -1830,6 +1836,12 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                             if AUTO_LAYER_INIT_TRAINING:
                                 projection_layers, layers_to_load = update_projection_layers(restart_cycle, layers_to_load)
                                 projection_parameters = get_projection_parameters(projection_layers, restart_cycle)
+
+                                # Reset gradients for new projection layers
+                                if TRAIN_PROJECTION:
+                                    for param in projection_parameters:
+                                        if param.grad is not None:
+                                            param.grad = None
 
                                 if TRAIN_PROJECTION:
                                     projection_optimizer.param_groups[0]['params'] = projection_parameters
