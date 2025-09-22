@@ -26,7 +26,7 @@ logging.basicConfig(
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
 QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/restart_9"
 
 USE_CACHED_EMBEDDINGS = True # 4MB per cached T5-xxl embedding, so be mindful of available capacity when using this. It's recommended though given the prohibitive size of the T5-xxl model
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2"
@@ -58,8 +58,7 @@ EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 '''
 Token loss compares tokens 1:1 (or with token alignment), sequence loss uses mean pooling
-Token loss is most useful for strict prompt following, so I use it as the main loss condition
-Sequence loss seems to help as a secondary loss condition with aesthetic quality and some aspects of prompt following
+Personally, I'd recommend sticking to token loss, at least initially
 '''
 TOKEN_HUBER_LOSS = 0.70
 TOKEN_COSINE_LOSS = 0.30
@@ -67,8 +66,8 @@ SEQUENCE_HUBER_LOSS = 0.00
 SEQUENCE_COSINE_LOSS = 0.00
 
 WARMUP_STEPS = 500 # Warmup steps occur prior and additional to the restart cycle steps
-RESTART_CYCLE_STEPS = 1500 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
-ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss, and isn't necessary, because sequence loss does not cause degradation in the way that 1:1 token loss does
+RESTART_CYCLE_STEPS = 1000 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
+ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss
 
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
@@ -80,8 +79,8 @@ TRAIN_MODEL = True
 
 LOG_VRAM_USAGE = False
 
-AUTO_LAYER_INIT_TRAINING = False  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
-AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
+AUTO_LAYER_INIT_TRAINING = True  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
+AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.2  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
 '''
 Most of these are self explanatory. "auto" for input aligns to previous output dim, "auto" for output aligns to previous transformer dim
 Using file_num you can bolt on new layers anywhere in the chain
@@ -982,16 +981,21 @@ def get_projection_layers(restart_cycle, layers_to_load):
 def update_projection_layers(restart_cycle, layers_to_load):
     if restart_cycle % 2 == 0:
         layers_to_load += 1
+
     len_offset = 0
     if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra'):
         len_offset = 1
+
+    # Condition for building non-extra layers: layers_to_load + len_offset > len(projection_layers)
     if layers_to_load + len_offset > len(projection_layers):
+        # Remove the extra layer if present
+        dropped_layer = None
         if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra') and projection_layers[-1].is_extra:
-            dropped_layer = projection_layers[-1]
-            projection_layers.pop(-1)
+            dropped_layer = projection_layers.pop(-1)
         else:
             dropped_layer = None
 
+        # Compute output_dim_prev from the existing projection_layers (without the extra layer)
         output_dim_prev = None
         if len(projection_layers) > 0:
             idx = len(projection_layers) - 1
@@ -1004,14 +1008,16 @@ def update_projection_layers(restart_cycle, layers_to_load):
         else:
             output_dim_prev = qwen_embedding_dim
 
+        # Build non-extra layers from the current non-extra count to layers_to_load
+        current_non_extra_count = len(projection_layers)
         file_num = None
         top_file_num = None
-        for i in range(len(projection_layers), layers_to_load + 1):
-            layer_config = PROJECTION_LAYERS_CONFIG[i-1]
+        for i in range(current_non_extra_count, layers_to_load):
+            layer_config = PROJECTION_LAYERS_CONFIG[i]
             layer_num = layer_config["file_num"]
             layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
 
-            if i == 1:
+            if i == 0:
                 input_dim = qwen_embedding_dim
             else:
                 input_dim = output_dim_prev
@@ -1100,23 +1106,80 @@ def update_projection_layers(restart_cycle, layers_to_load):
             projection_layers.append(projection_layer)
             projection_layer.to(device, dtype=torch.bfloat16)
 
-        if output_dim != 4096:
-            if dropped_layer is not None and dropped_layer.input_dim == output_dim:
-                print(f"Re-using previous final MLP layer due to matching dimension\n")
-                final_mlp = dropped_layer
+        # Set output_dim_prev to the last non-extra layer's output_dim
+        if len(projection_layers) > 0:
+            idx = len(projection_layers) - 1
+            while idx >= 0 and hasattr(projection_layers[idx], 'is_extra'):
+                idx -= 1
+            if idx >= 0:
+                output_dim_prev = projection_layers[idx].output_dim
             else:
-                print(f"Adding final MLP layer to match teacher dimension\n")
+                output_dim_prev = qwen_embedding_dim
+        else:
+            output_dim_prev = qwen_embedding_dim
+    else:
+        dropped_layer = None
+
+    # Compute output_dim_prev from the current projection_layers (whether we built new layers or not)
+    idx = len(projection_layers) - 1
+    while idx >= 0 and hasattr(projection_layers[idx], 'is_extra'):
+        idx -= 1
+    if idx >= 0:
+        output_dim_prev = projection_layers[idx].output_dim
+    else:
+        output_dim_prev = qwen_embedding_dim
+
+    # Add or update extra MLP layer if output_dim_prev is not 4096
+    if output_dim_prev != 4096:
+        if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra') and projection_layers[-1].is_extra:
+            current_extra_layer = projection_layers[-1]
+            if current_extra_layer.input_dim == output_dim_prev:
+                # Keep the existing extra layer
+                pass
+            else:
+                # Replace with a new extra layer if input_dim doesn't match
+                projection_layers.pop(-1)
                 final_mlp = MLPProjectionLayer(
-                    input_dim=output_dim,
+                    input_dim=output_dim_prev,
                     activation_dim=4096,
                     output_dim=4096
                 )
-                # Move new MLP to device and dtype
+                final_mlp.to(device, dtype=torch.bfloat16)
+                final_mlp.is_extra = True
+                final_mlp.input_dim = output_dim_prev
+                # Set file_num to max_file_num + 1
+                max_file_num = 0
+                for layer in projection_layers:
+                    if not hasattr(layer, 'is_extra') or not layer.is_extra:
+                        if hasattr(layer, 'file_num') and layer.file_num > max_file_num:
+                            max_file_num = layer.file_num
+                final_mlp.file_num = max_file_num + 1
+                projection_layers.append(final_mlp)
+        else:
+            # Add a new extra layer, reusing dropped_layer if possible
+            if dropped_layer is not None and dropped_layer.input_dim == output_dim_prev:
+                final_mlp = dropped_layer
+            else:
+                final_mlp = MLPProjectionLayer(
+                    input_dim=output_dim_prev,
+                    activation_dim=4096,
+                    output_dim=4096
+                )
                 final_mlp.to(device, dtype=torch.bfloat16)
             final_mlp.is_extra = True
-            final_mlp.input_dim = output_dim
-            final_mlp.file_num = top_file_num+1
+            final_mlp.input_dim = output_dim_prev
+            # Set file_num to max_file_num + 1
+            max_file_num = 0
+            for layer in projection_layers:
+                if not hasattr(layer, 'is_extra') or not layer.is_extra:
+                    if hasattr(layer, 'file_num') and layer.file_num > max_file_num:
+                        max_file_num = layer.file_num
+            final_mlp.file_num = max_file_num + 1
             projection_layers.append(final_mlp)
+    else:
+        # Remove extra layer if not needed
+        if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra') and projection_layers[-1].is_extra:
+            projection_layers.pop(-1)
 
     return projection_layers, layers_to_load
 
@@ -1903,7 +1966,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                 if restart_cycle > total_restarts:
                     break
                 else:
-                    pass
+                    continue
             print(f"Completed epoch {epoch + 1}/{EPOCHS} with {steps_completed_this_epoch} steps")
             next_epoch = epoch + 1
             if next_epoch % SAVE_EVERY_X_EPOCHS == 0:
