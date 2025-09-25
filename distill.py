@@ -46,8 +46,8 @@ EPOCHS = 1
 
 MAX_LEARNING_RATE_MODEL = 5e-5
 MIN_LEARNING_RATE_MODEL = 5e-6
-MAX_LEARNING_RATE_PROJECTION = 10e-5
-MIN_LEARNING_RATE_PROJECTION = 10e-6
+MAX_LEARNING_RATE_PROJECTION = 4e-4
+MIN_LEARNING_RATE_PROJECTION = 4e-5
 
 SAVE_EVERY_X_STEPS = 0
 SAVE_EVERY_X_RESTARTS = 1
@@ -60,14 +60,14 @@ SAVE_BEST_MODEL = True
 Token loss compares tokens 1:1 (or with token alignment), sequence loss uses mean pooling
 Personally, I'd recommend sticking to token loss, at least initially
 '''
-TOKEN_HUBER_LOSS = 0.70
-TOKEN_COSINE_LOSS = 0.30
-SEQUENCE_HUBER_LOSS = 0.00
-SEQUENCE_COSINE_LOSS = 0.00
+TOKEN_HUBER_LOSS = 0.50
+TOKEN_COSINE_LOSS = 0.20
+SEQUENCE_HUBER_LOSS = 0.20
+SEQUENCE_COSINE_LOSS = 0.10
 
 WARMUP_STEPS = 500 # Warmup steps occur prior and additional to the restart cycle steps
 RESTART_CYCLE_STEPS = 1000 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
-ALIGNMENT_STEPS = 200 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss
+ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss
 
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
@@ -80,7 +80,7 @@ TRAIN_MODEL = True
 LOG_VRAM_USAGE = False
 
 AUTO_LAYER_INIT_TRAINING = True  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
-AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
+AUTO_LAYER_INIT_TRAINING_LR_SCALER = 1.25  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
 '''
 Most of these are self explanatory. "auto" for input aligns to previous output dim, "auto" for output aligns to previous transformer dim
 If you output is not 4096, an MLP is added to the end. If using AUTO_LAYER_INIT_TRAINING, the MLP will be preserved through steps, with its linear input changed to match changed output dim
@@ -97,6 +97,50 @@ PROJECTION_LAYERS_CONFIG = [
         "omit_output_linear": False,
         "file_num": 1,
     },
+    {
+        "type": "transformer",
+        "input_dim": "auto",
+        "transformer_dim": 1024,
+        "output_dim": "auto",
+        "num_layers": 1,
+        "dim_feedforward": 2048,
+        "omit_output_mlp": False,
+        "omit_output_linear": False,
+        "file_num": 2,
+    },
+    {
+        "type": "transformer",
+        "input_dim": "auto",
+        "transformer_dim": 2048,
+        "output_dim": "auto",
+        "num_layers": 1,
+        "dim_feedforward": 4096,
+        "omit_output_mlp": False,
+        "omit_output_linear": False,
+        "file_num": 3,
+    },
+    {
+        "type": "transformer",
+        "input_dim": "auto",
+        "transformer_dim": 2048,
+        "output_dim": "auto",
+        "num_layers": 1,
+        "dim_feedforward": 4096,
+        "omit_output_mlp": False,
+        "omit_output_linear": False,
+        "file_num": 4,
+    },
+    {
+        "type": "transformer",
+        "input_dim": "auto",
+        "transformer_dim": 4096,
+        "output_dim": "auto",
+        "num_layers": 1,
+        "dim_feedforward": 8192,
+        "omit_output_mlp": False,
+        "omit_output_linear": False,
+        "file_num": 5,
+    },
 ]
 
 # ========== Advanced Configuration ==========
@@ -112,7 +156,7 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50 # Both use enhanced prompt/embedding
 ENABLE_STUDENT_WORD_DROPOUT = False # Probably token dropout is a better option
 STUDENT_WORD_DROPOUT_RATIO = 0.10
 
-ENABLE_STUDENT_TOKEN_DROPOUT = False # Teachers the model to generally infer complete sequence from incomplete sequence; also encourages over-projection
+ENABLE_STUDENT_TOKEN_DROPOUT = False # Teaches the model to generally infer complete sequence from incomplete sequence; also encourages over-projection
 STUDENT_TOKEN_DROPOUT_RATIO = 0.10
 
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True # No reason to dropout in this event
@@ -1056,7 +1100,7 @@ def update_projection_layers(restart_cycle, layers_to_load):
 
     # Add or update extra MLP layer if output_dim_prev is not 4096
     if output_dim_prev != 4096:
-        if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra') and projection_layers[-1].is_extra:
+        if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra'):
             current_extra_layer = projection_layers[-1]
             if current_extra_layer.linear_in.in_features == output_dim_prev:
                 # Keep the existing extra layer
@@ -1803,6 +1847,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         if global_step % cycle_length == 0 and global_step > 0:
                             if REPEAT_ALIGNMENT_AFTER_RESTART:
                                 loss_fn.reset_step()
+                                loss_fn_step = 0
                             if SAVE_EVERY_X_RESTARTS > 0 and restart_cycle % SAVE_EVERY_X_RESTARTS == 0:
                                 print(f"\nSaving checkpoint at restart {restart_cycle}\n")
                                 save_path = os.path.join(OUTPUT_DIR, f"restart_{restart_cycle}")
