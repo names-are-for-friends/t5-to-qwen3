@@ -26,7 +26,7 @@ logging.basicConfig(
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
 QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/restart_9"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/"
 
 USE_CACHED_EMBEDDINGS = True # 4MB per cached T5-xxl embedding, so be mindful of available capacity when using this. It's recommended though given the prohibitive size of the T5-xxl model
 CACHE_PATH = "/mnt/f/q5_xxs_training_script/cache2"
@@ -44,8 +44,8 @@ GRAD_CLIP = 5.0
 
 EPOCHS = 1
 
-MAX_LEARNING_RATE_MODEL = 1e-5
-MIN_LEARNING_RATE_MODEL = 1e-6
+MAX_LEARNING_RATE_MODEL = 5e-5
+MIN_LEARNING_RATE_MODEL = 5e-6
 MAX_LEARNING_RATE_PROJECTION = 10e-5
 MIN_LEARNING_RATE_PROJECTION = 10e-6
 
@@ -67,7 +67,7 @@ SEQUENCE_COSINE_LOSS = 0.00
 
 WARMUP_STEPS = 500 # Warmup steps occur prior and additional to the restart cycle steps
 RESTART_CYCLE_STEPS = 1000 # Set to 0 for a linear LR scheduler. Otherwise we use cosine with restarts
-ALIGNMENT_STEPS = 250 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss
+ALIGNMENT_STEPS = 200 # This is not additive to the step count, unlike the above two. I'd set it to half of your warmup steps, or something like that. This is necessary to prevent degradation and I recommend repeating it, and warmup, for every restart using the options below. I need to test more to see if other options would work better, but for now this seems to work well enough. Note: this setting does nothing with purely sequence loss
 
 REPEAT_WARMUP_AFTER_RESTART = True
 REPEAT_ALIGNMENT_AFTER_RESTART = True
@@ -80,19 +80,10 @@ TRAIN_MODEL = True
 LOG_VRAM_USAGE = False
 
 AUTO_LAYER_INIT_TRAINING = True  # If enabled, trains layer-by-layer, iterating over restarts in an entirely restart-based, epoch-agnostic training regime. This is recommended for initializing the layer array, because training multiple layers from scratch is unstable and will lead to bad results. Training will end when all layers have been trained together in a final restart cycle. Note that your settings for restart step, alignment steps, warmup steps are used here. Only run this once, and then disable for subsequent training of the now-initialized projection layers
-AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.2  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
+AUTO_LAYER_INIT_TRAINING_LR_SCALER = 2.0  # Scale the max LR for projection training higher for earlier layers when using automatic training, with linear degradation of the scaling rate towards 1.0 at the end of the run
 '''
 Most of these are self explanatory. "auto" for input aligns to previous output dim, "auto" for output aligns to previous transformer dim
-Using file_num you can bolt on new layers anywhere in the chain
-Using omit_output_mlp removes the activation and final linear from the transformer
-Using omit_output linear similarly just removes the final linear
-Transformer architecture is linear -> transformer_encoder -> linear -> activation -> linear
-Each layer starts with a linear, so when daisy-chaining we can omit the redundant linear or full MLP (the lin->act->lin sandwich)
-If the output of the final layer is not 4096, or omit_output_mlp is True for the final layer, an additional MLP is bolted on and trained, to make the output usable. This extra MLP will be removed whenever a new layer is to be added when using automatic training, unless its dimensions still match
-Oh, and if you omit the output MLP, output_dim will be overridden to "auto" behaviour ie. matching the transformer dim
-As well as transformer type, you can bolt on MLP or linear
-MLP takes input_dim, activation_dim, output_dim and omit_output_linear
-Linear takes input_dim and output_dim
+If you output is not 4096, an MLP is added to the end. If using AUTO_LAYER_INIT_TRAINING, the MLP will be preserved through steps, with its linear input changed to match changed output dim
 '''
 PROJECTION_LAYERS_CONFIG = [
     {
@@ -102,75 +93,9 @@ PROJECTION_LAYERS_CONFIG = [
         "output_dim": "auto",
         "num_layers": 1,
         "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 1,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 1024,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 2,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 1024,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 3,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 2048,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 4,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 2048,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 5,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 2048,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
-        "omit_output_mlp": True,
-        "omit_output_linear": True,
-        "file_num": 6,
-    },
-    {
-        "type": "transformer",
-        "input_dim": "auto",
-        "transformer_dim": 4096,
-        "output_dim": "auto",
-        "num_layers": 1,
-        "dim_feedforward": 2048,
         "omit_output_mlp": False,
         "omit_output_linear": False,
-        "file_num": 7,
+        "file_num": 1,
     },
 ]
 
@@ -1133,31 +1058,20 @@ def update_projection_layers(restart_cycle, layers_to_load):
     if output_dim_prev != 4096:
         if len(projection_layers) > 0 and hasattr(projection_layers[-1], 'is_extra') and projection_layers[-1].is_extra:
             current_extra_layer = projection_layers[-1]
-            if current_extra_layer.input_dim == output_dim_prev:
+            if current_extra_layer.linear_in.in_features == output_dim_prev:
                 # Keep the existing extra layer
                 pass
             else:
-                # Replace with a new extra layer if input_dim doesn't match
-                projection_layers.pop(-1)
-                final_mlp = MLPProjectionLayer(
-                    input_dim=output_dim_prev,
-                    activation_dim=4096,
-                    output_dim=4096
+                # Update only the input layer to match the new dimension
+                current_extra_layer.linear_in = torch.nn.Linear(
+                    output_dim_prev,
+                    current_extra_layer.linear_in.out_features
                 )
-                final_mlp.to(device, dtype=torch.bfloat16)
-                final_mlp.is_extra = True
-                final_mlp.input_dim = output_dim_prev
-                # Set file_num to max_file_num + 1
-                max_file_num = 0
-                for layer in projection_layers:
-                    if not hasattr(layer, 'is_extra') or not layer.is_extra:
-                        if hasattr(layer, 'file_num') and layer.file_num > max_file_num:
-                            max_file_num = layer.file_num
-                final_mlp.file_num = max_file_num + 1
-                projection_layers.append(final_mlp)
+                current_extra_layer.linear_in.to(device, dtype=torch.bfloat16)
+                current_extra_layer.input_dim = output_dim_prev
         else:
             # Add a new extra layer, reusing dropped_layer if possible
-            if dropped_layer is not None and dropped_layer.input_dim == output_dim_prev:
+            if dropped_layer is not None and dropped_layer.linear_in.in_features == output_dim_prev:
                 final_mlp = dropped_layer
             else:
                 final_mlp = MLPProjectionLayer(
@@ -1207,9 +1121,9 @@ def get_projection_parameters(projection_layers, restart_cycle):
                 if layer.file_num not in EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS]
 
 # ========== Optimiser Initialisation ==========
-def initialize_optimizer(max_lr, min_lr):
+def initialize_optimizer(parameters, max_lr, min_lr):
     optimizer = torch.optim.AdamW(
-        [p for p in student_model.parameters() if p.requires_grad],
+        parameters,
         lr=max_lr,
         betas=(0.9, 0.999),
         weight_decay=0.01,
@@ -1683,6 +1597,7 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
         global_step = 0
         accumulation_step = 0
         grad_norm = 0
+        loss_fn_step = 0
 
         try:
             with open(os.path.join(QWEN3_MODEL_NAME, "config.json"), "r") as f:
@@ -1715,10 +1630,11 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
             log_lines = []
 
         if TRAIN_MODEL:
-            model_optimizer, scheduler_model = initialize_optimizer(MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
+            model_parameters = [p for p in student_model.parameters() if p.requires_grad]
+            model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
 
         if TRAIN_PROJECTION:
-            projection_optimizer, scheduler_proj = initialize_optimizer(MAX_LEARNING_RATE_PROJECTION, MIN_LEARNING_RATE_PROJECTION)
+            projection_optimizer, scheduler_proj = initialize_optimizer(projection_parameters, MAX_LEARNING_RATE_PROJECTION, MIN_LEARNING_RATE_PROJECTION)
 
         # ========== Training Loop ==========
         student_model.train()
@@ -1820,6 +1736,8 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                         scaler.update()
 
                         global_step += 1
+                        loss_fn_step += 1
+                        loss_fn.update_global_step(loss_fn_step)
                         steps_completed_this_epoch += 1
 
                         accumulation_step = 0
@@ -1925,9 +1843,9 @@ with train_dataset as train_ds, eval_dataset as eval_ds:
                                 if not REPEAT_WARMUP_AFTER_RESTART:
                                     WARMUP_STEPS = 0
                                 if TRAIN_MODEL:
-                                    model_optimizer, scheduler_model = initialize_optimizer(MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
+                                    model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
                                 if TRAIN_PROJECTION:
-                                    projection_optimizer, scheduler_proj = initialize_optimizer(MAX_LEARNING_RATE_PROJECTION, MIN_LEARNING_RATE_PROJECTION)
+                                    projection_optimizer, scheduler_proj = initialize_optimizer(projection_parameters, MAX_LEARNING_RATE_PROJECTION, MIN_LEARNING_RATE_PROJECTION)
 
                         del student_outputs, student_hidden, projected_student, teacher_hidden
                         if 't_input_ids' in locals():
