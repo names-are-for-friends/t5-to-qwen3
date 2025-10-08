@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v11/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v12/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saigo/QT-embedder-v1/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saigo/QT-embedder-v2/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -55,10 +55,10 @@ MAX_LEARNING_RATE_MODEL = 5e-5
 MIN_LEARNING_RATE_MODEL = 5e-6
 MAX_LEARNING_RATE_TRANSFORMER = 10e-5
 MIN_LEARNING_RATE_TRANSFORMER = 10e-6
-MAX_LEARNING_RATE_MLP = 12e-5
-MIN_LEARNING_RATE_MLP = 12e-6
-MAX_LEARNING_RATE_LINEAR = 15e-5
-MIN_LEARNING_RATE_LINEAR = 15e-6
+MAX_LEARNING_RATE_MLP = 20e-5
+MIN_LEARNING_RATE_MLP = 20e-6
+MAX_LEARNING_RATE_LINEAR = 40e-5
+MIN_LEARNING_RATE_LINEAR = 40e-6
 MAX_LEARNING_RATE_INTERPOLATION = 10e-5
 MIN_LEARNING_RATE_INTERPOLATION = 10e-6
 
@@ -80,25 +80,26 @@ TOKEN_COSINE_WEIGHT = 0.15
 SEQUENCE_HUBER_WEIGHT = 0.35
 SEQUENCE_COSINE_WEIGHT = 0.15
 
-# Position targeting flags
+# Position targeting flags - use when training interpolation
 SEQUENCE_LOSS_ON_EXTENDED_ONLY = True
 TOKEN_LOSS_ON_STANDARD_ONLY = True
 
 # Scheduler
-WARMUP_STEPS = 500
-RESTART_CYCLE_STEPS = 1000
+WARMUP_STEPS = 500 # Set to 0 to disable
+RESTART_CYCLE_STEPS = 1000 # Set to 0 to use linear LR
 REPEAT_WARMUP_AFTER_RESTART = True
 
 # Dataset
 SHUFFLE_DATASET = False
+SKIP_DATASET_ENTRIES = 48000
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = False
+TRAIN_MODEL = True
 
 # Debugging
 LOG_VRAM_USAGE = False
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [1,2,3,4,5,6,7,8]
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 
 # Enhanced dataset
 ENHANCED_DATASET = True
@@ -119,10 +120,9 @@ TOKEN_ALIGNMENT_WINDOW = 5
 
 PROJECTION_LAYERS_CONFIG = [
     {
-        "type": "transformer",
+        "type": "interpolation",
         "input_dim": 1024,
-        "hidden_dim": 1024,
-        "dim_feedforward": 4096,
+        "output_dim": 1024,
         "file_num": 1,
     },
     {
@@ -136,56 +136,6 @@ PROJECTION_LAYERS_CONFIG = [
         "input_dim": 1024,
         "output_dim": 4096,
         "file_num": 3,
-    },
-    {
-        "type": "transformer",
-        "input_dim": 4096,
-        "hidden_dim": 1024,
-        "dim_feedforward": 4096,
-        "file_num": 4,
-    },
-    {
-        "type": "mlp",
-        "input_dim": 1024,
-        "hidden_dim": 1024,
-        "file_num": 5,
-    },
-    {
-        "type": "linear",
-        "input_dim": 1024,
-        "output_dim": 4096,
-        "file_num": 6,
-    },
-    {
-        "type": "transformer",
-        "input_dim": 4096,
-        "hidden_dim": 1024,
-        "dim_feedforward": 4096,
-        "file_num": 7,
-    },
-    {
-        "type": "mlp",
-        "input_dim": 1024,
-        "hidden_dim": 1024,
-        "file_num": 8,
-    },
-    {
-        "type": "interpolation",
-        "input_dim": 1024,
-        "teacher_dim": 4096,
-        "file_num": 9,
-    },
-    {
-        "type": "mlp",
-        "input_dim": 4096,
-        "hidden_dim": 4096,
-        "file_num": 10,
-    },
-    {
-        "type": "linear",
-        "input_dim": 4096,
-        "output_dim": 4096,
-        "file_num": 11,
     }
 ]
 
@@ -658,7 +608,7 @@ class PreTokenizedDataset(Dataset):
     def __init__(self, file_path: str, student_tokenizer, teacher_tokenizer,
                  max_length: int, teacher_model=None, is_eval: bool = False,
                  sample_rate: float = 0.1, use_cached_embeddings: bool = False,
-                 cache_path: Optional[str] = None):
+                 cache_path: Optional[str] = None, skip_entries: int = 0):
         self.max_length = max_length
         if USE_SEPARATE_EVALUATION_DATASET and is_eval:
             file_path = EVALUATION_DATASET_PATH
@@ -667,6 +617,13 @@ class PreTokenizedDataset(Dataset):
         with open(file_path, "r", encoding="utf-8") as f:
             self.lines = [line.strip() for line in f.readlines() if line.strip()]
 
+        if skip_entries > 0 and not is_eval:
+            if skip_entries >= len(self.lines):
+                print(f"Warning: skip_entries ({skip_entries}) is >= dataset length ({len(self.lines)}). Skipping all but last entry.")
+                skip_entries = len(self.lines) - 1
+            self.lines = self.lines[skip_entries:]
+            print(f"Skipped {skip_entries} entries from dataset. Remaining entries: {len(self.lines)}")
+
         if is_eval and sample_rate is not None:
             self.lines = random.sample(self.lines, min(int(len(self.lines) * sample_rate), len(self.lines)))
 
@@ -674,6 +631,14 @@ class PreTokenizedDataset(Dataset):
         if ENHANCED_DATASET:
             with open(ENHANCED_DATASET_PATH, "r", encoding="utf-8") as f:
                 self.enhanced_lines = [line.strip() for line in f.readlines() if line.strip()]
+
+            if skip_entries > 0 and not is_eval:
+                if skip_entries >= len(self.enhanced_lines):
+                    print(f"Warning: skip_entries ({skip_entries}) is >= enhanced dataset length ({len(self.enhanced_lines)}). Skipping all but last entry.")
+                    skip_entries = len(self.enhanced_lines) - 1
+                self.enhanced_lines = self.enhanced_lines[skip_entries:]
+                print(f"Skipped {skip_entries} entries from enhanced dataset. Remaining enhanced entries: {len(self.enhanced_lines)}")
+
             if len(self.enhanced_lines) < len(self.lines):
                 self.enhanced_lines += self.lines[len(self.enhanced_lines):]
             elif len(self.enhanced_lines) > len(self.lines):
@@ -1017,7 +982,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
             projection_layer.output_dim = output_dim
 
         elif layer_config["type"] == "interpolation":
-            output_dim = layer_config["teacher_dim"]
+            output_dim = layer_config["output_dim"]
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
                 projection_layer = LearnedInterpolationLayer(
@@ -1555,7 +1520,8 @@ def main():
         is_eval=False,
         sample_rate=None,
         use_cached_embeddings=USE_CACHED_EMBEDDINGS,
-        cache_path=CACHE_PATH
+        cache_path=CACHE_PATH,
+        skip_entries=SKIP_DATASET_ENTRIES
     )
 
     eval_dataset = PreTokenizedDataset(
@@ -1567,7 +1533,8 @@ def main():
         is_eval=True,
         sample_rate=None,
         use_cached_embeddings=USE_CACHED_EMBEDDINGS,
-        cache_path=CACHE_PATH
+        cache_path=CACHE_PATH,
+        skip_entries=0
     )
 
     if USE_CACHED_EMBEDDINGS and teacher_model is not None:
