@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v12/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saigo/QT-embedder-v1/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
 T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
-USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
+USE_T5_MASK_WITH_QWEN = False # It's recommended to use the T5 mask with our trained model, so leave this on
 QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0
 
 # === Configuration Dataclasses ===
@@ -1419,7 +1419,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
         elif layer_config["type"] == "interpolation":
             layer = LearnedInterpolationLayer(
                 layer_config["input_dim"],
-                layer_config["teacher_dim"]
+                layer_config["output_dim"]
             )
 
         file_num = layer_config["file_num"]
