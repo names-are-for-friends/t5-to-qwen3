@@ -6,9 +6,9 @@
 
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
-Work-in-progress. Current approach: use token alignment (matching tokens in a sequential window by text content) and per-token losses for 500~1000 steps (64 batch size, adjust accordingly), then use 1:1 positional per-token alignment once the 1:1 projected-student-to-teacher-output relationship is patterned enough (token alignment won't work once the transformer shifts the embedding sequence out of alignment with the token sequence, after all). Results so far (5000 steps in) are promising, with prompt comprehension reliably increasing and clear text present in the output. Initial outputs will have some noise, but by 5000 steps noise seems to be gone, so we seem to have defeated the complete collapse that previously happened with solely 1:1 alignment.
+Several training approaches are supported. Using token alignment (via the input text per token) for the loss calculation, we can fit the T5-xxl token's semantic meaning to the Qwen tokens in the (typically shorter) Qwen sequence; this approach fits closer to the target than using mean pooling loss, but is not perfect. We can also interpolate the sequence length to match the T5-xxl embedding, using a combination of positional token loss for the Qwen-mask-attended sequence and mean pooling loss for the solely T5-mask-attended extended space.
 
-Update: on further testing, the output seems to collapse when training for a while - the warning sign for this is rising loss, I notice our huber loss floor went from below 2000 to over 3000. Running the token alignment should bring it back down again. I don't know if somehow the expanded area of the projected Qwen3 output becomes too noisy and requires some cleaning up via the less noisy student-mask-attended area. The actual semantic content of the embedding is sequentially shifted though, so only run this for ~100 steps (at 64 batch size) or loss will rise back up. I'll probably try testing different methods, like periodic cleaning or switching to token alignment for every n number of steps, to make the process more simple.
+The script allows you to specify which layers to bolt on to the model. A simple configuration would be to use a Transformer->MLP->Linear chain that takes the 1024 embedding dim and outputs to 4096, which you would train using alignment loss. Layer types other than "linear" are bundled with an input linear layer, so this type is mainly for output. For expansion of the sequence, use the "interpolation" type with both token and sequence losses and their associated flags enabled to limit visibility to the appropriate tokens.
 
 ### Quick installation
 ---
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 ```
 Currently, the script is only tested on Linux, so I don't know if there are any incompatibilities with Windows.
 
-Provided default settings will run on 24GB VRAM with cached T5-xxl embeddings and the 0.6B Qwen3 model. If you have 16GB of VRAM, try reducing the batch size to 32, and for 12GB, a batch size of 16 should work.
+Provided default settings will run on 24GB VRAM with cached T5-xxl embeddings and the 0.6B Qwen3 model. 16GB should work, possibly with adjusted batch_size. Maybe 12GB too.
 
 You're recommended to use a 3.11 Python venv, as that's what I've been using. 
 
