@@ -6,7 +6,7 @@ from torch.nn import Module, Embedding
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, T5EncoderModel, T5TokenizerFast, AutoModel
-from typing import Callable, List, Tuple
+from typing import Callable, List, Tuple, Optional
 from dataclasses import dataclass
 import requests
 from PIL import Image
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/kibou/QT-embedder-initialize/initialized_model/"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v12/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -948,37 +948,32 @@ class AutoEncoder(nn.Module):
 
 # ========== Projection Layers ==========
 class LinearProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.linear = torch.nn.Linear(input_dim, output_dim)
         self.output_dim = output_dim
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
 class MLPProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, activation_dim, output_dim, omit_output_linear=False):
+    def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
-        self.linear_in = torch.nn.Linear(input_dim, activation_dim)
+        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         self.activation = torch.nn.GELU()
-        if omit_output_linear:
-            self.linear_out = None
-        else:
-            self.linear_out = torch.nn.Linear(activation_dim, output_dim)
+        self.output_dim = hidden_dim
 
-    def forward(self, x):
-        x = self.linear_in(x)
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self.linear(x)
         x = self.activation(x)
-        if self.linear_out is not None:
-            x = self.linear_out(x)
         return x
 
 class TransformerProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim, transformer_dim, output_dim, num_layers, dim_feedforward, omit_output_mlp=False, omit_output_linear=False):
+    def __init__(self, input_dim: int, hidden_dim: int, dim_feedforward: int, num_layers: int = 1):
         super().__init__()
-        self.linear_in = torch.nn.Linear(input_dim, transformer_dim)
+        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         transformer_layer = torch.nn.TransformerEncoderLayer(
-            d_model=transformer_dim,
+            d_model=hidden_dim,
             nhead=8,
             dim_feedforward=dim_feedforward,
             dropout=0.0,
@@ -986,145 +981,155 @@ class TransformerProjectionLayer(torch.nn.Module):
             batch_first=True
         )
         self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        if omit_output_mlp:
-            self.linear = None
-        else:
-            self.linear = torch.nn.Linear(transformer_dim, output_dim)
-            self.activation = torch.nn.GELU()
-            if omit_output_linear:
-                self.linear_out = None
-            else:
-                self.linear_out = torch.nn.Linear(output_dim, output_dim)
+        self.output_dim = hidden_dim
 
-    def forward(self, x):
-        x = self.linear_in(x)
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self.linear(x)
         x = self.transformer(x)
-        if self.linear is not None:
-            x = self.linear(x)
-            x = self.activation(x)
-            if self.linear_out is not None:
-                x = self.linear_out(x)
         return x
 
-# ========== Projection Function ==========
-def get_projection_layers(restart_cycle, layers_to_load):
-    projection_layers = []
-    layers_to_load = len(PROJECTION_LAYERS_CONFIG)
+class LearnedInterpolationLayer(torch.nn.Module):
+    """Learned interpolation layer for stretching sequences using position-aware upsampling"""
+    def __init__(self, input_dim: int, teacher_dim: int, max_length: int = 512):
+        super().__init__()
+        self.input_dim = input_dim
+        self.teacher_dim = teacher_dim
+        self.max_length = max_length
 
-    output_dim_prev = None
-    for i in range(1, layers_to_load + 1):
-        layer_config = PROJECTION_LAYERS_CONFIG[i-1]
-        layer_num = layer_config["file_num"]
-        layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
+        # Position encodings for both sequences
+        self.student_pos_encoder = torch.nn.Embedding(max_length, input_dim)
+        self.teacher_pos_encoder = torch.nn.Embedding(max_length, teacher_dim)
 
-        # Determine input dim
-        if i == 1:
-            input_dim = qwen_embedding_dim
-        else:
-            input_dim = output_dim_prev
-
-        # Override if specified in config
-        if layer_config.get("input_dim", "auto") != "auto":
-            input_dim = layer_config["input_dim"]
-
-        # Handle output_dim="auto"
-        if layer_config.get("output_dim", "auto") == "auto" or layer_config["omit_output_mlp"]:
-            if layer_config["type"] == "mlp":
-                output_dim = layer_config["activation_dim"]
-            elif layer_config["type"] == "transformer":
-                output_dim = layer_config["transformer_dim"]
-            else:
-                if "output_dim" not in layer_config or layer_config["output_dim"] == "auto":
-                    raise ValueError("Linear layer must specify output_dim")
-                output_dim = layer_config["output_dim"]
-        else:
-            output_dim = layer_config["output_dim"]
-
-        output_dim_prev = output_dim
-
-        if file_num is not None:
-            if layer_config["file_num"] > file_num:
-                top_file_num = layer_config["file_num"]
-        else:
-            top_file_num = layer_config["file_num"]
-        file_num = layer_config["file_num"]
-
-        # Load or initialize layer based on type
-        if layer_config["type"] == "linear":
-            if os.path.exists(layer_path):
-                state_dict = load_file(layer_path)
-                projection_layer = LinearProjectionLayer(
-                    input_dim=input_dim,
-                    output_dim=output_dim
-                )
-                projection_layer.load_state_dict(state_dict)
-            else:
-                projection_layer = LinearProjectionLayer(
-                    input_dim=input_dim,
-                    output_dim=output_dim
-                )
-        elif layer_config["type"] == "mlp":
-            activation_dim = layer_config["activation_dim"]
-            if os.path.exists(layer_path):
-                state_dict = load_file(layer_path)
-                projection_layer = MLPProjectionLayer(
-                    input_dim=input_dim,
-                    activation_dim=activation_dim,
-                    output_dim=output_dim,
-                    omit_output_linear=layer_config.get("omit_output_linear", False)
-                )
-                projection_layer.load_state_dict(state_dict)
-            else:
-                projection_layer = MLPProjectionLayer(
-                    input_dim=input_dim,
-                    activation_dim=activation_dim,
-                    output_dim=output_dim,
-                    omit_output_linear=layer_config.get("omit_output_linear", False)
-                )
-        elif layer_config["type"] == "transformer":
-            transformer_dim = layer_config["transformer_dim"]
-            num_layers = layer_config["num_layers"]
-            dim_feedforward = layer_config["dim_feedforward"]
-            if os.path.exists(layer_path):
-                state_dict = load_file(layer_path)
-                projection_layer = TransformerProjectionLayer(
-                    input_dim=input_dim,
-                    transformer_dim=transformer_dim,
-                    output_dim=output_dim,
-                    num_layers=num_layers,
-                    dim_feedforward=dim_feedforward,
-                    omit_output_mlp=layer_config.get("omit_output_mlp", False),
-                    omit_output_linear=layer_config.get("omit_output_linear", False)
-                )
-                projection_layer.load_state_dict(state_dict)
-            else:
-                projection_layer = TransformerProjectionLayer(
-                    input_dim=input_dim,
-                    transformer_dim=transformer_dim,
-                    output_dim=output_dim,
-                    num_layers=num_layers,
-                    dim_feedforward=dim_feedforward,
-                    omit_output_mlp=layer_config.get("omit_output_mlp", False),
-                    omit_output_linear=layer_config.get("omit_output_linear", False)
-                )
-        projection_layer.file_num = layer_config["file_num"]
-        projection_layer.output_dim = output_dim
-        projection_layers.append(projection_layer)
-
-    # Add final linear layer if output dim is not 4096
-    if output_dim != 4096:
-        print("Adding final MLP layer to match teacher dimension")
-        final_mlp = MLPProjectionLayer(
-            input_dim=output_dim,
-            activation_dim=4096,
-            output_dim=4096
+        # Learnable interpolation network using 1D convolution for upsampling
+        self.upsample_conv = torch.nn.Conv1d(
+            in_channels=input_dim,
+            out_channels=teacher_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1
         )
-        final_mlp.is_extra = True
-        final_mlp.input_dim = output_dim
-        final_mlp.file_num = top_file_num+1
-        projection_layers.append(final_mlp)
 
-    return projection_layers, layers_to_load
+        # Learnable interpolation weights
+        self.weight_predictor = torch.nn.Sequential(
+            torch.nn.Linear(teacher_dim * 3, 512),  # student emb + 2 position embeddings
+            torch.nn.GELU(),
+            torch.nn.Linear(512, 3),  # weights for 3 points
+            torch.nn.Softmax(dim=-1)
+        )
+
+        # Refinement layers
+        self.refine = torch.nn.Sequential(
+            torch.nn.Linear(teacher_dim, teacher_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(teacher_dim, teacher_dim)
+        )
+
+        # Output projection
+        self.output_proj = torch.nn.Linear(teacher_dim, teacher_dim)
+        self.layer_norm = torch.nn.LayerNorm(teacher_dim)
+        self.output_dim = teacher_dim
+        self.layer_type = "interpolation"
+
+        # Add projection layer for dimension mismatch
+        if self.input_dim != self.teacher_dim:
+            self.input_to_teacher_proj = torch.nn.Linear(self.input_dim, self.teacher_dim)
+        else:
+            self.input_to_teacher_proj = None
+
+    def forward(self, student_emb, s_mask, t_mask, target_length=512):
+        batch_size, s_len, _ = student_emb.shape
+        t_len = t_mask.sum(dim=1).max()
+
+        # Get actual sequence lengths
+        s_lens = s_mask.sum(dim=1)  # [B]
+        t_lens = t_mask.sum(dim=1)  # [B]
+
+        # Avoid division by zero and ensure at least one token
+        s_lens = s_lens.clamp(min=1)
+        t_lens = t_lens.clamp(min=1)
+
+        # Create position indices for the entire batch (using max lengths)
+        s_pos = torch.arange(s_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)  # [B, s_len]
+        t_pos = torch.arange(t_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)   # [B, t_len]
+
+        # Normalize positions to [0, 1] per batch
+        s_pos_norm = s_pos.float() / (s_lens.unsqueeze(1) - 1)  # [B, s_len]
+        t_pos_norm = t_pos.float() / (t_lens.unsqueeze(1) - 1)  # [B, t_len]
+
+        # Get position encodings
+        s_pos_emb = self.student_pos_encoder(s_pos)  # [B, s_len, input_dim]
+        t_pos_emb = self.teacher_pos_encoder(t_pos)  # [B, t_len, teacher_dim]
+
+        # Add position info to student embeddings
+        student_with_pos = student_emb + s_pos_emb
+
+        # Apply 1D convolution for initial upsampling (helps with local patterns)
+        student_conv = student_with_pos.transpose(1, 2)  # [B, input_dim, s_len]
+        upsampled = self.upsample_conv(student_conv)  # [B, teacher_dim, s_len]
+        upsampled = upsampled.transpose(1, 2)  # [B, s_len, teacher_dim]
+
+        # Project to teacher dimension if needed (using pre-initialized layer)
+        if self.input_to_teacher_proj is not None:
+            student_with_pos = self.input_to_teacher_proj(student_with_pos)
+
+        # For each teacher position, find 3 neighboring student positions for smooth interpolation
+        t_pos_scaled = t_pos_norm * (s_lens.unsqueeze(1) - 1)  # [B, t_len] - positions in student scale
+        t_pos_scaled = t_pos_scaled.long()  # [B, t_len]
+
+        # Calculate max valid index per batch (ensure non-negative)
+        max_index = (s_lens - 1).clamp(min=0)  # [B]
+
+        # Use tensors for min and max in clamp
+        min_val = torch.tensor(0, device=student_emb.device, dtype=torch.long)
+
+        # Get 3 neighboring indices (prev, current, next) with proper per-batch clamping
+        idx_prev = torch.clamp(t_pos_scaled - 1, min=min_val, max=max_index.unsqueeze(1))
+        idx_curr = torch.clamp(t_pos_scaled, min=min_val, max=max_index.unsqueeze(1))
+        idx_next = torch.clamp(t_pos_scaled + 1, min=min_val, max=max_index.unsqueeze(1))
+
+        # Gather embeddings at these indices
+        student_emb_prev = student_with_pos.gather(1, idx_prev.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
+        student_emb_curr = student_with_pos.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
+        student_emb_next = student_with_pos.gather(1, idx_next.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
+
+        # Get corresponding upsampled embeddings
+        upsampled_curr = upsampled.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
+
+        # Use learned weights to combine the 3 points
+        weight_input = torch.cat([student_emb_prev, student_emb_curr, student_emb_next], dim=-1)
+        weights = self.weight_predictor(weight_input)  # [B, t_len, 3]
+
+        # Interpolate
+        interpolated = (
+            weights[:, :, 0:1] * student_emb_prev +
+            weights[:, :, 1:2] * student_emb_curr +
+            weights[:, :, 2:3] * student_emb_next
+        )
+
+        # Blend with convolutional upsampling for better pattern preservation
+        blend_factor = 0.7  # Can be made learnable
+        interpolated = blend_factor * interpolated + (1 - blend_factor) * upsampled_curr
+
+        # Refine the interpolated sequence
+        interpolated = self.refine(interpolated)
+        interpolated = self.layer_norm(interpolated)
+
+        # Add teacher position encoding
+        interpolated = interpolated + t_pos_emb
+
+        # Final projection
+        output = self.output_proj(interpolated)
+
+        # Apply mask
+        output_mask = t_mask[:, :t_len].unsqueeze(-1)
+        output = output * output_mask
+
+        # Pad to target length if needed
+        if output.shape[1] < target_length:
+            padding = (0, 0, 0, target_length - output.shape[1])
+            output = F.pad(output, padding, 'constant', 0)
+
+        return output
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1392,57 +1397,39 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
     with open(projection_config_path, "r") as file:
         projection_config = json.load(file)
 
-    # Build projection module
-    projection_module = nn.Sequential()
-    current_input_dim = qwen_embedding_dim
+    projection_layers = []
 
     for layer_config in projection_config["layers"]:
-        # Resolve auto dimensions
-        if layer_config["input_dim"] == "auto":
-            layer_config["input_dim"] = current_input_dim
-        output_dim = layer_config.get("output_dim")
-
-        if output_dim == "auto":
-            if layer_config["type"] == "linear":
-                layer_config["output_dim"] = layer_config["input_dim"]
-            elif layer_config["type"] == "mlp":
-                layer_config["output_dim"] = layer_config["activation_dim"]
-            elif layer_config["type"] == "transformer":
-                layer_config["output_dim"] = layer_config["transformer_dim"]
-
-        # Create layer based on type
         if layer_config["type"] == "linear":
             layer = LinearProjectionLayer(
                 layer_config["input_dim"],
-                layer_config["output_dim"]
+                layer_config["output_dim"],
             )
         elif layer_config["type"] == "mlp":
             layer = MLPProjectionLayer(
                 layer_config["input_dim"],
-                layer_config["activation_dim"],
-                layer_config["output_dim"],
-                layer_config.get("omit_output_linear", False)
+                layer_config["hidden_dim"],
             )
         elif layer_config["type"] == "transformer":
             layer = TransformerProjectionLayer(
                 layer_config["input_dim"],
-                layer_config["transformer_dim"],
-                layer_config["output_dim"],
-                layer_config["num_layers"],
+                layer_config["hidden_dim"],
                 layer_config["dim_feedforward"],
-                layer_config.get("omit_output_linear", False),
-                layer_config.get("omit_output_mlp", False)
+            )
+        elif layer_config["type"] == "interpolation":
+            layer = LearnedInterpolationLayer(
+                layer_config["input_dim"],
+                layer_config["teacher_dim"]
             )
 
-        # Load weights if available
         file_num = layer_config["file_num"]
         layer_path = os.path.join(qwen3_folder, f"projection_layer_{file_num}.safetensors")
         if os.path.exists(layer_path):
             state_dict = load_file(layer_path)
             layer.load_state_dict(state_dict)
 
-        projection_module.append(layer)
-        current_input_dim = layer_config["output_dim"]
+        layer.to(device, dtype=torch.bfloat16).eval()
+        projection_layers.append(layer)
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
@@ -1454,10 +1441,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
     ).to(device)
     model.eval()
 
-    projection_module.to(model.device, dtype=torch.bfloat16)
-    projection_module.eval()
-
-    return model, projection_module, tokenizer
+    return model, projection_layers, tokenizer
 
 def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
     logger.info(f"Loading T5 model from {t5_folder}")
@@ -1468,6 +1452,13 @@ def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
         logger.error(f"Model file not found in {t5_folder}. Expected file: model.safetensors")
         raise FileNotFoundError(f"Model file not found in {t5_folder}. Expected file: model.safetensors")
 
+    # Use flash attention for speed if available
+    model = T5EncoderModel.from_pretrained(t5_folder).to(device)
+    model.eval()
+
+    return model
+
+def load_t5_tokenizer(t5_folder: str) -> Tuple[Module, Module]:
     # Look for the tokenizer file
     tokenizer_file = os.path.join(t5_folder, "tokenizer.json")
     if not os.path.exists(tokenizer_file):
@@ -1477,11 +1468,7 @@ def load_t5_model(t5_folder: str) -> Tuple[Module, Module]:
     # Load tokenizer
     tokenizer = T5TokenizerFast.from_pretrained(t5_folder)
 
-    # Use flash attention for speed if available
-    model = T5EncoderModel.from_pretrained(t5_folder).to(device)
-    model.eval()
-
-    return model, tokenizer
+    return tokenizer
 
 # === Image Saving ===
 def save_images(images: torch.Tensor, filename: str, format: str = 'png', quality: int = 95):
@@ -1526,28 +1513,35 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
 
     # Choose text embedder based on flag
+    logger.info("Using T5-xxl for text embeddings")
+
+    tokenizer = load_t5_tokenizer(args.t5_folder)
+
     if use_t5:
-        logger.info("Using T5-xxl for text embeddings")
-        # Load T5 model and tokenizer
-        t5_model, tokenizer = load_t5_model(args.t5_folder)
+        if not args.positive_prompt.strip():
+            args.positive_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
+        if not args.negative_prompt.strip():
+            args.negative_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
 
-        # Tokenize and create embeddings
-        text_inputs = tokenizer(
-            [args.positive_prompt],
-            padding="max_length",
-            max_length=args.max_length,
-            truncation=True,
-            return_tensors="pt"
-        ).to(t5_model.device)
+    # Tokenize and create embeddings
+    text_inputs = tokenizer(
+        [args.positive_prompt],
+        padding="max_length",
+        max_length=args.max_length,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
 
-        text_inputs_neg = tokenizer(
-            [args.negative_prompt],
-            padding="max_length",
-            max_length=args.max_length,
-            truncation=True,
-            return_tensors="pt"
-        ).to(t5_model.device)
+    text_inputs_neg = tokenizer(
+        [args.negative_prompt],
+        padding="max_length",
+        max_length=args.max_length,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
 
+    if use_t5:
+        t5_model = load_t5_model(args.t5_folder)
         attention_mask = text_inputs["attention_mask"].to(device).to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
@@ -1566,9 +1560,16 @@ if __name__ == "__main__":
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
 
     else:
+        t5_attention_mask = text_inputs["attention_mask"].to(device).to(device)
+        t5_attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
         logger.info("Using Qwen3 for text embeddings")
         # Load Qwen3 model and projection to CUDA first
-        qwen3_model, projection_module, tokenizer = load_qwen3_model(args.qwen3_folder)
+        qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder)
+
+        if not args.positive_prompt.strip():
+            args.positive_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
+        if not args.negative_prompt.strip():
+            args.negative_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
 
         # Tokenize and create embeddings
         text_inputs = tokenizer(
@@ -1600,9 +1601,6 @@ if __name__ == "__main__":
             )
             embed = output.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        # Pass through all projection layers
-        embed = projection_module(embed).to(qwen3_model.device)
-
         with torch.no_grad():
             output_neg = qwen3_model(
                 input_ids=text_inputs_neg["input_ids"],
@@ -1611,42 +1609,38 @@ if __name__ == "__main__":
             )
             embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        embed_neg = projection_module(embed_neg).to(qwen3_model.device)
+        for layer in projection_layers:
+            if isinstance(layer, (LearnedInterpolationLayer)):
+                embed = layer(
+                    embed,
+                    s_mask=attention_mask,
+                    t_mask=t5_attention_mask,
+                    target_length=512
+                )
+                embed_neg = layer(
+                    embed_neg,
+                    s_mask=attention_mask_neg,
+                    t_mask=t5_attention_mask_neg,
+                    target_length=512
+                )
+            else:
+                embed = layer(embed)
+                embed_neg = layer(embed_neg)
 
         if USE_T5_MASK_WITH_QWEN:
-
-            tokenizer_t5 = T5TokenizerFast.from_pretrained(DEFAULT_T5_FOLDER)
-            text_inputs_t5 = tokenizer_t5(
-                [args.positive_prompt],
-                padding="max_length",
-                max_length=args.max_length,
-                truncation=True,
-                return_tensors="pt",
-                return_offsets_mapping=True
-            ).to(device)
-            text_inputs_neg_t5 = tokenizer_t5(
-                [args.negative_prompt],
-                padding="max_length",
-                max_length=args.max_length,
-                truncation=True,
-                return_tensors="pt",
-                return_offsets_mapping=True
-            ).to(device)
-            attention_mask = text_inputs_t5["attention_mask"].to(device)
-            attention_mask_neg = text_inputs_neg_t5["attention_mask"].to(device)
+            attention_mask = t5_attention_mask
+            attention_mask_neg = t5_attention_mask_neg
 
             use_t5 = True
 
             T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
-
-        del text_inputs_t5, text_inputs_neg_t5, tokenizer_t5, text_inputs, text_inputs_neg, tokenizer
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
 
     # Clear text models from CUDA memory
     if 'qwen3_model' in locals():
-        del qwen3_model, projection_module
+        del qwen3_model, projection_layers
     else:
         del model
     torch.cuda.empty_cache()
