@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saigo/QT-embedder-v1/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v32/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
 T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
-USE_T5_MASK_WITH_QWEN = False # It's recommended to use the T5 mask with our trained model, so leave this on
+USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
 QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0
 
 # === Configuration Dataclasses ===
@@ -1036,6 +1036,24 @@ class LearnedInterpolationLayer(torch.nn.Module):
         else:
             self.input_to_teacher_proj = None
 
+        # Add layer normalization at the end
+        self.final_norm = torch.nn.LayerNorm(teacher_dim)
+
+        # Initialize weights properly
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights to prevent collapse"""
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Conv1d):
+                torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, torch.nn.Embedding):
+                torch.nn.init.normal_(m.weight, mean=0, std=0.02)
+
     def forward(self, student_emb, s_mask, t_mask, target_length=512):
         batch_size, s_len, _ = student_emb.shape
         t_len = t_mask.sum(dim=1).max()
@@ -1128,6 +1146,8 @@ class LearnedInterpolationLayer(torch.nn.Module):
         if output.shape[1] < target_length:
             padding = (0, 0, 0, target_length - output.shape[1])
             output = F.pad(output, padding, 'constant', 0)
+
+        output = self.final_norm(output)
 
         return output
 
