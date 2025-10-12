@@ -6,9 +6,7 @@
 
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
-Several training approaches are supported. Using token alignment (via the input text per token) for the loss calculation, we can fit the T5-xxl token's semantic meaning to the Qwen tokens in the (typically shorter) Qwen sequence; this approach fits closer to the target than using mean pooling loss, but is not perfect. We can also interpolate the sequence length to match the T5-xxl embedding, using a combination of positional token loss for the Qwen-mask-attended sequence and mean pooling loss for the solely T5-mask-attended extended space.
-
-The script allows you to specify which layers to bolt on to the model. A simple configuration would be to use a Transformer->MLP->Linear chain that takes the 1024 embedding dim and outputs to 4096, which you would train using alignment loss. Layer types other than "linear" are bundled with an input linear layer, so this type is mainly for output. For expansion of the sequence, use the "interpolation" type with both token and sequence losses and their associated flags enabled to limit visibility to the appropriate tokens.
+Work-in-progress so don't expect everything to work at the moment. I'm working on getting sequence interpolation to work atm.
 
 ### Quick installation
 ---
