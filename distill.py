@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/futotta/QT-embedder-v1"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/futotta/QT-embedder-v3/restart_1/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/futotta/QT-embedder-v5"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -51,14 +51,14 @@ GRAD_CLIP = 5.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 7e-5
-MIN_LEARNING_RATE_MODEL = 7e-6
-MAX_LEARNING_RATE_TRANSFORMER = 15e-5
-MIN_LEARNING_RATE_TRANSFORMER = 15e-6
-MAX_LEARNING_RATE_MLP = 20e-5
-MIN_LEARNING_RATE_MLP = 20e-6
-MAX_LEARNING_RATE_LINEAR = 30e-5
-MIN_LEARNING_RATE_LINEAR = 30e-6
+MAX_LEARNING_RATE_MODEL = 5e-5
+MIN_LEARNING_RATE_MODEL = 5e-6
+MAX_LEARNING_RATE_TRANSFORMER = 8e-5
+MIN_LEARNING_RATE_TRANSFORMER = 8e-6
+MAX_LEARNING_RATE_MLP = 12e-5
+MIN_LEARNING_RATE_MLP = 12e-6
+MAX_LEARNING_RATE_LINEAR = 15e-5
+MIN_LEARNING_RATE_LINEAR = 15e-6
 MAX_LEARNING_RATE_INTERPOLATION = 10e-5
 MIN_LEARNING_RATE_INTERPOLATION = 10e-6
 
@@ -83,8 +83,8 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Scheduler
-WARMUP_STEPS = 500
-RESTART_CYCLE_STEPS = 1000
+WARMUP_STEPS = 0
+RESTART_CYCLE_STEPS = 500
 REPEAT_WARMUP_AFTER_RESTART = False
 
 # Dataset
@@ -95,7 +95,7 @@ REUSE_OPTIMIZER_STATE = True
 SAVE_OPTIMIZER_STATES = True
 
 # Debugging
-LOG_VRAM_USAGE = False
+LOG_VRAM_USAGE = True
 
 # Enhanced dataset
 ENHANCED_DATASET = True
@@ -112,7 +112,7 @@ STUDENT_TOKEN_DROPOUT_RATIO = 0.10
 SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 # Alignment
-ALIGNMENT_WINDOW = 5
+ALIGNMENT_WINDOW = 4
 
 # Training flags
 TRAIN_PROJECTION = True
@@ -123,7 +123,7 @@ EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
-        "input_dim": 4096,
+        "input_dim": 1024,
         "hidden_dim": 4096,
         "dim_feedforward": 16384,
         "file_num": 1,
@@ -186,73 +186,6 @@ class TransformerProjectionLayer(torch.nn.Module):
         x = self.linear(x)
         x = self.transformer(x)
         return x
-
-class LearnedAttentionAlignmentLayer(torch.nn.Module):
-    """Learn attention-based alignment between student and teacher sequences"""
-    def __init__(self, input_dim: int, teacher_dim: int, max_length: int = 512):
-        super().__init__()
-        self.input_dim = input_dim
-        self.teacher_dim = teacher_dim
-        self.max_length = max_length
-
-        # Project student embeddings to teacher dimension
-        self.student_proj = torch.nn.Linear(input_dim, teacher_dim)
-
-        # Cross-attention mechanism
-        self.cross_attention = torch.nn.MultiheadAttention(
-            embed_dim=teacher_dim,
-            num_heads=8,
-            batch_first=True,
-            dropout=0.0
-        )
-
-        # Position embeddings for queries
-        self.position_proj = torch.nn.Embedding(max_length, teacher_dim)
-
-        # Output refinement
-        self.refine = torch.nn.Sequential(
-            torch.nn.Linear(teacher_dim, teacher_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(teacher_dim, teacher_dim)
-        )
-
-        self.layer_norm = torch.nn.LayerNorm(teacher_dim)
-        self.output_dim = teacher_dim
-        self.layer_type = "attention"
-
-    def forward(self, student_emb, s_mask, t_mask, target_length=512):
-        batch_size, s_len, _ = student_emb.shape
-        t_len = t_mask.sum(dim=1).max()
-
-        # Project student embeddings
-        student_proj = self.student_proj(student_emb)
-
-        # Create position-based queries for teacher tokens
-        teacher_positions = torch.arange(t_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)
-        queries = self.position_proj(teacher_positions)
-
-        # Apply cross-attention: queries attend to student embeddings
-        aligned_emb, attention_weights = self.cross_attention(
-            query=queries,
-            key=student_proj,
-            value=student_proj,
-            key_padding_mask=~s_mask.bool()
-        )
-
-        # Refine the aligned embeddings
-        refined = self.refine(aligned_emb)
-        refined = self.layer_norm(refined)
-
-        # Apply mask
-        output_mask = t_mask[:, :t_len].unsqueeze(-1)
-        refined = refined * output_mask
-
-        # Pad to target length if needed
-        if refined.shape[1] < target_length:
-            padding = (0, 0, 0, target_length - refined.shape[1])
-            refined = F.pad(refined, padding, 'constant', 0)
-
-        return refined
 
 class LearnedInterpolationLayer(torch.nn.Module):
     """Learned interpolation layer for stretching sequences using position-aware upsampling"""
@@ -475,17 +408,54 @@ def token_based_alignment(student_input_ids, teacher_input_ids,
 
     return aligned_pairs
 
+def fuzzy_token_alignment(student_ids, teacher_ids, student_tokenizer, teacher_tokenizer):
+    """Fallback fuzzy alignment when direct matching fails"""
+    student_tokens = ids_to_tokens(student_ids.cpu().numpy(), student_tokenizer)
+    teacher_tokens = ids_to_tokens(teacher_ids.cpu().numpy(), teacher_tokenizer)
+
+    aligned_pairs = []
+    norm_student = [normalize_token(t) for t in student_tokens]
+    norm_teacher = [normalize_token(t) for t in teacher_tokens]
+
+    # Try substring matching for remaining tokens
+    for i, norm_s in enumerate(norm_student):
+        if student_tokens[i] in [student_tokenizer.pad_token, student_tokenizer.bos_token, student_tokenizer.eos_token]:
+            continue
+
+        best_j = None
+        best_match = 0
+
+        for j, norm_t in enumerate(norm_teacher):
+            if teacher_tokens[j] in [teacher_tokenizer.pad_token, teacher_tokenizer.bos_token, teacher_tokenizer.eos_token]:
+                continue
+
+            # Check for substring match
+            if norm_s in norm_t or norm_t in norm_s:
+                best_j = j
+                break
+            # Check for partial match (at least 2 chars)
+            elif len(norm_s) >= 2 and len(norm_t) >= 2:
+                common_chars = set(norm_s) & set(norm_t)
+                match_ratio = len(common_chars) / min(len(norm_s), len(norm_t))
+                if match_ratio > 0.5 and match_ratio > best_match:
+                    best_match = match_ratio
+                    best_j = j
+
+        if best_j is not None:
+            aligned_pairs.append((i, best_j))
+
+    return aligned_pairs
+
 # ========== Loss Functions ==========
 class AlignmentLoss(torch.nn.Module):
-    """Loss for token-level alignment"""
     def __init__(self, huber_weight: float = 0.7, cosine_weight: float = 0.3,
-                 huber_delta: float = 1.0,
+                 huber_delta: float = 1.0, temperature: float = 0.5,  # Increased temperature
                  student_tokenizer=None, teacher_tokenizer=None):
         super().__init__()
         self.huber_weight = huber_weight
         self.cosine_weight = cosine_weight
         self.huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction='none')
-        self.cos_loss = torch.nn.CosineSimilarity(dim=-1)
+        self.temperature = temperature
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
 
@@ -499,45 +469,57 @@ class AlignmentLoss(torch.nn.Module):
         # Initialize loss accumulators
         huber_sum = torch.tensor(0.0, device=device)
         cos_loss_sum = torch.tensor(0.0, device=device)
-        num_aligned_tokens = 0
-        num_seqs = 0
+        total_aligned = 0
 
         for i in range(batch_size):
-            # Token alignment
-            if student_input_ids is not None and teacher_input_ids is not None:
-                aligned_pairs_tok = token_based_alignment(
+            aligned_pairs = token_based_alignment(
+                student_input_ids[i], teacher_input_ids[i],
+                self.student_tokenizer, self.teacher_tokenizer,
+                window_size=ALIGNMENT_WINDOW
+            )
+
+            # Try fuzzy matching if no direct alignment
+            if len(aligned_pairs) == 0:
+                aligned_pairs = fuzzy_token_alignment(
                     student_input_ids[i], teacher_input_ids[i],
-                    self.student_tokenizer, self.teacher_tokenizer,
-                    window_size=ALIGNMENT_WINDOW
+                    self.student_tokenizer, self.teacher_tokenizer
                 )
 
-                if len(aligned_pairs_tok) > 0:
-                    student_aligned_tok = []
-                    teacher_aligned_tok = []
-                    for (stu_idx, tea_idx) in aligned_pairs_tok:
-                        student_aligned_tok.append(student_output[i, stu_idx])
-                        teacher_aligned_tok.append(teacher_output[i, tea_idx])
+            if len(aligned_pairs) > 0:
+                student_aligned = []
+                teacher_aligned = []
+                for (stu_idx, tea_idx) in aligned_pairs:
+                    student_aligned.append(student_output[i, stu_idx])
+                    teacher_aligned.append(teacher_output[i, tea_idx])
 
-                    if student_aligned_tok and teacher_aligned_tok:
-                        student_aligned_tok = torch.stack(student_aligned_tok)
-                        teacher_aligned_tok = torch.stack(teacher_aligned_tok)
+                if student_aligned and teacher_aligned:
+                    student_aligned = torch.stack(student_aligned)
+                    teacher_aligned = torch.stack(teacher_aligned)
 
-                        huber_sum += self.huber_loss(student_aligned_tok, teacher_aligned_tok).mean()
-                        cos_sim_align = self.cos_loss(student_aligned_tok, teacher_aligned_tok)
-                        cos_loss_sum += (1 - cos_sim_align).mean()
-                        num_seqs += 1
-                        num_aligned_tokens += len(aligned_pairs_tok)
+                    # Huber loss on aligned tokens
+                    huber_sum += self.huber_loss(student_aligned, teacher_aligned).mean()
 
-        # Compute averaged losses
-        huber_loss = huber_sum / num_seqs if num_seqs > 0 else torch.tensor(0.0, device=device)
-        cos_loss = cos_loss_sum / num_seqs if num_seqs > 0 else torch.tensor(0.0, device=device)
+                    # Gentle temperature scaling - don't use tanh, just scale the loss
+                    cos_sim = F.cosine_similarity(student_aligned, teacher_aligned, dim=-1)
+                    # Use temperature only for scaling the loss, not the similarity
+                    cos_loss_sum += (1 - cos_sim).mean() / self.temperature
+
+                    total_aligned += len(aligned_pairs)
+
+        # Simple normalization by batch size
+        if total_aligned > 0:
+            huber_loss = huber_sum / batch_size
+            cos_loss = cos_loss_sum / batch_size
+        else:
+            huber_loss = torch.tensor(0.0, device=device)
+            cos_loss = torch.tensor(0.0, device=device)
 
         total_loss = (
             self.huber_weight * huber_loss +
             self.cosine_weight * cos_loss
         )
 
-        return total_loss, huber_loss, cos_loss, num_aligned_tokens
+        return total_loss, huber_loss, cos_loss, total_aligned
 
 class TokenLoss(torch.nn.Module):
     """Loss for token-level position matching with optional position targeting"""
@@ -632,20 +614,19 @@ class SequenceLoss(torch.nn.Module):
 
 class CosineAlignLoss(torch.nn.Module):
     def __init__(self, huber_weight: float = 0.4, cosine_weight: float = 0.3,
-                 window_size: int = 3):
+                 window_size: int = 3, temperature: float = 0.5):
         super().__init__()
         self.huber_weight = huber_weight
         self.cosine_weight = cosine_weight
         self.window_size = window_size
+        self.temperature = temperature
 
-        self.huber_loss = torch.nn.HuberLoss(delta=1.0, reduction='mean')
-        self.cos_loss = torch.nn.CosineSimilarity(dim=-1)
+        self.huber_loss = torch.nn.HuberLoss(delta=1.0, reduction='none')
 
     def forward(self, student_output, teacher_output, original_student, s_mask, t_mask):
         device = student_output.device
         batch_size = student_output.size(0)
 
-        # 1. Windowed token alignment (soft matching)
         token_huber_loss = torch.tensor(0.0, device=device)
         token_cosine_loss = torch.tensor(0.0, device=device)
         token_count = 0
@@ -657,45 +638,41 @@ class CosineAlignLoss(torch.nn.Module):
             if len(t_indices) == 0 or len(s_indices) == 0:
                 continue
 
-            # For each teacher token, find best matching student in window
             for t_idx in t_indices:
-                # Map teacher position to student space (approximate)
                 s_pos_approx = int(t_idx * len(s_indices) / len(t_indices))
 
-                # Define window around approximate position
                 window_start = max(0, s_pos_approx - self.window_size)
                 window_end = min(len(s_indices), s_pos_approx + self.window_size + 1)
 
                 if window_start >= window_end:
                     continue
 
-                # Get student embeddings in window
                 window_students = student_output[i, window_start:window_end]
                 teacher_emb = teacher_output[i, t_idx:t_idx+1]
 
-                # Compute similarities
                 similarities = F.cosine_similarity(
                     window_students, teacher_emb, dim=-1
                 )
 
                 if similarities.numel() > 0:
-                    # Use weighted average based on similarity
-                    weights = F.softmax(similarities * 3.0, dim=0)  # Sharpen distribution
+                    # Remove temperature scaling from softmax - let it be natural
+                    weights = F.softmax(similarities, dim=0)  # No temperature here
                     aligned_student = torch.sum(window_students * weights.unsqueeze(-1), dim=0)
 
-                    # Compute loss for this alignment
+                    # Huber loss
                     huber = self.huber_loss(aligned_student, teacher_emb.squeeze(0))
-                    cos_sim = self.cos_loss(aligned_student.unsqueeze(0), teacher_emb).squeeze()
-                    cos_loss = (1 - cos_sim)
+                    # Simple cosine loss with gentle temperature scaling
+                    cos_sim = F.cosine_similarity(aligned_student.unsqueeze(0), teacher_emb).squeeze()
+                    cos_loss = (1 - cos_sim) / self.temperature  # Scale loss, not similarity
 
                     token_huber_loss += huber
                     token_cosine_loss += cos_loss
                     token_count += 1
 
-        # Average over all alignments
+        # Normalize by batch size
         if token_count > 0:
-            token_huber_loss = token_huber_loss / token_count
-            token_cosine_loss = token_cosine_loss / token_count
+            token_huber_loss = token_huber_loss / batch_size
+            token_cosine_loss = token_cosine_loss / batch_size
             token_loss = self.huber_weight * token_huber_loss + self.cosine_weight * token_cosine_loss
         else:
             token_huber_loss = torch.tensor(0.0, device=device)
@@ -1046,17 +1023,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
         layer_config = PROJECTION_LAYERS_CONFIG[i-1]
         layer_num = layer_config["file_num"]
         layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
-
-        # Determine input dim
-        if i == 1:
-            input_dim = qwen_embedding_dim
-        else:
-            input_dim = projection_layers[-1].output_dim if hasattr(projection_layers[-1], 'output_dim') else 4096
-
-        # Override if specified in config
-        if layer_config.get("input_dim", "auto") != "auto":
-            input_dim = layer_config["input_dim"]
-
+        input_dim = layer_config["input_dim"]
         file_num = layer_config["file_num"]
 
         if layer_config["type"] == "linear":
@@ -1161,12 +1128,8 @@ def get_projection_parameters_by_type(projection_layers: List[torch.nn.Module]) 
                     params_by_type[group].append(param)
             continue
 
-        # For other layers, examine their internal structure
-        for name, submodule in layer.named_modules():
-            # Skip the container module itself
-            if name == '':
-                continue
-
+        # Use named_children to avoid recursion into nested modules
+        for name, submodule in layer.named_children():
             # Determine group based on actual PyTorch layer type
             if isinstance(submodule, torch.nn.Linear):
                 group = 'linear'
@@ -1292,7 +1255,10 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                   device: str, autocast_dtype: torch.dtype,
                   student_tokenizer, teacher_tokenizer, teacher_model=None) -> Dict[str, float]:
     """Evaluate model with improved metrics and memory handling"""
-    # Set to eval mode only for non-None loss functions
+    # Temporarily set all to eval mode
+    current_model_state = model.training
+    current_layer_states = [layer.training for layer in projection_layers]
+
     model.eval()
     for layer in projection_layers:
         layer.eval()
@@ -1355,7 +1321,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
 
                     # Pass teacher embeddings and masks to projection layers
                     for layer in projection_layers:
-                        if isinstance(layer, LearnedAttentionAlignmentLayer) or isinstance(layer, LearnedInterpolationLayer):
+                        if isinstance(layer, LearnedInterpolationLayer):
                             projected_student = layer(
                                 projected_student,
                                 s_mask=s_mask,
@@ -1484,9 +1450,11 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
         total_losses['alignment_quality'] = sum(m['token_alignment_quality'] for m in metric_samples) / len(metric_samples)
 
     # Set back to train mode
-    model.train()
-    for layer in projection_layers:
-        layer.train()
+    if current_model_state:
+        model.train()
+    for layer, state in zip(projection_layers, current_layer_states):
+        if state:
+            layer.train()
     if text_align_loss_fn is not None:
         text_align_loss_fn.train()
     if cosine_align_loss_fn is not None:
@@ -1606,6 +1574,27 @@ def exit_dataloader() -> None:
     gc.collect()
     torch.cuda.empty_cache()
 
+def set_training_mode(model, projection_layers, train_model_flag=True, train_projection_flag=True):
+    """Set training mode only for layers that are being trained"""
+    if train_model_flag:
+        model.train()
+    else:
+        model.eval()
+
+    for layer_idx, layer in enumerate(projection_layers):
+        # Check if this layer is excluded from training
+        is_excluded = layer_idx + 1 in EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS
+
+        # Only set to train mode if projection training is enabled AND layer is not excluded
+        if train_projection_flag and not is_excluded:
+            layer.train()
+        else:
+            layer.eval()
+
+def restore_training_mode(model, projection_layers, train_model_flag=True, train_projection_flag=True):
+    """Restore training mode after evaluation"""
+    set_training_mode(model, projection_layers, train_model_flag, train_projection_flag)
+
 def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
                current_loss: float,
                current_text_align_huber: float, current_text_align_cos: float,
@@ -1614,6 +1603,7 @@ def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
                current_sequence_huber: float, current_sequence_cos: float,
                grad_norm_model: float, grad_norm_proj: float,
                current_lr_model: float, current_lr_proj: float,
+               num_aligned_tokens: int, num_cosine_align_tokens: int,
                elapsed: float, eta: float) -> str:
     """Generate logging string with dynamic loss reporting"""
     model_gn_line = ""
@@ -1640,18 +1630,20 @@ def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
 
     # Build loss lines based on enabled losses
     loss_lines = []
-    if TEXT_ALIGN_HUBER_WEIGHT > 0 or TEXT_ALIGN_COSINE_WEIGHT > 0:
-        loss_lines.append(f"Text Align Huber: {current_text_align_huber:.6f}")
-        loss_lines.append(f"Text Align Cosine: {current_text_align_cos:.6f}")
-    if COSINE_ALIGN_HUBER_WEIGHT > 0 or COSINE_ALIGN_COSINE_WEIGHT > 0:
-        loss_lines.append(f"Cosine Align Huber: {current_cosine_align_huber:.6f}")
-        loss_lines.append(f"Cosine Align Cosine: {current_cosine_align_cos:.6f}")
     if TOKEN_HUBER_WEIGHT > 0 or TOKEN_COSINE_WEIGHT > 0:
         loss_lines.append(f"Token Huber: {current_token_huber:.6f}")
         loss_lines.append(f"Token Cosine: {current_token_cos:.6f}")
     if SEQUENCE_HUBER_WEIGHT > 0 or SEQUENCE_COSINE_WEIGHT > 0:
         loss_lines.append(f"Sequence Huber: {current_sequence_huber:.6f}")
         loss_lines.append(f"Sequence Cosine: {current_sequence_cos:.6f}")
+    if TEXT_ALIGN_HUBER_WEIGHT > 0 or TEXT_ALIGN_COSINE_WEIGHT > 0:
+        loss_lines.append(f"Text Align Huber: {current_text_align_huber:.6f}")
+        loss_lines.append(f"Text Align Cosine: {current_text_align_cos:.6f}")
+        loss_lines.append(f"Num Aligned: {num_aligned_tokens}")
+    if COSINE_ALIGN_HUBER_WEIGHT > 0 or COSINE_ALIGN_COSINE_WEIGHT > 0:
+        loss_lines.append(f"Cosine Align Huber: {current_cosine_align_huber:.6f}")
+        loss_lines.append(f"Cosine Align Cosine: {current_cosine_align_cos:.6f}")
+        loss_lines.append(f"Num Aligned: {num_cosine_align_tokens}")
 
     loss_str = ", ".join(loss_lines)
 
@@ -1907,7 +1899,7 @@ def main():
                             projected_student = student_hidden
 
                             for layer in projection_layers:
-                                if isinstance(layer, LearnedAttentionAlignmentLayer) or isinstance(layer, LearnedInterpolationLayer):
+                                if isinstance(layer, LearnedInterpolationLayer):
                                         projected_student = layer(
                                             projected_student,
                                             s_mask=s_mask,
@@ -2000,7 +1992,19 @@ def main():
                         accumulation_step += 1
 
                         if accumulation_step >= GRAD_ACCUM_STEPS or batch_idx == len(train_dataloader) - 1:
-                            # Clip gradients
+                            # Scale gradients BEFORE clipping
+                            if TRAIN_MODEL and model_optimizer:
+                                for param in student_model.parameters():
+                                    if param.grad is not None:
+                                        param.grad.div_(GRAD_ACCUM_STEPS)
+
+                            for layer in projection_layers:
+                                if layer.file_num not in EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS:
+                                    for param in layer.parameters():
+                                        if param.grad is not None:
+                                            param.grad.div_(GRAD_ACCUM_STEPS)
+
+                            # Now clip properly scaled gradients
                             if TRAIN_MODEL and model_optimizer:
                                 grad_norm_model = clip_grad_norm_(
                                     [p for p in student_model.parameters() if p.requires_grad],
@@ -2009,7 +2013,6 @@ def main():
                             else:
                                 grad_norm_model = 0.0
 
-                            # Get all projection parameters for clipping
                             all_proj_params = []
                             for layer in projection_layers:
                                 if layer.file_num not in EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS:
@@ -2027,14 +2030,15 @@ def main():
                                 scaler.step(opt[0])
                             scaler.update()
 
-                            global_step += 1
-                            steps_completed_this_epoch += 1
-
+                            # Clear gradients
                             accumulation_step = 0
                             if TRAIN_MODEL and model_optimizer:
                                 model_optimizer.zero_grad()
                             for opt in projection_optimizers.values():
                                 opt[0].zero_grad()
+
+                            global_step += 1
+                            steps_completed_this_epoch += 1
 
                             # Reset gradients for projection layers
                             for layer in projection_layers:
@@ -2078,6 +2082,7 @@ def main():
                                     current_sequence_huber, current_sequence_cos,
                                     grad_norm_model, grad_norm_proj,
                                     current_lr_model, current_lr_proj,
+                                    num_aligned_tokens, num_cosine_align_tokens,
                                     elapsed, eta
                                 ))
 
@@ -2091,6 +2096,7 @@ def main():
                                     current_sequence_huber, current_sequence_cos,
                                     grad_norm_model, grad_norm_proj,
                                     current_lr_model, current_lr_proj,
+                                    num_aligned_tokens, num_cosine_align_tokens,
                                     elapsed, eta
                                 ))
                                 if global_step % WRITE_TO_LOG_EVERY_X_STEPS == 0:
@@ -2166,6 +2172,8 @@ def main():
                     save_path = os.path.join(OUTPUT_DIR, f"epoch_{next_epoch}")
                     save_trained_model(save_path, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizers)
 
+                set_training_mode(student_model, projection_layers, TRAIN_MODEL, TRAIN_PROJECTION)
+
                 if next_epoch % EVAL_EVERY_X_EPOCHS == 0:
                     eval_start_time = time.time()
 
@@ -2225,7 +2233,7 @@ def main():
 
                     eval_end_time = time.time()
                     eval_delta_time += (eval_end_time - eval_start_time)
-                    student_model.train()
+                    restore_training_mode(student_model, projection_layers, TRAIN_MODEL, TRAIN_PROJECTION)
 
         except Exception as e:
             logging.exception("Exception during training.")
