@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v51/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v52/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v60/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v61/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -53,12 +53,12 @@ EPOCHS = 2
 # Learning rates
 MAX_LEARNING_RATE_MODEL = 1e-5
 MIN_LEARNING_RATE_MODEL = 1e-6
-MAX_LEARNING_RATE_TRANSFORMER = 10e-5
-MIN_LEARNING_RATE_TRANSFORMER = 10e-6
-MAX_LEARNING_RATE_MLP = 15e-5
-MIN_LEARNING_RATE_MLP = 15e-6
-MAX_LEARNING_RATE_LINEAR = 20e-5
-MIN_LEARNING_RATE_LINEAR = 20e-6
+MAX_LEARNING_RATE_TRANSFORMER = 15e-5
+MIN_LEARNING_RATE_TRANSFORMER = 15e-6
+MAX_LEARNING_RATE_MLP = 20e-5
+MIN_LEARNING_RATE_MLP = 20e-6
+MAX_LEARNING_RATE_LINEAR = 30e-5
+MIN_LEARNING_RATE_LINEAR = 30e-6
 MAX_LEARNING_RATE_INTERPOLATION = 10e-5
 MIN_LEARNING_RATE_INTERPOLATION = 10e-6
 
@@ -81,7 +81,8 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Alignment options
-ALIGN_SIMILARITY_THRESHOLD = 0.8 # Higher = stricter matching for cosine similarity
+ALIGN_SIMILARITY_THRESHOLD = 0.80 # Higher = stricter matching for cosine similarity. Set to 1 to disable cosine alignment and instead use the text alignment fallback each time
+ALIGN_TEXT_THRESHOLD = 0 # Threshold for level of cosine alignment matches that triggers text alignment fallback; lower = fewer fallbacks. Set to 0 to disable text alignment fallback
 ALIGN_WINDOW = 3 # We look this many tokens ahead and this many tokens backwards
 
 # Scheduler
@@ -113,9 +114,9 @@ UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50
 ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
-# Training flags - in my experience, disbling model training or turning it to a very low LR is more stable
+# Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = True
+TRAIN_MODEL = False
 
 # Layer arrangement
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
@@ -138,6 +139,44 @@ PROJECTION_LAYERS_CONFIG = [
         "input_dim": 1024,
         "output_dim": 4096,
         "file_num": 3,
+    },
+    {
+        "type": "transformer",
+        "input_dim": 4096,
+        "hidden_dim": 1024,
+        "dim_feedforward": 4096,
+        "file_num": 4,
+    },
+    {
+        "type": "mlp",
+        "input_dim": 1024,
+        "hidden_dim": 1024,
+        "file_num": 5,
+    },
+    {
+        "type": "linear",
+        "input_dim": 1024,
+        "output_dim": 4096,
+        "file_num": 6,
+    },
+    {
+        "type": "transformer",
+        "input_dim": 4096,
+        "hidden_dim": 1024,
+        "dim_feedforward": 4096,
+        "file_num": 7,
+    },
+    {
+        "type": "mlp",
+        "input_dim": 1024,
+        "hidden_dim": 1024,
+        "file_num": 8,
+    },
+    {
+        "type": "linear",
+        "input_dim": 1024,
+        "output_dim": 4096,
+        "file_num": 9,
     },
 ]
 
@@ -1494,7 +1533,7 @@ def save_optimizer_states(save_path: str, model_optimizer, projection_optimizers
     for opt_name, (optimizer, scheduler) in projection_optimizers.items():
         torch.save(optimizer.state_dict(), os.path.join(optimizer_dir, f"{opt_name}_optimizer.pt"))
 
-def load_optimizer_states(save_path: str, model_optimizer, projection_optimizers):
+def load_optimizer_states(save_path: str, model_optimizer, scheduler_model, projection_optimizers):
     """Load optimizer states from a subfolder if available"""
     if not REUSE_OPTIMIZER_STATE:
         return False
@@ -1747,6 +1786,7 @@ def main():
             teacher_tokenizer=teacher_tokenizer,
             window_size=ALIGN_WINDOW,
             similarity_threshold=ALIGN_SIMILARITY_THRESHOLD,
+            text_similarity_threshold=ALIGN_TEXT_THRESHOLD,
         ).to(device, dtype=torch.bfloat16)
 
     if TOKEN_HUBER_WEIGHT > 0 or TOKEN_COSINE_WEIGHT > 0:
@@ -1855,7 +1895,7 @@ def main():
                 model_parameters = [p for p in student_model.parameters() if p.requires_grad]
                 model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
 
-            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_NAME, model_optimizer, projection_optimizers):
+            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_NAME, model_optimizer, scheduler_model, projection_optimizers):
                 # Update learning rates to match scheduler current state
                 if TRAIN_MODEL and scheduler_model:
                     for param_group, lr in zip(model_optimizer.param_groups, scheduler_model.get_last_lr()):
