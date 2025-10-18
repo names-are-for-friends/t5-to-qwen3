@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v8/restart_2"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v8/restart_2/"
 OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v60/"
 
 # Caching
@@ -83,20 +83,26 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Alignment options
-ALIGN_WINDOW = 5 # We look this many tokens ahead (and this many tokens backwards when approximating position) for finding a matching token
+ALIGN_WINDOW = 2 # We look this many tokens ahead for finding a matching token (also backwards if using approx position, so adjust accordingly)
 
 TEXT_ALIGN_COSINE_GUARANTEE = True # Only accept text align matches with sufficient cosine similarity. Prevents incorrect matches from dominating loss as general alignment progresses and correct match losses are minimised
-TEXT_ALIGN_COSINE_THRESHOLD = 0.80  # Minimum cosine similarity to accept text alignment match
-TEXT_USE_APPROXIMATE_POSITION = False # Use an approximate position adjusted to account for sequence length disparity to find token matches
+TEXT_ALIGN_COSINE_THRESHOLD = 0.70 # Cosine similarity threshold to accept text alignment match
+TEXT_USE_APPROXIMATE_POSITION = True # Use an approximate position adjusted to account for sequence length disparity to find token matches
 TEXT_ITERATE_STUDENT = True # Iterate through student tokens, looking for teacher tokens in window of position; else, vice-versa
+
+TEXT_ALIGN_FUZZY_FALLBACK = False # Unaligned tokens will be run through a fuzzy text matching process to maximise representation. Occurs prior to cosine fallback
+TEXT_ALIGN_FUZZY_COSINE_THRESHOLD = 0.80
+
+TEXT_ALIGN_COSINE_FALLBACK = True # Unaligned tokens will be run through a further cosine similarity matching process to maximise representation
+TEXT_ALIGN_COSINE_FALLBACK_THRESHOLD = 0.80
 
 COSINE_USE_APPROXIMATE_POSITION = True
 COSINE_ITERATE_STUDENT = True
 COSINE_ALIGN_SIMILARITY_THRESHOLD = 0.80 # Higher = stricter matching for cosine similarity
 
 # Scheduler
-WARMUP_STEPS = 150
-RESTART_CYCLE_STEPS = 350
+WARMUP_STEPS = 0
+RESTART_CYCLE_STEPS = 500
 REPEAT_WARMUP_AFTER_RESTART = False
 
 # Dataset
@@ -125,7 +131,7 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = True
+TRAIN_MODEL = False
 
 # Layer arrangement
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
@@ -399,30 +405,23 @@ class LearnedInterpolationLayer(torch.nn.Module):
 
 # ========== Token Alignment ==========
 def normalize_token(token):
-    token = token.replace('Ġ', '')
-    token = token.replace('▁', '')
-    token = token.replace('▔', '')
-    token = token.replace('▃', '')
-    token = token.replace('�', '')
-    token = token.replace(' .', '.')
-    token = token.replace(' ,', ',')
-    token = token.replace(' !', '!')
-    token = token.replace(' ?', '?')
-    token = token.replace(' :', ':')
-    token = token.replace(' ;', ';')
-    token = token.replace(' (', '(')
-    token = token.replace(' )', ')')
-    token = token.replace(' [', '[')
-    token = token.replace(' ]', ']')
-    token = token.replace(' {', '{')
-    token = token.replace(' }', '}')
-    token = token.lower()
-    return token
+    """Optimized token normalization with reduced string operations"""
+    replacements = {
+        'Ġ': '', '▁': '', '▔': '', '▃': '', '�': '',
+        ' .': '.', ' ,': ',', ' !': '!', ' ?': '?',
+        ' :': ':', ' ;': ';', ' (': '(', ' )': ')',
+        ' [': '[', ' ]': ']', ' {': '{', ' }': '}'
+    }
+    for old, new in replacements.items():
+        token = token.replace(old, new)
+    return token.lower()
 
 def ids_to_tokens(token_ids, tokenizer):
+    """Optimized token conversion"""
     return tokenizer.convert_ids_to_tokens(token_ids)
 
 def token_based_alignment(student_input_ids, teacher_input_ids, student_tokenizer, teacher_tokenizer, window_size=5, iterate_student=True, use_approx=False, student_output=None, teacher_output=None):
+    """Optimized token-based alignment with reduced loops"""
     student_tokens = ids_to_tokens(student_input_ids.cpu().numpy(), student_tokenizer)
     teacher_tokens = ids_to_tokens(teacher_input_ids.cpu().numpy(), teacher_tokenizer)
 
@@ -430,120 +429,79 @@ def token_based_alignment(student_input_ids, teacher_input_ids, student_tokenize
     normalized_student = [normalize_token(token) for token in student_tokens]
     normalized_teacher = [normalize_token(token) for token in teacher_tokens]
 
+    # Precompute special token sets for faster lookup
+    student_special = {student_tokenizer.pad_token, student_tokenizer.bos_token, student_tokenizer.eos_token}
+    teacher_special = {teacher_tokenizer.pad_token, teacher_tokenizer.bos_token, teacher_tokenizer.eos_token}
+
     if iterate_student:
-        # Iterate through student tokens looking for matching teacher tokens
-        for i, norm_stu in enumerate(normalized_student):
-            if student_tokens[i] in [student_tokenizer.pad_token,
-                                    student_tokenizer.bos_token,
-                                    student_tokenizer.eos_token]:
+        # Create mapping of normalized teacher tokens to positions
+        token_to_teacher_positions = {}
+        for j, norm_t in enumerate(normalized_teacher):
+            if teacher_tokens[j] not in teacher_special:
+                token_to_teacher_positions.setdefault(norm_t, []).append(j)
+
+        # Iterate through student tokens
+        for i, norm_s in enumerate(normalized_student):
+            if student_tokens[i] in student_special:
                 continue
 
-            if use_approx:
-                # Compute approximate teacher position for this student token
-                t_pos_approx = int(i * len(teacher_tokens) / len(student_tokens))
-                # Define window around approximate position
-                start_j = max(0, t_pos_approx - window_size)
-                end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
-            else:
-                t_pos_approx = i
-                # Define window around approximate position
-                start_j = max(0, t_pos_approx)
-                end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
+            # Get approximate position and window
+            t_pos_approx = int(i * len(teacher_tokens) / len(student_tokens)) if use_approx else i
+            start_j = max(0, t_pos_approx - window_size) if use_approx else t_pos_approx
+            end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
 
-            matches = []
-            match_positions = []
-            for j in range(start_j, end_j):
-                if teacher_tokens[j] in [teacher_tokenizer.pad_token,
-                                        teacher_tokenizer.bos_token,
-                                        teacher_tokenizer.eos_token]:
-                    continue
-
-                norm_tea = normalized_teacher[j]
-                if norm_stu == norm_tea:
-                    matches.append(j)
-                    match_positions.append(j)
+            # Get candidate positions from mapping
+            candidate_positions = token_to_teacher_positions.get(norm_s, [])
+            matches = [j for j in candidate_positions if start_j <= j < end_j]
 
             if matches:
-                # Select match based on cosine similarity if embeddings are available
+                # Select best match
                 if student_output is not None and teacher_output is not None:
-                    # Get embeddings for all potential matches
                     student_emb = student_output[i]
                     teacher_embs = teacher_output[matches]
-
-                    # Calculate cosine similarities
                     similarities = F.cosine_similarity(
                         student_emb.unsqueeze(0), teacher_embs, dim=-1
                     )
-
-                    # Select the match with highest cosine similarity
                     best_idx = torch.argmax(similarities).item()
                     closest_match = matches[best_idx]
                 else:
-                    # Fallback to position-based selection if no embeddings available
                     closest_match = min(matches, key=lambda x: abs(x - t_pos_approx))
-
                 aligned_pairs.append((i, closest_match))
     else:
-        # Iterate through teacher tokens looking for matching student tokens
-        for j, norm_tea in enumerate(normalized_teacher):
-            if teacher_tokens[j] in [teacher_tokenizer.pad_token,
-                                    teacher_tokenizer.bos_token,
-                                    teacher_tokenizer.eos_token]:
+        # Symmetric implementation for teacher iteration
+        token_to_student_positions = {}
+        for i, norm_s in enumerate(normalized_student):
+            if student_tokens[i] not in student_special:
+                token_to_student_positions.setdefault(norm_s, []).append(i)
+
+        for j, norm_t in enumerate(normalized_teacher):
+            if teacher_tokens[j] in teacher_special:
                 continue
 
-            if use_approx:
-                # Compute approximate student position for this teacher token
-                s_pos_approx = int(j * len(student_tokens) / len(teacher_tokens))
-                # Define window around approximate position
-                start_i = max(0, s_pos_approx - window_size)
-                end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
-            else:
-                s_pos_approx = i
-                start_i = max(0, s_pos_approx)
-                end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
-
-            # Define window around approximate position
+            s_pos_approx = int(j * len(student_tokens) / len(teacher_tokens)) if use_approx else j
             start_i = max(0, s_pos_approx - window_size)
-            end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
+            end_i = min(len(student_tokens), s_pos_approx + window_size + 1) if use_approx else min(len(student_tokens), s_pos_approx + 1)
 
-            matches = []
-            match_positions = []
-            for i in range(start_i, end_i):
-                if student_tokens[i] in [student_tokenizer.pad_token,
-                                        student_tokenizer.bos_token,
-                                        student_tokenizer.eos_token]:
-                    continue
-
-                norm_stu = normalized_student[i]
-                if norm_stu == norm_tea:
-                    matches.append(i)
-                    match_positions.append(i)
+            candidate_positions = token_to_student_positions.get(norm_t, [])
+            matches = [i for i in candidate_positions if start_i <= i < end_i]
 
             if matches:
-                # Select match based on cosine similarity if embeddings are available
-                if student_output is not None and teacher_output is not None:
-                    # Get embeddings for all potential matches
+                if teacher_output is not None and student_output is not None:
                     teacher_emb = teacher_output[j]
                     student_embs = student_output[matches]
-
-                    # Calculate cosine similarities
                     similarities = F.cosine_similarity(
                         student_embs, teacher_emb.unsqueeze(0), dim=-1
                     )
-
-                    # Select the match with highest cosine similarity
                     best_idx = torch.argmax(similarities).item()
                     closest_match = matches[best_idx]
                 else:
-                    # Fallback to position-based selection if no embeddings available
                     closest_match = min(matches, key=lambda x: abs(x - s_pos_approx))
-
                 aligned_pairs.append((closest_match, j))
 
     return aligned_pairs
 
 def fuzzy_token_alignment(student_ids, teacher_ids, student_tokenizer, teacher_tokenizer, window_size=5, iterate_student=True, use_approx=True, student_output=None, teacher_output=None):
-    """Fallback fuzzy alignment when direct matching fails"""
+    """Optimized fuzzy alignment with precomputed character sets"""
     student_tokens = ids_to_tokens(student_ids.cpu().numpy(), student_tokenizer)
     teacher_tokens = ids_to_tokens(teacher_ids.cpu().numpy(), teacher_tokenizer)
 
@@ -551,161 +509,195 @@ def fuzzy_token_alignment(student_ids, teacher_ids, student_tokenizer, teacher_t
     norm_student = [normalize_token(t) for t in student_tokens]
     norm_teacher = [normalize_token(t) for t in teacher_tokens]
 
+    # Precompute character sets for faster fuzzy matching
+    student_char_sets = [set(s) for s in norm_student]
+    teacher_char_sets = [set(t) for t in norm_teacher]
+
+    # Precompute special token sets
+    student_special = {student_tokenizer.pad_token, student_tokenizer.bos_token, student_tokenizer.eos_token}
+    teacher_special = {teacher_tokenizer.pad_token, teacher_tokenizer.bos_token, teacher_tokenizer.eos_token}
+
     if iterate_student:
-        # Iterate through student tokens looking for matching teacher tokens
-        for i, norm_s in enumerate(norm_student):
-            if student_tokens[i] in [student_tokenizer.pad_token, student_tokenizer.bos_token, student_tokenizer.eos_token]:
+        for i, (norm_s, char_set_s) in enumerate(zip(norm_student, student_char_sets)):
+            if student_tokens[i] in student_special:
                 continue
 
-            if use_approx:
-                # Compute approximate teacher position for this student token
-                t_pos_approx = int(i * len(teacher_tokens) / len(student_tokens))
-                start_j = max(0, t_pos_approx - window_size)
-                end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
-            else:
-                t_pos_approx = i
-                start_j = max(0, t_pos_approx)
-                end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
+            t_pos_approx = int(i * len(teacher_tokens) / len(student_tokens)) if use_approx else i
+            start_j = max(0, t_pos_approx - window_size) if use_approx else t_pos_approx
+            end_j = min(len(teacher_tokens), t_pos_approx + window_size + 1)
 
             matches = []
-            match_positions = []
-            match_ratios = []  # Store match ratios for secondary selection
+            match_ratios = []
 
             for j in range(start_j, end_j):
-                if teacher_tokens[j] in [teacher_tokenizer.pad_token, teacher_tokenizer.bos_token, teacher_tokenizer.eos_token]:
+                if teacher_tokens[j] in teacher_special:
                     continue
 
                 norm_t = norm_teacher[j]
+                char_set_t = teacher_char_sets[j]
 
                 # Check for substring match
                 if norm_s in norm_t or norm_t in norm_s:
                     matches.append(j)
-                    match_positions.append(j)
-                    match_ratios.append(1.0)  # Perfect match ratio
+                    match_ratios.append(1.0)
                 # Check for partial match
                 elif len(norm_s) >= 2 and len(norm_t) >= 2:
-                    common_chars = set(norm_s) & set(norm_t)
+                    common_chars = char_set_s & char_set_t
                     match_ratio = len(common_chars) / min(len(norm_s), len(norm_t))
                     if match_ratio > 0.5:
                         matches.append(j)
-                        match_positions.append(j)
                         match_ratios.append(match_ratio)
 
             if matches:
-                # Select match based on cosine similarity if embeddings are available
                 if student_output is not None and teacher_output is not None:
-                    # Get embeddings for all potential matches
                     student_emb = student_output[i]
                     teacher_embs = teacher_output[matches]
-
-                    # Calculate cosine similarities
                     similarities = F.cosine_similarity(
                         student_emb.unsqueeze(0), teacher_embs, dim=-1
                     )
-
-                    # Select the match with highest cosine similarity
                     best_idx = torch.argmax(similarities).item()
                     closest_match = matches[best_idx]
                 else:
-                    # For exact matches, select closest to approximate position
                     exact_matches = [idx for idx, ratio in zip(matches, match_ratios) if ratio == 1.0]
                     if exact_matches:
                         closest_match = min(exact_matches, key=lambda x: abs(x - t_pos_approx))
                     else:
-                        # For partial matches, select highest ratio, then closest position
                         max_ratio = max(match_ratios)
                         best_ratio_matches = [idx for idx, ratio in zip(matches, match_ratios) if ratio == max_ratio]
                         closest_match = min(best_ratio_matches, key=lambda x: abs(x - t_pos_approx))
-
                 aligned_pairs.append((i, closest_match))
     else:
-        # Iterate through teacher tokens looking for matching student tokens
-        for j, norm_t in enumerate(norm_teacher):
-            if teacher_tokens[j] in [teacher_tokenizer.pad_token, teacher_tokenizer.bos_token, teacher_tokenizer.eos_token]:
+        for j, (norm_t, char_set_t) in enumerate(zip(norm_teacher, teacher_char_sets)):
+            if teacher_tokens[j] in teacher_special:
                 continue
 
-            if use_approx:
-                # Compute approximate student position for this teacher token
-                s_pos_approx = int(j * len(student_tokens) / len(teacher_tokens))
-                start_i = max(0, s_pos_approx - window_size)
-                end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
-            else:
-                s_pos_approx = i
-                start_i = max(0, s_pos_approx)
-                end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
-
+            s_pos_approx = int(j * len(student_tokens) / len(teacher_tokens)) if use_approx else j
             start_i = max(0, s_pos_approx - window_size)
-            end_i = min(len(student_tokens), s_pos_approx + window_size + 1)
+            end_i = min(len(student_tokens), s_pos_approx + window_size + 1) if use_approx else min(len(student_tokens), s_pos_approx + 1)
 
             matches = []
-            match_positions = []
-            match_ratios = []  # Store match ratios for secondary selection
+            match_ratios = []
 
             for i in range(start_i, end_i):
-                if student_tokens[i] in [student_tokenizer.pad_token, student_tokenizer.bos_token, student_tokenizer.eos_token]:
+                if student_tokens[i] in student_special:
                     continue
 
                 norm_s = norm_student[i]
+                char_set_s = student_char_sets[i]
 
-                # Check for substring match
                 if norm_s in norm_t or norm_t in norm_s:
                     matches.append(i)
-                    match_positions.append(i)
-                    match_ratios.append(1.0)  # Perfect match ratio
-                # Check for partial match
+                    match_ratios.append(1.0)
                 elif len(norm_s) >= 2 and len(norm_t) >= 2:
-                    common_chars = set(norm_s) & set(norm_t)
+                    common_chars = char_set_s & char_set_t
                     match_ratio = len(common_chars) / min(len(norm_s), len(norm_t))
                     if match_ratio > 0.5:
                         matches.append(i)
-                        match_positions.append(i)
                         match_ratios.append(match_ratio)
 
             if matches:
-                # Select match based on cosine similarity if embeddings are available
-                if student_output is not None and teacher_output is not None:
-                    # Get embeddings for all potential matches
+                if teacher_output is not None and student_output is not None:
                     teacher_emb = teacher_output[j]
                     student_embs = student_output[matches]
-
-                    # Calculate cosine similarities
                     similarities = F.cosine_similarity(
                         student_embs, teacher_emb.unsqueeze(0), dim=-1
                     )
-
-                    # Select the match with highest cosine similarity
                     best_idx = torch.argmax(similarities).item()
                     closest_match = matches[best_idx]
                 else:
-                    # For exact matches, select closest to approximate position
                     exact_matches = [idx for idx, ratio in zip(matches, match_ratios) if ratio == 1.0]
                     if exact_matches:
                         closest_match = min(exact_matches, key=lambda x: abs(x - s_pos_approx))
                     else:
-                        # For partial matches, select highest ratio, then closest position
                         max_ratio = max(match_ratios)
                         best_ratio_matches = [idx for idx, ratio in zip(matches, match_ratios) if ratio == max_ratio]
                         closest_match = min(best_ratio_matches, key=lambda x: abs(x - s_pos_approx))
-
                 aligned_pairs.append((closest_match, j))
+
+    return aligned_pairs
+
+def cosine_similarity_alignment(student_output: torch.Tensor, teacher_output: torch.Tensor, student_mask: torch.Tensor, teacher_mask: torch.Tensor,                               iterate_student: bool = True, use_approximate_position: bool = True, window_size: int = 5, similarity_threshold: float = 0.8):
+    """Optimized cosine similarity alignment with vectorized operations"""
+    batch_size = student_output.size(0)
+    aligned_pairs = []
+
+    for i in range(batch_size):
+        # Get actual tokens (not padded)
+        t_indices = (teacher_mask[i] == 1).nonzero(as_tuple=True)[0]
+        s_indices = (student_mask[i] == 1).nonzero(as_tuple=True)[0]
+
+        if len(t_indices) == 0 or len(s_indices) == 0:
+            continue
+
+        # Vectorized cosine similarity computation
+        if iterate_student:
+            # Normalize embeddings once
+            student_embs_norm = F.normalize(student_output[i, s_indices], p=2, dim=-1)
+            teacher_embs_norm = F.normalize(teacher_output[i, t_indices], p=2, dim=-1)
+
+            # Compute all pairwise similarities
+            similarities = torch.mm(student_embs_norm, teacher_embs_norm.t())
+
+            # Apply window constraints
+            mask = torch.zeros_like(similarities, dtype=torch.bool)
+            for s_pos, s_idx in enumerate(s_indices):
+                t_pos_approx = int(s_idx * len(t_indices) / len(s_indices)) if use_approximate_position else s_idx
+                t_start = max(0, t_pos_approx - window_size) if use_approximate_position else t_pos_approx
+                t_end = min(len(t_indices), t_pos_approx + window_size + 1)
+                mask[s_pos, t_start:t_end] = True
+
+            # Apply threshold and find best matches
+            similarities = similarities.masked_fill(~mask, -1)
+            best_sims, best_indices = similarities.max(dim=1)
+
+            # Filter by threshold and avoid duplicates
+            aligned_teacher_positions = set()
+            for s_pos, (sim, t_pos) in enumerate(zip(best_sims, best_indices)):
+                if sim > similarity_threshold and t_pos not in aligned_teacher_positions:
+                    aligned_pairs.append((s_indices[s_pos].item(), t_indices[t_pos].item()))
+                    aligned_teacher_positions.add(t_pos)
+        else:
+            # Symmetric implementation for teacher iteration
+            teacher_embs_norm = F.normalize(teacher_output[i, t_indices], p=2, dim=-1)
+            student_embs_norm = F.normalize(student_output[i, s_indices], p=2, dim=-1)
+
+            similarities = torch.mm(teacher_embs_norm, student_embs_norm.t())
+
+            mask = torch.zeros_like(similarities, dtype=torch.bool)
+            for t_pos, t_idx in enumerate(t_indices):
+                s_pos_approx = int(t_idx * len(s_indices) / len(t_indices)) if use_approximate_position else t_idx
+                s_start = max(0, s_pos_approx - window_size)
+                s_end = min(len(s_indices), s_pos_approx + window_size + 1) if use_approximate_position else min(len(s_indices), s_pos_approx + 1)
+                mask[t_pos, s_start:s_end] = True
+
+            similarities = similarities.masked_fill(~mask, -1)
+            best_sims, best_indices = similarities.max(dim=1)
+
+            aligned_student_positions = set()
+            for t_pos, (sim, s_pos) in enumerate(zip(best_sims, best_indices)):
+                if sim > similarity_threshold and s_pos not in aligned_student_positions:
+                    aligned_pairs.append((s_indices[s_pos].item(), t_indices[t_pos].item()))
+                    aligned_student_positions.add(s_pos)
 
     return aligned_pairs
 
 # ========== Loss Functions ==========
 class AlignmentLoss(torch.nn.Module):
     def __init__(self, huber_weight: float = 0.7, cosine_weight: float = 0.3,
-                 huber_delta: float = 1.0, temperature: float = 0.5,
+                 huber_delta: float = 1.0,
                  student_tokenizer=None, teacher_tokenizer=None,
                  window_size: int = 3,
                  use_approximate_position: bool = True,
                  iterate_student: bool = True,
                  cosine_guarantee: bool = True,
-                 cosine_threshold: float = 0.3):
+                 cosine_threshold: float = 0.70,
+                 cosine_fallback: bool = False,
+                 cosine_fallback_threshold: float = 0.80,
+                 fuzzy_fallback: bool = False,
+                 fuzzy_cosine_threshold: float = 0.80):
         super().__init__()
         self.huber_weight = huber_weight
         self.cosine_weight = cosine_weight
-        self.huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction='mean')
-        self.temperature = temperature
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
         self.window_size = window_size
@@ -713,79 +705,98 @@ class AlignmentLoss(torch.nn.Module):
         self.iterate_student = iterate_student
         self.cosine_guarantee = cosine_guarantee
         self.cosine_threshold = cosine_threshold
+        self.cosine_fallback = cosine_fallback
+        self.cosine_fallback_threshold = cosine_fallback_threshold
+        self.fuzzy_fallback = fuzzy_fallback
+        self.fuzzy_cosine_threshold = fuzzy_cosine_threshold
 
-        # Store alignment stats for logging
         self.last_alignment_stats = {
             'text_aligned': 0,
             'cosine_filtered': 0,
+            'total_tokens_processed': 0,
         }
 
     def forward(self, student_output: torch.Tensor, teacher_output: torch.Tensor,
                 student_mask: torch.Tensor, teacher_mask: torch.Tensor,
                 student_input_ids: Optional[torch.Tensor] = None,
-                teacher_input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+                teacher_input_ids: Optional[torch.Tensor] = None):
         device = student_output.device
         batch_size = student_output.size(0)
 
-        # Initialize loss accumulators
         total_huber = torch.tensor(0.0, device=device)
         total_cos = torch.tensor(0.0, device=device)
 
-        # Reset alignment stats for this batch
         self.last_alignment_stats = {
             'text_aligned': 0,
             'cosine_filtered': 0,
+            'total_tokens_processed': 0,
         }
 
         for i in range(batch_size):
             # Get actual tokens (not padded)
-            batch_student_output = student_output[i]
-            batch_teacher_output = teacher_output[i]
             t_indices = (teacher_mask[i] == 1).nonzero(as_tuple=True)[0]
             s_indices = (student_mask[i] == 1).nonzero(as_tuple=True)[0]
 
             if len(t_indices) == 0 or len(s_indices) == 0:
                 continue
 
+            # Count total tokens processed
+            if self.iterate_student:
+                total_tokens = sum(
+                    1 for idx in s_indices
+                    if student_input_ids[i][idx].item() not in [
+                        self.student_tokenizer.pad_token_id,
+                        self.student_tokenizer.bos_token_id,
+                        self.student_tokenizer.eos_token_id
+                    ]
+                )
+            else:
+                total_tokens = sum(
+                    1 for idx in t_indices
+                    if teacher_input_ids[i][idx].item() not in [
+                        self.teacher_tokenizer.pad_token_id,
+                        self.teacher_tokenizer.bos_token_id,
+                        self.teacher_tokenizer.eos_token_id
+                    ]
+                )
+            self.last_alignment_stats['total_tokens_processed'] += total_tokens
+
             # Text-based alignment
             text_aligned_pairs = []
+            unaligned_positions = set()
 
             if self.iterate_student:
-                # Find which student positions still need alignment
                 unaligned_student_positions = set(s_indices.tolist())
-
                 if unaligned_student_positions:
-                    # Use token-based alignment functions
                     all_text_aligned_pairs = token_based_alignment(
                         student_input_ids[i], teacher_input_ids[i],
                         self.student_tokenizer, self.teacher_tokenizer,
                         window_size=self.window_size,
                         iterate_student=self.iterate_student,
                         use_approx=self.use_approximate_position,
-                        student_output=batch_student_output,
-                        teacher_output=batch_teacher_output
+                        student_output=student_output[i],
+                        teacher_output=teacher_output[i]
                     )
-                    if len(all_text_aligned_pairs) == 0:
+                    if not all_text_aligned_pairs:
                         all_text_aligned_pairs = fuzzy_token_alignment(
                             student_input_ids[i], teacher_input_ids[i],
                             self.student_tokenizer, self.teacher_tokenizer,
                             window_size=self.window_size,
                             iterate_student=self.iterate_student,
                             use_approx=self.use_approximate_position,
-                            student_output=batch_student_output,
-                            teacher_output=batch_teacher_output
+                            student_output=student_output[i],
+                            teacher_output=teacher_output[i]
                         )
 
-                    # Filter to only cover unaligned positions and apply cosine guarantee
+                    # Filter and apply cosine guarantee
                     for pair in all_text_aligned_pairs:
                         if pair[0] in unaligned_student_positions:
-                            # Apply cosine guarantee
                             if self.cosine_guarantee:
                                 s_idx, t_idx = pair
-                                student_emb = student_output[i, s_idx]
-                                teacher_emb = teacher_output[i, t_idx]
                                 cos_sim = F.cosine_similarity(
-                                    student_emb.unsqueeze(0), teacher_emb.unsqueeze(0), dim=-1
+                                    student_output[i, s_idx].unsqueeze(0),
+                                    teacher_output[i, t_idx].unsqueeze(0),
+                                    dim=-1
                                 ).squeeze()
                                 if cos_sim > self.cosine_threshold:
                                     text_aligned_pairs.append(pair)
@@ -795,42 +806,38 @@ class AlignmentLoss(torch.nn.Module):
                             else:
                                 text_aligned_pairs.append(pair)
                                 unaligned_student_positions.remove(pair[0])
-
+                    unaligned_positions = unaligned_student_positions
             else:
-                # Find which teacher positions still need alignment
                 unaligned_teacher_positions = set(t_indices.tolist())
-
                 if unaligned_teacher_positions:
-                    # Use token-based alignment functions
                     all_text_aligned_pairs = token_based_alignment(
                         student_input_ids[i], teacher_input_ids[i],
                         self.student_tokenizer, self.teacher_tokenizer,
                         window_size=self.window_size,
                         iterate_student=self.iterate_student,
                         use_approx=self.use_approximate_position,
-                        student_output=batch_student_output,
-                        teacher_output=batch_teacher_output
+                        student_output=student_output[i],
+                        teacher_output=teacher_output[i]
                     )
-                    if len(all_text_aligned_pairs) == 0:
+                    if not all_text_aligned_pairs:
                         all_text_aligned_pairs = fuzzy_token_alignment(
                             student_input_ids[i], teacher_input_ids[i],
                             self.student_tokenizer, self.teacher_tokenizer,
+                            window_size=self.window_size,
                             iterate_student=self.iterate_student,
                             use_approx=self.use_approximate_position,
-                            student_output=batch_student_output,
-                            teacher_output=batch_teacher_output
+                            student_output=student_output[i],
+                            teacher_output=teacher_output[i]
                         )
 
-                    # Filter to only cover unaligned positions and apply cosine guarantee
                     for pair in all_text_aligned_pairs:
                         if pair[1] in unaligned_teacher_positions:
-                            # Apply cosine guarantee
                             if self.cosine_guarantee:
                                 s_idx, t_idx = pair
-                                student_emb = student_output[i, s_idx]
-                                teacher_emb = teacher_output[i, t_idx]
                                 cos_sim = F.cosine_similarity(
-                                    student_emb.unsqueeze(0), teacher_emb.unsqueeze(0), dim=-1
+                                    student_output[i, s_idx].unsqueeze(0),
+                                    teacher_output[i, t_idx].unsqueeze(0),
+                                    dim=-1
                                 ).squeeze()
                                 if cos_sim > self.cosine_threshold:
                                     text_aligned_pairs.append(pair)
@@ -840,27 +847,114 @@ class AlignmentLoss(torch.nn.Module):
                             else:
                                 text_aligned_pairs.append(pair)
                                 unaligned_teacher_positions.remove(pair[1])
+                    unaligned_positions = unaligned_teacher_positions
 
-            # Calculate losses for all text-aligned pairs
-            for (stu_idx, tea_idx) in text_aligned_pairs:
-                if stu_idx < len(s_indices) and tea_idx < len(t_indices):
-                    student_emb = student_output[i, stu_idx]
-                    teacher_emb = teacher_output[i, tea_idx]
+            # Fuzzy token alignment fallback (optimized)
+            fuzzy_aligned_pairs = []
+            if self.fuzzy_fallback and unaligned_positions:
+                # Run fuzzy alignment once for entire sequence
+                fuzzy_matches = fuzzy_token_alignment(
+                    student_input_ids[i], teacher_input_ids[i],
+                    self.student_tokenizer, self.teacher_tokenizer,
+                    window_size=self.window_size,
+                    iterate_student=self.iterate_student,
+                    use_approx=self.use_approximate_position,
+                    student_output=student_output[i],
+                    teacher_output=teacher_output[i]
+                )
 
-                    # Calculate Huber loss
-                    huber_loss = self.huber_loss(student_emb, teacher_emb)
-                    total_huber += huber_loss
+                if self.iterate_student:
+                    for pair in fuzzy_matches:
+                        if pair[0] in unaligned_positions and pair[1] in t_indices:
+                            s_idx, t_idx = pair
+                            cos_sim = F.cosine_similarity(
+                                student_output[i, s_idx].unsqueeze(0),
+                                teacher_output[i, t_idx].unsqueeze(0),
+                                dim=-1
+                            ).squeeze()
+                            if cos_sim > self.fuzzy_cosine_threshold:
+                                fuzzy_aligned_pairs.append(pair)
+                                unaligned_positions.discard(s_idx)
+                            else:
+                                self.last_alignment_stats['cosine_filtered'] += 1
+                else:
+                    for pair in fuzzy_matches:
+                        if pair[1] in unaligned_positions and pair[0] in s_indices:
+                            s_idx, t_idx = pair
+                            cos_sim = F.cosine_similarity(
+                                student_output[i, s_idx].unsqueeze(0),
+                                teacher_output[i, t_idx].unsqueeze(0),
+                                dim=-1
+                            ).squeeze()
+                            if cos_sim > self.fuzzy_cosine_threshold:
+                                fuzzy_aligned_pairs.append(pair)
+                                unaligned_positions.discard(t_idx)
+                            else:
+                                self.last_alignment_stats['cosine_filtered'] += 1
 
-                    # Calculate cosine similarity
-                    cos_sim = F.cosine_similarity(student_emb.unsqueeze(0), teacher_emb.unsqueeze(0), dim=-1).squeeze()
-                    cos_sim = torch.clamp(cos_sim, min=-0.99, max=0.99)
-                    cos_loss = (1 - cos_sim) / self.temperature
-                    total_cos += cos_loss
+            # Cosine fallback alignment
+            cosine_fallback_pairs = []
+            if self.cosine_fallback and unaligned_positions:
+                temp_student_mask = torch.zeros_like(student_mask[i])
+                temp_teacher_mask = torch.zeros_like(teacher_mask[i])
 
-            # Count alignments
-            self.last_alignment_stats['text_aligned'] += len(text_aligned_pairs)
+                if self.iterate_student:
+                    for pos in unaligned_positions:
+                        temp_student_mask[pos] = 1
+                    for pos in t_indices:
+                        temp_teacher_mask[pos] = 1
+                else:
+                    for pos in s_indices:
+                        temp_student_mask[pos] = 1
+                    for pos in unaligned_positions:
+                        temp_teacher_mask[pos] = 1
 
-        # Normalize by token count only if we have alignments
+                cosine_alignments = cosine_similarity_alignment(
+                    student_output[i:i+1],
+                    teacher_output[i:i+1],
+                    temp_student_mask.unsqueeze(0),
+                    temp_teacher_mask.unsqueeze(0),
+                    iterate_student=self.iterate_student,
+                    use_approximate_position=self.use_approximate_position,
+                    window_size=self.window_size,
+                    similarity_threshold=self.cosine_fallback_threshold
+                )
+
+                for pair in cosine_alignments:
+                    s_idx, t_idx = pair
+                    if self.iterate_student:
+                        if s_idx in unaligned_positions:
+                            cosine_fallback_pairs.append(pair)
+                            unaligned_positions.discard(s_idx)
+                    else:
+                        if t_idx in unaligned_positions:
+                            cosine_fallback_pairs.append(pair)
+                            unaligned_positions.discard(t_idx)
+
+                self.last_alignment_stats['cosine_filtered'] += len(unaligned_positions)
+
+            # Combine all aligned pairs
+            all_aligned_pairs = text_aligned_pairs + fuzzy_aligned_pairs + cosine_fallback_pairs
+            self.last_alignment_stats['text_aligned'] += len(all_aligned_pairs)
+
+            # Calculate losses for all aligned pairs
+            if all_aligned_pairs:
+                student_embs = student_output[i, [pair[0] for pair in all_aligned_pairs]]
+                teacher_embs = teacher_output[i, [pair[1] for pair in all_aligned_pairs]]
+
+                # Huber loss on normalized embeddings
+                huber_losses = F.huber_loss(
+                    student_embs,
+                    teacher_embs,
+                    reduction='none'
+                ).mean(dim=1)
+                total_huber += huber_losses.sum()
+
+                cos_sims = F.cosine_similarity(student_embs, teacher_embs, dim=-1)
+                cos_losses = (1 - cos_sims)
+                total_cos += cos_losses.sum()
+
+        # Normalize by token count
         if self.last_alignment_stats['text_aligned'] > 0:
             huber_loss = total_huber / self.last_alignment_stats['text_aligned']
             cos_loss = total_cos / self.last_alignment_stats['text_aligned']
@@ -874,163 +968,6 @@ class AlignmentLoss(torch.nn.Module):
         )
 
         return total_loss, huber_loss, cos_loss, self.last_alignment_stats['text_aligned'], self.last_alignment_stats['cosine_filtered']
-
-class CosineAlignmentLoss(torch.nn.Module):
-    def __init__(self, huber_weight: float = 0.7, cosine_weight: float = 0.3,
-                 huber_delta: float = 1.0, temperature: float = 0.5,
-                 similarity_threshold: float = 0.8,
-                 window_size: int = 5,
-                 use_approximate_position: bool = True,
-                 iterate_student: bool = True):
-        super().__init__()
-        self.huber_weight = huber_weight
-        self.cosine_weight = cosine_weight
-        self.huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction='mean')
-        self.temperature = temperature
-        self.similarity_threshold = similarity_threshold
-        self.use_approximate_position = use_approximate_position
-        self.iterate_student = iterate_student
-        self.window_size = window_size
-
-    def forward(self, student_output: torch.Tensor, teacher_output: torch.Tensor,
-                student_mask: torch.Tensor, teacher_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        device = student_output.device
-        batch_size = student_output.size(0)
-
-        # Initialize loss accumulators
-        total_huber = torch.tensor(0.0, device=device)
-        total_cos = torch.tensor(0.0, device=device)
-        num_cosine_aligned = 0
-
-        for i in range(batch_size):
-            # Get actual tokens (not padded)
-            t_indices = (teacher_mask[i] == 1).nonzero(as_tuple=True)[0]
-            s_indices = (student_mask[i] == 1).nonzero(as_tuple=True)[0]
-
-            if len(t_indices) == 0 or len(s_indices) == 0:
-                continue
-
-            # Cosine similarity-based alignment
-            cosine_aligned_pairs = []
-
-            if self.iterate_student:  # Iterate through student tokens
-                # Create a set to track which teacher positions have been aligned
-                aligned_teacher_positions = set()
-
-                # Attempt cosine alignment for each STUDENT token
-                for s_idx in s_indices:
-                    # Find candidate teacher positions
-                    if self.use_approximate_position:
-                        # Approximate position with forwards+backwards window
-                        t_pos_approx = int(s_idx * len(t_indices) / len(s_indices))
-                        t_start = max(0, t_pos_approx - self.window_size)
-                        t_end = min(len(t_indices), t_pos_approx + self.window_size + 1)
-                    else:
-                        # Same position with forwards window only
-                        t_pos = int(s_idx * len(t_indices) / len(s_indices))
-                        t_start = t_pos
-                        t_end = min(len(t_indices), t_pos + self.window_size + 1)
-
-                    if t_start >= t_end:
-                        continue
-
-                    # Get all teacher candidates in window
-                    window_teachers = teacher_output[i, t_start:t_end]
-                    student_emb = student_output[i, s_idx:s_idx+1]
-
-                    # Normalize embeddings for cosine similarity
-                    window_teachers_norm = F.normalize(window_teachers, p=2, dim=-1)
-                    student_emb_norm = F.normalize(student_emb, p=2, dim=-1)
-
-                    # Find best match by cosine similarity
-                    similarities = F.cosine_similarity(
-                        window_teachers_norm, student_emb_norm, dim=-1
-                    )
-
-                    if similarities.numel() > 0:
-                        max_sim, best_idx = torch.max(similarities, dim=0)
-                        if max_sim > self.similarity_threshold:
-                            global_teacher_idx = t_start + best_idx
-                            if global_teacher_idx not in aligned_teacher_positions:
-                                cosine_aligned_pairs.append((s_idx.item(), global_teacher_idx))
-                                aligned_teacher_positions.add(global_teacher_idx)
-
-            else:  # Iterate through teacher tokens
-                # Create a set to track which student positions have been aligned
-                aligned_student_positions = set()
-
-                # Attempt cosine alignment for each TEACHER token
-                for t_idx in t_indices:
-                    # Find candidate student positions
-                    if self.use_approximate_position:
-                        # Approximate position with forwards+backwards window
-                        s_pos_approx = int(t_idx * len(s_indices) / len(t_indices))
-                        s_start = max(0, s_pos_approx - self.window_size)
-                        s_end = min(len(s_indices), s_pos_approx + self.window_size + 1)
-                    else:
-                        # Same position with forwards window only
-                        s_pos = int(t_idx * len(s_indices) / len(t_indices))
-                        s_start = s_pos
-                        s_end = min(len(s_indices), s_pos + self.window_size + 1)
-
-                    if s_start >= s_end:
-                        continue
-
-                    # Get all student candidates in window
-                    window_students = student_output[i, s_start:s_end]
-                    teacher_emb = teacher_output[i, t_idx:t_idx+1]
-
-                    # Normalize embeddings for cosine similarity
-                    window_students_norm = F.normalize(window_students, p=2, dim=-1)
-                    teacher_emb_norm = F.normalize(teacher_emb, p=2, dim=-1)
-
-                    # Find best match by cosine similarity
-                    similarities = F.cosine_similarity(
-                        window_students_norm, teacher_emb_norm, dim=-1
-                    )
-
-                    if similarities.numel() > 0:
-                        max_sim, best_idx = torch.max(similarities, dim=0)
-                        if max_sim > self.similarity_threshold:
-                            global_student_idx = s_start + best_idx
-                            # Check if student position already aligned
-                            already_aligned = any(pair[0] == global_student_idx for pair in cosine_aligned_pairs)
-                            if not already_aligned:
-                                cosine_aligned_pairs.append((global_student_idx, t_idx.item()))
-
-            # Calculate losses for all aligned pairs
-            for (stu_idx, tea_idx) in cosine_aligned_pairs:
-                if stu_idx < len(s_indices) and tea_idx < len(t_indices):
-                    student_emb = student_output[i, stu_idx]
-                    teacher_emb = teacher_output[i, tea_idx]
-
-                    # Calculate Huber loss on original embeddings
-                    huber_loss = self.huber_loss(student_emb, teacher_emb)
-                    total_huber += huber_loss
-
-                    # Calculate cosine similarity
-                    cos_sim = F.cosine_similarity(student_emb.unsqueeze(0), teacher_emb.unsqueeze(0), dim=-1).squeeze()
-                    cos_sim = torch.clamp(cos_sim, min=-0.99, max=0.99)
-                    cos_loss = (1 - cos_sim) / self.temperature
-                    total_cos += cos_loss
-
-            # Count alignments
-            num_cosine_aligned += len(cosine_aligned_pairs)
-
-        # Normalize by token count only if we have alignments
-        if num_cosine_aligned > 0:
-            huber_loss = total_huber / num_cosine_aligned
-            cos_loss = total_cos / num_cosine_aligned
-        else:
-            huber_loss = torch.tensor(0.0, device=device)
-            cos_loss = torch.tensor(0.0, device=device)
-
-        total_loss = (
-            self.huber_weight * huber_loss +
-            self.cosine_weight * cos_loss
-        )
-
-        return total_loss, huber_loss, cos_loss, num_cosine_aligned
 
 class TokenLoss(torch.nn.Module):
     """Loss for token-level position matching with optional position targeting"""
@@ -1974,7 +1911,8 @@ def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
                current_lr_model: float, current_lr_proj: float,
                num_aligned_tokens: int, num_cosine_align_tokens: int,
                num_filtered_tokens: int,
-               elapsed: float, eta: float) -> str:
+               total_tokens_processed: int,  # Add this parameter
+               elapsed: float, eta: float) -> str:  # Add total_tokens_processed parameter
     """Generate logging string with dynamic loss reporting"""
     model_gn_line = ""
     model_lr_line = ""
@@ -2009,14 +1947,13 @@ def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
     if TEXT_ALIGN_HUBER_WEIGHT > 0 or TEXT_ALIGN_COSINE_WEIGHT > 0:
         loss_lines.append(f"Text Align Huber: {current_align_huber:.6f}")
         loss_lines.append(f"Text Align Cosine: {current_align_cos:.6f}")
-        loss_lines.append(f"Num Text Aligned: {num_aligned_tokens}")
+        loss_lines.append(f"Num Text Aligned: {num_aligned_tokens} / {total_tokens_processed}")
         if TEXT_ALIGN_COSINE_GUARANTEE:
             loss_lines.append(f"Num Filtered: {num_filtered_tokens}")
     if COSINE_ALIGN_HUBER_WEIGHT > 0 or COSINE_ALIGN_COSINE_WEIGHT > 0:
         loss_lines.append(f"Cosine Align Huber: {current_cos_align_huber:.6f}")
-        loss_lines.append(f"Cosine Aligm Cosine: {current_cos_align_cos:.6f}")
+        loss_lines.append(f"Cosine Align Cosine: {current_cos_align_cos:.6f}")
         loss_lines.append(f"Num Cosine Aligned: {num_cosine_align_tokens}")
-
 
     loss_str = ", ".join(loss_lines)
 
@@ -2108,13 +2045,17 @@ def main():
             iterate_student=TEXT_ITERATE_STUDENT,
             cosine_guarantee=TEXT_ALIGN_COSINE_GUARANTEE,
             cosine_threshold=TEXT_ALIGN_COSINE_THRESHOLD,
+            cosine_fallback=TEXT_ALIGN_COSINE_FALLBACK,
+            cosine_fallback_threshold=TEXT_ALIGN_COSINE_FALLBACK_THRESHOLD,
+            fuzzy_fallback=TEXT_ALIGN_FUZZY_FALLBACK,
+            fuzzy_cosine_threshold=TEXT_ALIGN_FUZZY_COSINE_THRESHOLD,
         ).to(device, dtype=torch.bfloat16)
 
     if COSINE_ALIGN_HUBER_WEIGHT > 0 or COSINE_ALIGN_COSINE_WEIGHT > 0:
         cosine_align_loss_fn = CosineAlignmentLoss(
             huber_weight=COSINE_ALIGN_HUBER_WEIGHT,
             cosine_weight=COSINE_ALIGN_COSINE_WEIGHT,
-            similarity_threshold=ALIGN_SIMILARITY_THRESHOLD,
+            similarity_threshold=COSINE_ALIGN_SIMILARITY_THRESHOLD,
             window_size=ALIGN_WINDOW,
             use_approximate_position=COSINE_USE_APPROXIMATE_POSITION,
             iterate_student=COSINE_ITERATE_STUDENT,
@@ -2448,6 +2389,11 @@ def main():
                             else:
                                 current_lr_proj = 0.0
 
+                            if align_loss_fn is not None:
+                                total_tokens_processed = align_loss_fn.last_alignment_stats['total_tokens_processed']
+                            else:
+                                total_tokens_processed = 0
+
                             if PRINT_EVERY_X_STEPS > 0 and global_step % PRINT_EVERY_X_STEPS == 0:
                                 print(get_logging(
                                     epoch, batch_idx, global_step, total_steps,
@@ -2460,6 +2406,7 @@ def main():
                                     current_lr_model, current_lr_proj,
                                     text_aligned, cosine_aligned,
                                     filtered_tokens,
+                                    total_tokens_processed,
                                     elapsed, eta
                                 ))
 
@@ -2475,6 +2422,7 @@ def main():
                                     current_lr_model, current_lr_proj,
                                     text_aligned, cosine_aligned,
                                     filtered_tokens,
+                                    total_tokens_processed,
                                     elapsed, eta
                                 ))
                                 if global_step % WRITE_TO_LOG_EVERY_X_STEPS == 0:
