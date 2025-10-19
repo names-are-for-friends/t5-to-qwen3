@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v8/restart_2/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v60/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v61/restart_2/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v62/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -51,14 +51,14 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 1e-5
-MIN_LEARNING_RATE_MODEL = 1e-6
-MAX_LEARNING_RATE_TRANSFORMER = 8e-5
-MIN_LEARNING_RATE_TRANSFORMER = 8e-6
-MAX_LEARNING_RATE_MLP = 10e-5
-MIN_LEARNING_RATE_MLP = 10e-6
-MAX_LEARNING_RATE_LINEAR = 12e-5
-MIN_LEARNING_RATE_LINEAR = 12e-6
+MAX_LEARNING_RATE_MODEL = 5e-5
+MIN_LEARNING_RATE_MODEL = 5e-6
+MAX_LEARNING_RATE_TRANSFORMER = 9e-5
+MIN_LEARNING_RATE_TRANSFORMER = 9e-6
+MAX_LEARNING_RATE_MLP = 11e-5
+MIN_LEARNING_RATE_MLP = 11e-6
+MAX_LEARNING_RATE_LINEAR = 13e-5
+MIN_LEARNING_RATE_LINEAR = 13e-6
 MAX_LEARNING_RATE_INTERPOLATION = 10e-5
 MIN_LEARNING_RATE_INTERPOLATION = 10e-6
 
@@ -83,7 +83,7 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Alignment options
-ALIGN_WINDOW = 2 # We look this many tokens ahead for finding a matching token (also backwards if using approx position, so adjust accordingly)
+ALIGN_WINDOW = 3 # We look this many tokens ahead for finding a matching token (also backwards if using approx position, so adjust accordingly)
 
 TEXT_ALIGN_COSINE_GUARANTEE = True # Only accept text align matches with sufficient cosine similarity. Prevents incorrect matches from dominating loss as general alignment progresses and correct match losses are minimised
 TEXT_ALIGN_COSINE_THRESHOLD = 0.70 # Cosine similarity threshold to accept text alignment match
@@ -93,8 +93,8 @@ TEXT_ITERATE_STUDENT = True # Iterate through student tokens, looking for teache
 TEXT_ALIGN_FUZZY_FALLBACK = False # Unaligned tokens will be run through a fuzzy text matching process to maximise representation. Occurs prior to cosine fallback
 TEXT_ALIGN_FUZZY_COSINE_THRESHOLD = 0.80
 
-TEXT_ALIGN_COSINE_FALLBACK = True # Unaligned tokens will be run through a further cosine similarity matching process to maximise representation
-TEXT_ALIGN_COSINE_FALLBACK_THRESHOLD = 0.80
+TEXT_ALIGN_COSINE_FALLBACK = False # Unaligned tokens will be run through a further cosine similarity matching process to maximise representation
+TEXT_ALIGN_COSINE_FALLBACK_THRESHOLD = 0.95
 
 COSINE_USE_APPROXIMATE_POSITION = True
 COSINE_ITERATE_STUDENT = True
@@ -102,7 +102,7 @@ COSINE_ALIGN_SIMILARITY_THRESHOLD = 0.80 # Higher = stricter matching for cosine
 
 # Scheduler
 WARMUP_STEPS = 0
-RESTART_CYCLE_STEPS = 500
+RESTART_CYCLE_STEPS = 1000
 REPEAT_WARMUP_AFTER_RESTART = False
 
 # Dataset
@@ -131,7 +131,7 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = False
+TRAIN_MODEL = True
 
 # Layer arrangement
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
@@ -184,12 +184,12 @@ PROJECTION_LAYERS_CONFIG = [
     {
         "type": "mlp",
         "input_dim": 1024,
-        "hidden_dim": 1024,
+        "hidden_dim": 4096,
         "file_num": 8,
     },
     {
         "type": "linear",
-        "input_dim": 1024,
+        "input_dim": 4096,
         "output_dim": 4096,
         "file_num": 9,
     },
@@ -954,13 +954,15 @@ class AlignmentLoss(torch.nn.Module):
                 cos_losses = (1 - cos_sims)
                 total_cos += cos_losses.sum()
 
-        # Normalize by token count
         if self.last_alignment_stats['text_aligned'] > 0:
             huber_loss = total_huber / self.last_alignment_stats['text_aligned']
             cos_loss = total_cos / self.last_alignment_stats['text_aligned']
         else:
-            huber_loss = torch.tensor(0.0, device=device)
-            cos_loss = torch.tensor(0.0, device=device)
+            # Create zero tensors with gradient tracking
+            huber_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            cos_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            # Print warning for user
+            print("Warning: No aligned tokens found in this batch. Consider disabling cosine guarantee or adjusting thresholds.")
 
         total_loss = (
             self.huber_weight * huber_loss +
@@ -987,7 +989,7 @@ class TokenLoss(torch.nn.Module):
         position_mask = teacher_mask.bool()
 
         if not position_mask.any():
-            return torch.tensor(0.0, device=student_output.device), torch.tensor(0.0, device=student_output.device), torch.tensor(0.0, device=student_output.device), 0
+            return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device, requires_grad=True), 0
 
         # Flatten for easier computation
         student_flat = student_output.view(-1, student_output.size(-1))
@@ -1034,7 +1036,7 @@ class SequenceLoss(torch.nn.Module):
         position_mask = teacher_mask.bool()
 
         if not position_mask.any():
-            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0
+            return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device, requires_grad=True), 0
 
         # Apply position mask to embeddings
         masked_student = student_output * position_mask.unsqueeze(-1)
@@ -1681,7 +1683,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                         student_input_ids=s_input_ids,
                         teacher_input_ids=t_input_ids
                     )
-                    total_loss += align_loss
+                    eval_loss += align_loss
                     align_huber_loss = align_huber
                     align_cos_loss = align_cos
                     num_aligned_tokens = text_aligned
@@ -1693,7 +1695,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                         s_mask,
                         t_mask
                     )
-                    total_loss += cosine_align_loss
+                    eval_loss += cosine_align_loss
                     cosine_align_huber_loss = cosine_align_huber
                     cosine_align_cos_loss = cosine_align_cos
                     num_cosine_align_tokens = cosine_aligned
