@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
 T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
-USE_T5_MASK_WITH_QWEN = True # It's recommended to use the T5 mask with our trained model, so leave this on
+USE_T5_MASK_WITH_QWEN = False # Unless interpolating the output sequence length, use the Qwen mask
 QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0
 
 # === Configuration Dataclasses ===
