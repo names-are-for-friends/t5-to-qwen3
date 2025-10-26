@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v32/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v60/restart_12/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -38,9 +38,9 @@ DEFAULT_RESOLUTION = [512,512]
 DEFAULT_OUTPUT_FILE = "output/q3"
 APPEND_DATETIME = True
 
-T5_ADDITIONAL_PADDING_ATTENTION = 0 # Unmask specified padding amount when using T5-xxl
-USE_T5_MASK_WITH_QWEN = False # Unless interpolating the output sequence length, use the Qwen mask
-QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION = 0
+T5_MASK_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5 mask (including with Qwen)
+USE_T5_MASK_WITH_QWEN = False
+QWEN_MASK_ADDITIONAL_PADDING_ATTENTION = 1
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -610,11 +610,14 @@ class Chroma(Module):
         with torch.no_grad():
             if use_padding_modification:
                 txt_mask_w_padding = modify_mask_to_attend_padding(
-                    txt_mask, max_len, T5_ADDITIONAL_PADDING_ATTENTION
+                    txt_mask, max_len, T5_MASK_ADDITIONAL_PADDING_ATTENTION
                 )
                 txt_mask_w_padding = txt_mask_w_padding.to(img.device)
             else:
-                txt_mask_w_padding = txt_mask.to(img.device)
+                txt_mask_w_padding = modify_mask_to_attend_padding(
+                    txt_mask, max_len, QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
+                )
+                txt_mask_w_padding = txt_mask_w_padding.to(img.device)
 
             txt_img_mask = torch.cat(
                 [
@@ -1151,6 +1154,213 @@ class LearnedInterpolationLayer(torch.nn.Module):
 
         return output
 
+class CrossAttentionProjectionLayer(torch.nn.Module):
+    """
+    Cross-attention projection layer that can be used in inference without teacher embeddings.
+    During training, it uses teacher embeddings for attention. During inference, it uses
+    self-attention or cached attention patterns.
+    """
+    def __init__(self, student_dim: int, teacher_dim: int, hidden_dim: int,
+                 num_heads: int = 8, max_length: int = 512):
+        super().__init__()
+        self.student_dim = student_dim
+        self.teacher_dim = teacher_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.max_length = max_length
+        self.layer_type = "cross_attention"
+
+        # Input projections to common dimension
+        self.student_proj = torch.nn.Linear(student_dim, hidden_dim)
+        self.teacher_proj = torch.nn.Linear(teacher_dim, hidden_dim)
+
+        # Cross-attention mechanism
+        self.cross_attention = torch.nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+
+        # Self-attention for refinement (used in both training and inference)
+        self.self_attention = torch.nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+
+        # Layer normalizations
+        self.norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.norm2 = torch.nn.LayerNorm(hidden_dim)
+        self.norm3 = torch.nn.LayerNorm(hidden_dim)
+
+        # Feed-forward network
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim * 4),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(hidden_dim * 4, hidden_dim),
+            torch.nn.Dropout(0.1)
+        )
+
+        # Inference mode components
+        self.inference_mode = False
+        self.attention_cache = None
+
+        # Learnable "teacher-like" embeddings for inference
+        self.teacher_like_embeddings = torch.nn.Parameter(
+            torch.randn(max_length, hidden_dim) * 0.02
+        )
+
+        # Position encoding
+        self.pos_encoding = torch.nn.Embedding(max_length, hidden_dim)
+
+        # Gate to control cross vs self attention
+        self.attention_gate = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim * 2, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, 1),
+            torch.nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor, s_mask: torch.Tensor = None,
+                t_mask: torch.Tensor = None, teacher_emb: torch.Tensor = None,
+                use_cache: bool = False) -> torch.Tensor:
+        """
+        Forward pass with different behavior for training vs inference.
+
+        Args:
+            x: Input embeddings [batch_size, seq_len, student_dim]
+            s_mask: Student mask [batch_size, seq_len]
+            t_mask: Teacher mask [batch_size, teacher_seq_len] (training only)
+            teacher_emb: Teacher embeddings [batch_size, teacher_seq_len, teacher_dim] (training only)
+            use_cache: Whether to use cached attention patterns (inference)
+        """
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
+        # Add position encoding
+        pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        x = x + self.pos_encoding(pos_ids)
+
+        # Project student embeddings
+        student_proj = self.student_proj(x)  # [B, S, H]
+        student_proj = self.norm1(student_proj)
+
+        if self.training and teacher_emb is not None:
+            # Training mode: use actual teacher embeddings
+            return self._forward_train(student_proj, x, teacher_emb, s_mask, t_mask)
+        else:
+            # Inference mode: use learned patterns
+            return self._forward_inference(student_proj, x, s_mask, use_cache)
+
+    def _forward_train(self, student_proj: torch.Tensor, original_x: torch.Tensor,
+                      teacher_emb: torch.Tensor, s_mask: torch.Tensor,
+                      t_mask: torch.Tensor) -> torch.Tensor:
+        """Training forward pass with real teacher embeddings"""
+        batch_size, seq_len, _ = student_proj.shape
+
+        # Project teacher embeddings
+        teacher_proj = self.teacher_proj(teacher_emb)  # [B, T, H]
+        teacher_proj = self.norm1(teacher_proj)
+
+        # Cross-attention: student attends to teacher
+        cross_out, cross_weights = self.cross_attention(
+            query=student_proj,
+            key=teacher_proj,
+            value=teacher_proj,
+            key_padding_mask=~(t_mask.bool() if t_mask is not None else torch.ones_like(t_mask, dtype=bool, device=teacher_proj.device)),
+            need_weights=True
+        )  # [B, S, H], [B, S, T]
+
+        # Combine with gate
+        gate_input = torch.cat([student_proj, cross_out], dim=-1)
+        gate = self.attention_gate(gate_input)
+        student_proj = student_proj * (1 - gate) + cross_out * gate
+        student_proj = self.norm2(student_proj)
+
+        # Cache attention pattern for potential inference use
+        if hasattr(self, 'cache_attention_pattern'):
+            self.cache_attention_pattern = cross_weights.detach()
+
+        return self._apply_self_attention_and_output(student_proj, original_x, s_mask)
+
+    def _forward_inference(self, student_proj: torch.Tensor, original_x: torch.Tensor,
+                          s_mask: torch.Tensor, use_cache: bool) -> torch.Tensor:
+        """Inference forward pass without teacher embeddings"""
+        batch_size, seq_len, _ = student_proj.shape
+
+        if use_cache and hasattr(self, 'cached_attention_pattern'):
+            # Use cached attention pattern from training
+            cached_pattern = self.cached_attention_pattern
+            if cached_pattern.shape[1] != seq_len:
+                # Interpolate to match current sequence length
+                cached_pattern = F.interpolate(
+                    cached_pattern.unsqueeze(1),
+                    size=(seq_len, cached_pattern.shape[-1]),
+                    mode='linear',
+                    align_corners=False
+                ).squeeze(1)
+
+            # Apply cached pattern to learned teacher-like embeddings
+            teacher_like = self.teacher_like_embeddings[:seq_len].unsqueeze(0).expand(batch_size, -1, -1)
+            cross_out = torch.bmm(cached_pattern, teacher_like)
+
+        else:
+            # Use self-attention as fallback
+            cross_out, _ = self.self_attention(
+                query=student_proj,
+                key=student_proj,
+                value=student_proj,
+                key_padding_mask=~(s_mask.bool() if s_mask is not None else torch.ones_like(s_mask, dtype=bool, device=student_proj.device)),
+                need_weights=False
+            )
+
+        # Combine with gate
+        gate_input = torch.cat([student_proj, cross_out], dim=-1)
+        gate = self.attention_gate(gate_input)
+        student_proj = student_proj * (1 - gate) + cross_out * gate
+        student_proj = self.norm2(student_proj)
+
+        return self._apply_self_attention_and_output(student_proj, original_x, s_mask)
+
+    def _apply_self_attention_and_output(self, student_proj: torch.Tensor,
+                                        original_x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Common post-processing for both training and inference"""
+        # Self-attention for refinement
+        self_out, _ = self.self_attention(
+            query=student_proj,
+            key=student_proj,
+            value=student_proj,
+            key_padding_mask=~(mask.bool() if mask is not None else torch.ones_like(mask, dtype=bool, device=student_proj.device)),
+            need_weights=False
+        )
+        student_proj = student_proj + self_out
+        student_proj = self.norm3(student_proj)
+
+        # Feed-forward network
+        ffn_out = self.ffn(student_proj)
+        student_proj = student_proj + ffn_out
+
+        return student_proj
+
+    def set_inference_mode(self, mode: bool = True):
+        """Set inference mode and prepare for deployment"""
+        self.inference_mode = mode
+        if mode:
+            # Prepare for inference by freezing attention patterns
+            if hasattr(self, 'cache_attention_pattern'):
+                self.eval()
+
+    def cache_attention_pattern(self, pattern: torch.Tensor):
+        """Manually cache attention pattern for inference"""
+        self.cached_attention_pattern = pattern.detach()
+
+    def get_output_dim(self) -> int:
+        """Return output dimension for layer configuration"""
+        return self.teacher_dim
+
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
     return torch.randn(
@@ -1537,12 +1747,6 @@ if __name__ == "__main__":
 
     tokenizer = load_t5_tokenizer(args.t5_folder)
 
-    if use_t5:
-        if not args.positive_prompt.strip():
-            args.positive_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
-        if not args.negative_prompt.strip():
-            args.negative_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
-
     # Tokenize and create embeddings
     text_inputs = tokenizer(
         [args.positive_prompt],
@@ -1584,12 +1788,13 @@ if __name__ == "__main__":
         t5_attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
         logger.info("Using Qwen3 for text embeddings")
         # Load Qwen3 model and projection to CUDA first
-        qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder)
 
         if not args.positive_prompt.strip():
             args.positive_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
         if not args.negative_prompt.strip():
             args.negative_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
+
+        qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder)
 
         # Tokenize and create embeddings
         text_inputs = tokenizer(
@@ -1653,7 +1858,7 @@ if __name__ == "__main__":
 
             use_t5 = True
 
-            T5_ADDITIONAL_PADDING_ATTENTION = QWEN_WITH_T5_MASK_ADDITIONAL_PADDING_ATTENTION
+            T5_MASK_ADDITIONAL_PADDING_ATTENTION = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
 
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
@@ -1662,7 +1867,7 @@ if __name__ == "__main__":
     if 'qwen3_model' in locals():
         del qwen3_model, projection_layers
     else:
-        del model
+        del t5_model
     torch.cuda.empty_cache()
 
     # Load Chroma model with memory optimization
