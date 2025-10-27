@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v1/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v4/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v5/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -113,22 +113,29 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = True
+TRAIN_MODEL = False
 
 # Layer arrangement
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [2,3]
 PROJECTION_LAYERS_CONFIG = [
+    {
+        "type": "transformer",
+        "input_dim": 1024,
+        "hidden_dim": 1024,
+        "dim_feedforward": 4096,
+        "file_num": 1,
+    },
     {
         "type": "mlp",
         "input_dim": 1024,
         "hidden_dim": 4096,
-        "file_num": 1,
+        "file_num": 2,
     },
     {
         "type": "linear",
         "input_dim": 4096,
         "output_dim": 4096,
-        "file_num": 2,
+        "file_num": 3,
     },
 ]
 
@@ -1714,26 +1721,48 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                 t_mask = t_mask.to(device)
                 s_mask = s_mask.to(device)
 
-                with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
-                    student_outputs = model(
-                        input_ids=s_input_ids,
-                        attention_mask=s_mask,
-                        output_hidden_states=True
-                    )
-                    student_hidden = student_outputs.hidden_states[-1]
-                    projected_student = student_hidden
+                if TRAIN_MODEL:
+                    with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                        student_outputs = student_model(
+                            input_ids=s_input_ids,
+                            attention_mask=s_mask,
+                            output_hidden_states=True
+                        )
+                        student_hidden = student_outputs.hidden_states[-1]
+                        projected_student = student_hidden
 
-                    # Pass teacher embeddings and masks to projection layers
-                    for layer in projection_layers:
-                        if isinstance(layer, LearnedInterpolationLayer):
-                            projected_student = layer(
-                                projected_student,
-                                s_mask=s_mask,
-                                t_mask=t_mask,
-                                target_length=512
-                            )
-                        else:
-                            projected_student = layer(projected_student)
+                        for layer in projection_layers:
+                            if isinstance(layer, LearnedInterpolationLayer):
+                                    projected_student = layer(
+                                        projected_student,
+                                        s_mask=s_mask,
+                                        t_mask=t_mask,
+                                        target_length=512
+                                    )
+                            else:
+                                projected_student = layer(projected_student)
+                else:
+                    # Use no_grad and only get last hidden state when not training model
+                    with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                        student_outputs = student_model(
+                            input_ids=s_input_ids,
+                            attention_mask=s_mask,
+                            output_hidden_states=True
+                        )
+                        student_hidden = student_outputs.hidden_states[-1]
+
+                    with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                        projected_student = student_hidden
+                        for layer in projection_layers:
+                            if isinstance(layer, LearnedInterpolationLayer):
+                                    projected_student = layer(
+                                        projected_student,
+                                        s_mask=s_mask,
+                                        t_mask=t_mask,
+                                        target_length=512
+                                    )
+                            else:
+                                projected_student = layer(projected_student)
 
                 eval_loss = torch.tensor(0.0, device=device)
                 eval_align_huber = torch.tensor(0.0, device=device)
@@ -1959,7 +1988,7 @@ def get_logging(epoch: int, batch_idx: int, global_step: int, total_steps: int,
         model_lr_line = f"Mod LR: {current_lr_model:.6f}, "
     if TRAIN_PROJECTION:
         proj_gn_line = f"GN Proj: {grad_norm_proj:.6f}, "
-        proj_lr_line = f"Avg Proj LR: {current_lr_proj:.6f}, "
+        proj_lr_line = f"Proj LR: {current_lr_proj:.6f}, "
     if LOG_VRAM_USAGE:
         vram_free, vram_total, vram_used = get_memory_usage()
         vram_line = f"VRAM: {vram_used:.0f}MiB / {vram_total:.0f}MiB, "
@@ -2226,25 +2255,48 @@ def main():
                         s_mask = s_mask.to(device)
                         t_mask = t_mask.to(device)
 
-                        with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
-                            student_outputs = student_model(
-                                input_ids=s_input_ids,
-                                attention_mask=s_mask,
-                                output_hidden_states=True
-                            )
-                            student_hidden = student_outputs.hidden_states[-1]
-                            projected_student = student_hidden
+                        if TRAIN_MODEL:
+                            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                student_outputs = student_model(
+                                    input_ids=s_input_ids,
+                                    attention_mask=s_mask,
+                                    output_hidden_states=True
+                                )
+                                student_hidden = student_outputs.hidden_states[-1]
+                                projected_student = student_hidden
 
-                            for layer in projection_layers:
-                                if isinstance(layer, LearnedInterpolationLayer):
-                                        projected_student = layer(
-                                            projected_student,
-                                            s_mask=s_mask,
-                                            t_mask=t_mask,
-                                            target_length=512
-                                        )
-                                else:
-                                    projected_student = layer(projected_student)
+                                for layer in projection_layers:
+                                    if isinstance(layer, LearnedInterpolationLayer):
+                                            projected_student = layer(
+                                                projected_student,
+                                                s_mask=s_mask,
+                                                t_mask=t_mask,
+                                                target_length=512
+                                            )
+                                    else:
+                                        projected_student = layer(projected_student)
+                        else:
+                            # Use no_grad and only get last hidden state when not training model
+                            with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                student_outputs = student_model(
+                                    input_ids=s_input_ids,
+                                    attention_mask=s_mask,
+                                    output_hidden_states=True
+                                )
+                                student_hidden = student_outputs.hidden_states[-1]
+
+                            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                projected_student = student_hidden
+                                for layer in projection_layers:
+                                    if isinstance(layer, LearnedInterpolationLayer):
+                                            projected_student = layer(
+                                                projected_student,
+                                                s_mask=s_mask,
+                                                t_mask=t_mask,
+                                                target_length=512
+                                            )
+                                    else:
+                                        projected_student = layer(projected_student)
 
                         if USE_CACHED_EMBEDDINGS:
                             teacher_hidden = t_embeddings.to(device).squeeze(1)
