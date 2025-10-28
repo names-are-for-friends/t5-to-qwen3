@@ -6,7 +6,11 @@
 
 A handy script for distillation training Qwen3 on T5-xxl output with an accompanying inference script for the Chroma image generation model. [Credit to lodestone-rock for the inference code](https://github.com/lodestone-rock/flow/tree/master), which was largely just taken and bundled together in one script for simplicity.
 
-Work-in-progress so don't expect everything to work at the moment. I'm working on getting sequence interpolation to work atm.
+Work-in-progress so don't expect everything to work at the moment. I'm still learning, so it's been hard-going, but I understand much more about the process now than I did at the beginning!
+
+In order to match tokens between the differing tokenizers, we first map the words and their corresponding absolute start and end positions, then iterate through the Qwen in-word tokens, looking at the same normalised word-interior position in the T5 word for a matching token via token text. This accomplishes roughly 80~85% matching tokens, so the tokenizers aren't TOO different (actually, based on experimentation, even 30~40% is not too sparse for decent alignment, but this is better). Then, we calculate mean pooling loss with the remaining unmatched in-word tokens, and as a final fallback we match remaining unmatched tokens with approximate position via length differential, in a window with cosine threshold. Final token coverage is almost 100%. Experimentation with weighting needs to follow, and you may have better results by reducing the word match weights, since mean pooling losses might dilute the direct token matching losses.
+
+Due to the small size of the 0.6B parameter Qwen3 Text Embedder model, you will need to bolt on additional transformer layers. I'm still experimenting to find the most efficient possible approach - hidden_dim = 1024, dim_feedforward = 4096 is likely the lowest you would want to go, with an MLP at 2048 or 4096 for refinement and a final linear layer to 4096. Transformer size exponentially increases with hidden_dim, but you might also want to try hidden_dim = 2048, dim_feedforward = 8192 for faster alignment. Again, I still haven't experimented sufficiently with this.
 
 ### Quick installation
 ---
