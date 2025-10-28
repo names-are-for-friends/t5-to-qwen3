@@ -26,6 +26,15 @@ You're recommended to use a 3.11 Python venv, as that's what I've been using.
 
 Configuration options are provided at the top of both scripts. You can pass a --t5 flag to the inference script to use T5-xxl instead.
 
+### VRAM Recommendation
+---
+
+24GB will have absolutely no problem running the script with a batch size of 32, unless you decide to pile up huge transformers (ie hidden_dim = 4096), as a lot of memory is allocated for these in training mode.
+
+16GB is viable, but you will probably want to reduce the batch size to 16, and/or exclusively use small transformer layers (ie. hidden_dim = 1024).
+
+12GB should work fine too if you are very conservative with batch size and, again, exclusively use small transformer layers. I wouldn't recommend going much lower than this, though.
+
 ### Credit
 ---
 - [lodestone-rock](https://huggingface.co/lodestones) for the inference script and the Chroma image generation model
