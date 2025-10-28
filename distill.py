@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v4/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v5/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v2/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v3/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -67,8 +67,8 @@ EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
 # Scheduler
-WARMUP_STEPS = 150
-RESTART_CYCLE_STEPS = 350
+WARMUP_STEPS = 500
+RESTART_CYCLE_STEPS = 2000
 REPEAT_WARMUP_AFTER_RESTART = False
 '''
 --Alignment weights & settings--
@@ -113,21 +113,21 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = False
+TRAIN_MODEL = True
 
 # Layer arrangement
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [2,3]
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
         "input_dim": 1024,
-        "hidden_dim": 1024,
-        "dim_feedforward": 4096,
+        "hidden_dim": 2048,
+        "dim_feedforward": 8192,
         "file_num": 1,
     },
     {
         "type": "mlp",
-        "input_dim": 1024,
+        "input_dim": 2048,
         "hidden_dim": 4096,
         "file_num": 2,
     },
@@ -1723,7 +1723,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
 
                 if TRAIN_MODEL:
                     with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
-                        student_outputs = student_model(
+                        student_outputs = model(
                             input_ids=s_input_ids,
                             attention_mask=s_mask,
                             output_hidden_states=True
@@ -1744,7 +1744,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                 else:
                     # Use no_grad and only get last hidden state when not training model
                     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
-                        student_outputs = student_model(
+                        student_outputs = model(
                             input_ids=s_input_ids,
                             attention_mask=s_mask,
                             output_hidden_states=True
