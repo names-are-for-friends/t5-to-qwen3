@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v2/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v3/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v3/restart_6"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v4/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -67,8 +67,8 @@ EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
 # Scheduler
-WARMUP_STEPS = 500
-RESTART_CYCLE_STEPS = 2000
+WARMUP_STEPS = 150
+RESTART_CYCLE_STEPS = 350
 REPEAT_WARMUP_AFTER_RESTART = False
 '''
 --Alignment weights & settings--
@@ -78,8 +78,8 @@ For remaining unmatched tokens (due to differing tokenization) we take mean-pool
 '''
 TEXT_MATCH_HUBER_WEIGHT = 0.70
 TEXT_MATCH_COSINE_WEIGHT = 0.30
-WORD_MATCH_HUBER_WEIGHT = 0.70
-WORD_MATCH_COSINE_WEIGHT = 0.30
+WORD_MATCH_HUBER_WEIGHT = 0.35
+WORD_MATCH_COSINE_WEIGHT = 0.15
 
 # Basic weights
 TOKEN_HUBER_WEIGHT = 0.00
@@ -113,10 +113,10 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = True
+TRAIN_MODEL = False
 
 # Layer arrangement
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [1,2,3]
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
@@ -136,6 +136,25 @@ PROJECTION_LAYERS_CONFIG = [
         "input_dim": 4096,
         "output_dim": 4096,
         "file_num": 3,
+    },
+    {
+        "type": "transformer",
+        "input_dim": 4096,
+        "hidden_dim": 2048,
+        "dim_feedforward": 8192,
+        "file_num": 4,
+    },
+    {
+        "type": "mlp",
+        "input_dim": 2048,
+        "hidden_dim": 4096,
+        "file_num": 5,
+    },
+    {
+        "type": "linear",
+        "input_dim": 4096,
+        "output_dim": 4096,
+        "file_num": 6,
     },
 ]
 
@@ -1550,12 +1569,14 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 )
                 projection_layer.load_state_dict(state_dict)
                 print(f"Loading existing linear layer {file_num}")
+                projection_layer.is_new = False
             else:
                 projection_layer = LinearProjectionLayer(
                     input_dim=input_dim,
                     output_dim=output_dim
                 )
                 print(f"Initialising new linear layer {file_num}")
+                projection_layer.is_new = True
             projection_layer.output_dim = output_dim
 
         elif layer_config["type"] == "mlp":
@@ -1568,12 +1589,14 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 )
                 projection_layer.load_state_dict(state_dict)
                 print(f"Loading existing MLP layer {file_num}")
+                projection_layer.is_new = False
             else:
                 projection_layer = MLPProjectionLayer(
                     input_dim=input_dim,
                     hidden_dim=output_dim,
                 )
                 print(f"Initialising new MLP layer {file_num}")
+                projection_layer.is_new = True
             projection_layer.output_dim = output_dim
 
         elif layer_config["type"] == "transformer":
@@ -1588,6 +1611,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 )
                 projection_layer.load_state_dict(state_dict)
                 print(f"Loading existing transformer layer {file_num}")
+                projection_layer.is_new = False
             else:
                 projection_layer = TransformerProjectionLayer(
                     input_dim=input_dim,
@@ -1595,6 +1619,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                     dim_feedforward=dim_feedforward,
                 )
                 print(f"Initialising new transformer layer {file_num}")
+                projection_layer.is_new = True
             projection_layer.output_dim = output_dim
 
         elif layer_config["type"] == "interpolation":
@@ -1608,6 +1633,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 )
                 projection_layer.load_state_dict(state_dict)
                 print(f"Loading existing interpolation layer {file_num}")
+                projection_layer.is_new = False
             else:
                 projection_layer = LearnedInterpolationLayer(
                     input_dim=input_dim,
@@ -1615,6 +1641,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                     max_length=512
                 )
                 print(f"Initialising new interpolation layer {file_num}")
+                projection_layer.is_new = True
             projection_layer.output_dim = output_dim
 
         projection_layer.file_num = layer_config["file_num"]
@@ -1855,7 +1882,7 @@ def save_optimizer_states(save_path: str, model_optimizer, projection_optimizer)
     if projection_optimizer is not None:
         torch.save(projection_optimizer.state_dict(), os.path.join(optimizer_dir, "projection_optimizer.pt"))
 
-def load_optimizer_states(save_path: str, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection) -> bool:
+def load_optimizer_states(save_path: str, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection, new_layer_exists) -> bool:
     """Load optimizer states from a subfolder if available"""
     if not REUSE_OPTIMIZER_STATE or not projection_optimizer:
         return False
@@ -1887,12 +1914,16 @@ def load_optimizer_states(save_path: str, model_optimizer, scheduler_model, proj
     opt_path = os.path.join(optimizer_dir, "projection_optimizer.pt")
     if os.path.exists(opt_path):
         try:
-            projection_optimizer.load_state_dict(torch.load(opt_path))
-            # Reset learning rate to current scheduler value
-            if scheduler_projection is not None:
-                for param_group, lr in zip(projection_optimizer.param_groups, scheduler_projection.get_last_lr()):
-                    param_group['lr'] = lr
-            print("Loaded projection optimizer state")
+            # Discard projection optimizer state if new proj layer loaded
+            if not new_layer_exists:
+                projection_optimizer.load_state_dict(torch.load(opt_path))
+                # Reset learning rate to current scheduler value
+                if scheduler_projection is not None:
+                    for param_group, lr in zip(projection_optimizer.param_groups, scheduler_projection.get_last_lr()):
+                        param_group['lr'] = lr
+                print("Loaded projection optimizer state")
+            else:
+                print("Discarded projection optimizer state due to new layer initialisation")
         except Exception as e:
             print(f"Warning: Failed to load projection optimizer state: {e}")
             success = False
@@ -2195,11 +2226,14 @@ def main():
             projection_optimizer = None
             scheduler_projection = None
             projection_parameters = []
+            new_layer_exists = False
             if TRAIN_PROJECTION:
                 for projection_layer in projection_layers:
                     for p in projection_layer.parameters():
                         if p.requires_grad:
                             projection_parameters.append(p)
+                    if layer.is_new == True:
+                        new_layer_exists = True
                 projection_optimizer, scheduler_projection = initialize_optimizer(projection_parameters, MAX_LEARNING_RATE_PROJ, MIN_LEARNING_RATE_PROJ)
 
             model_optimizer = None
@@ -2208,7 +2242,7 @@ def main():
                 model_parameters = [p for p in student_model.parameters() if p.requires_grad]
                 model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
 
-            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_NAME, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection):
+            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_NAME, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection, new_layer_exists):
                 # Update learning rates to match scheduler current state
                 if TRAIN_MODEL and scheduler_model:
                     for param_group, lr in zip(model_optimizer.param_groups, scheduler_model.get_last_lr()):
