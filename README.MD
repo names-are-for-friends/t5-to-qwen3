@@ -20,8 +20,6 @@ pip install -r requirements.txt
 ```
 Currently, the script is only tested on Linux, so I don't know if there are any incompatibilities with Windows.
 
-Provided default settings will run on 24GB VRAM with cached T5-xxl embeddings and the 0.6B Qwen3 model. 16GB should work, possibly with adjusted batch_size. Maybe 12GB too.
-
 You're recommended to use a 3.11 Python venv, as that's what I've been using. 
 
 Configuration options are provided at the top of both scripts. You can pass a --t5 flag to the inference script to use T5-xxl instead.
