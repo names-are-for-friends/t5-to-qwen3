@@ -959,7 +959,7 @@ class ActivationLayer(torch.nn.Module):
         return x
 
 class TransformerLayer(torch.nn.Module):
-    def __init__(self, dim_feedforward: int, num_layers: int = 1, hidden_size: int = 1024):
+    def __init__(self, dim_feedforward: int, hidden_size: int = 1024, num_layers: int = 1):
         super().__init__()
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=hidden_size,
@@ -1248,17 +1248,16 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
     for layer_config in projection_config["layers"]:
         if layer_config["type"] == "linear":
             layer = LinearLayer(
-                output_dim_prev,
-                layer_config["output_dim"],
+                input_dim=output_dim_prev,
+                output_dim=layer_config["output_dim"],
             )
             output_dim_prev = layer_config["output_dim"]
         elif layer_config["type"] == "activation":
             layer = ActivationLayer()
         elif layer_config["type"] == "transformer":
             layer = TransformerLayer(
-                layer_config["dim_feedforward"],
-                layer_config["num_layers"],
-                output_dim_prev,
+                dim_feedforward=layer_config["dim_feedforward"],
+                hidden_size=output_dim_prev,
             )
 
         file_num = layer_config["file_num"]
@@ -1466,9 +1465,9 @@ if __name__ == "__main__":
             pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
             neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
         # Empty prompts should always have at least one padding token attended
-        if not args.positive_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_ATTENTION < 1:
+        if not args.positive_prompt.strip() and pos_add_pad < 1:
             pos_add_pad = 1
-        if not args.negative_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_ATTENTION < 1:
+        if not args.negative_prompt.strip() and neg_add_pad < 1:
             neg_add_pad = 1
 
         # Replace masked positions (attention=0) with padding token in student input and then attend
