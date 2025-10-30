@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v2/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -51,10 +51,10 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 5e-5
-MIN_LEARNING_RATE_MODEL = 5e-6
-MAX_LEARNING_RATE_PROJ = 1e-4
-MIN_LEARNING_RATE_PROJ = 1e-5
+MAX_LEARNING_RATE_MODEL = 8e-5
+MIN_LEARNING_RATE_MODEL = 8e-6
+MAX_LEARNING_RATE_PROJ = 15e-5
+MIN_LEARNING_RATE_PROJ = 15e-6
 
 # Saving
 SAVE_EVERY_X_STEPS = 0
@@ -88,7 +88,7 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Dataset
-SHUFFLE_DATASET = False
+SHUFFLE_DATASET = True
 
 # Optimizer state preservation
 REUSE_OPTIMIZER_STATE = True
@@ -96,20 +96,6 @@ SAVE_OPTIMIZER_STATES = True
 
 # Debugging
 LOG_VRAM_USAGE = True
-
-# Dropout - this could potentially be used to train the sequential interpolation layer to over-project and infer embedding space from context, but is untested
-ENABLE_STUDENT_WORD_DROPOUT = False
-STUDENT_WORD_DROPOUT_RATIO = 0.10
-ENABLE_STUDENT_TOKEN_DROPOUT = False
-STUDENT_TOKEN_DROPOUT_RATIO = 0.10
-SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
-
-# Enhanced dataset - experimental option that is likely not useful
-ENHANCED_DATASET = True
-ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
-UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50
-ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00
-ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
@@ -121,7 +107,6 @@ PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
         "dim_feedforward": 4096,
-        "num_layers": 10,
         "file_num": 1,
     },
     {
@@ -139,6 +124,21 @@ PROJECTION_LAYERS_CONFIG = [
         "file_num": 4,
     }
 ]
+
+# ========== Experimental/Unused Configuration ==========
+# Dropout - this could potentially be used to train sequential interpolation to over-project and infer embedding space from context, but is untested and not really useful at the moment
+ENABLE_STUDENT_WORD_DROPOUT = False
+STUDENT_WORD_DROPOUT_RATIO = 0.10
+ENABLE_STUDENT_TOKEN_DROPOUT = False
+STUDENT_TOKEN_DROPOUT_RATIO = 0.10
+SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
+
+# Enhanced dataset - experimental option that is not really useful at the moment
+ENHANCED_DATASET = True
+ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
+UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50
+ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00
+ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # ========== Projection Layers ==========
 class LinearLayer(torch.nn.Module):
@@ -1537,12 +1537,10 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
         elif layer_config["type"] == "transformer":
             hidden_size = output_dim_prev
             dim_feedforward = layer_config["dim_feedforward"]
-            num_layers = layer_config["num_layers"]
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
                 projection_layer = TransformerLayer(
                     dim_feedforward=dim_feedforward,
-                    num_layers=num_layers,
                     hidden_size=hidden_size,
                 )
                 projection_layer.load_state_dict(state_dict)
@@ -1551,7 +1549,6 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
             else:
                 projection_layer = TransformerLayer(
                     dim_feedforward=dim_feedforward,
-                    num_layers=num_layers,
                     hidden_size=hidden_size,
                 )
                 print(f"Initialising new transformer layer {file_num}")
