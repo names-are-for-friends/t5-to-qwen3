@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-embedder-ALL/saikou/QT-embedder-v60/restart_12/"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder/v11/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -40,7 +40,7 @@ APPEND_DATETIME = True
 
 T5_MASK_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5 mask (including with Qwen)
 USE_T5_MASK_WITH_QWEN = False
-QWEN_MASK_ADDITIONAL_PADDING_ATTENTION = 1
+QWEN_MASK_ADDITIONAL_PADDING_TOKENS = 1
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -577,7 +577,7 @@ class Chroma(Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
-    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor, attn_padding: int = 1, use_padding_modification: bool = False) -> Tensor:
+    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, txt_mask: Tensor, timesteps: Tensor, guidance: Tensor) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
@@ -608,20 +608,9 @@ class Chroma(Module):
 
         max_len = txt.shape[1]
         with torch.no_grad():
-            if use_padding_modification:
-                txt_mask_w_padding = modify_mask_to_attend_padding(
-                    txt_mask, max_len, T5_MASK_ADDITIONAL_PADDING_ATTENTION
-                )
-                txt_mask_w_padding = txt_mask_w_padding.to(img.device)
-            else:
-                txt_mask_w_padding = modify_mask_to_attend_padding(
-                    txt_mask, max_len, QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
-                )
-                txt_mask_w_padding = txt_mask_w_padding.to(img.device)
-
             txt_img_mask = torch.cat(
                 [
-                    txt_mask_w_padding,
+                    txt_mask,
                     torch.ones([img.shape[0], img_ids.shape[1]], device=txt_mask.device),
                 ],
                 dim=1,
@@ -1467,13 +1456,13 @@ def denoise_cfg(
         step_size = t_curr - t_prev
 
         # Positive prediction (guidance=0)
-        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
+        pred = model(img=img, img_ids=img_ids, txt=txt, txt_ids=txt_ids, txt_mask=txt_mask, timesteps=t_vec, guidance=guidance_vec)
 
         if step_count < first_n_steps_wo_cfg or first_n_steps_wo_cfg == -1:
             img = img - step_size * pred
         else:
             # Negative prediction (guidance=0)
-            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec, use_padding_modification=use_t5)
+            pred_neg = model(img=img, img_ids=img_ids, txt=neg_txt, txt_ids=neg_txt_ids, txt_mask=neg_txt_mask, timesteps=t_vec, guidance=guidance_vec)
             # CFG scaling by blending predictions
             pred_cfg = pred_neg + cfg * (pred - pred_neg)
             img = img - step_size * pred_cfg
@@ -1742,31 +1731,26 @@ if __name__ == "__main__":
     device = 'cuda'
     dtype = torch.bfloat16
 
-    # Choose text embedder based on flag
-    logger.info("Using T5-xxl for text embeddings")
-
-    tokenizer = load_t5_tokenizer(args.t5_folder)
-
     # Tokenize and create embeddings
-    text_inputs = tokenizer(
-        [args.positive_prompt],
-        padding="max_length",
-        max_length=args.max_length,
-        truncation=True,
-        return_tensors="pt"
-    ).to(device)
-
-    text_inputs_neg = tokenizer(
-        [args.negative_prompt],
-        padding="max_length",
-        max_length=args.max_length,
-        truncation=True,
-        return_tensors="pt"
-    ).to(device)
-
     if use_t5:
+        tokenizer = load_t5_tokenizer(args.t5_folder)
+        text_inputs = tokenizer(
+            [args.positive_prompt],
+            padding="max_length",
+            max_length=args.max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).to(device)
+
+        text_inputs_neg = tokenizer(
+            [args.negative_prompt],
+            padding="max_length",
+            max_length=args.max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).to(device)
         t5_model = load_t5_model(args.t5_folder)
-        attention_mask = text_inputs["attention_mask"].to(device).to(device)
+        attention_mask = text_inputs["attention_mask"].to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
         with torch.no_grad():
@@ -1784,16 +1768,6 @@ if __name__ == "__main__":
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
 
     else:
-        t5_attention_mask = text_inputs["attention_mask"].to(device).to(device)
-        t5_attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
-        logger.info("Using Qwen3 for text embeddings")
-        # Load Qwen3 model and projection to CUDA first
-
-        if not args.positive_prompt.strip():
-            args.positive_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
-        if not args.negative_prompt.strip():
-            args.negative_prompt = tokenizer.pad_token if tokenizer.pad_token else "<pad>"
-
         qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder)
 
         # Tokenize and create embeddings
@@ -1815,6 +1789,7 @@ if __name__ == "__main__":
             return_offsets_mapping=True
         ).to(qwen3_model.device)
 
+        # Get the attention masks
         attention_mask = text_inputs["attention_mask"].to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
@@ -1853,15 +1828,56 @@ if __name__ == "__main__":
                 embed_neg = layer(embed_neg)
 
         if USE_T5_MASK_WITH_QWEN:
-            attention_mask = t5_attention_mask
-            attention_mask_neg = t5_attention_mask_neg
+            tokenizer = load_t5_tokenizer(args.t5_folder)
+            text_inputs = tokenizer(
+                [args.positive_prompt],
+                padding="max_length",
+                max_length=args.max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).to(device)
+
+            text_inputs_neg = tokenizer(
+                [args.negative_prompt],
+                padding="max_length",
+                max_length=args.max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).to(device)
+            attention_mask = text_inputs["attention_mask"].to(device)
+            attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
             use_t5 = True
 
-            T5_MASK_ADDITIONAL_PADDING_ATTENTION = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
-
         text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
+
+    if tokenizer.pad_token_id is not None:
+        if use_t5:
+            pos_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
+            neg_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
+        else:
+            pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_TOKENS
+            neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_TOKENS
+        # Empty prompts should always have at least one padding token attended
+        if not args.positive_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_TOKENS < 1:
+            pos_add_pad = 1
+        if not args.negative_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_TOKENS < 1:
+            neg_add_pad = 1
+
+        # Replace masked positions (attention=0) with padding token in student input and then attend
+        if pos_add_pad > 0:
+            attention_mask = modify_mask_to_attend_padding(
+                attention_mask,
+                args.max_length,
+                num_extra_padding=pos_add_pad
+            )
+        if neg_add_pad > 0:
+            attention_mask_neg = modify_mask_to_attend_padding(
+                attention_mask_neg,
+                args.max_length,
+                num_extra_padding=neg_add_pad
+            )
 
     # Clear text models from CUDA memory
     if 'qwen3_model' in locals():
