@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder/v11/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder/v12/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -40,7 +40,7 @@ APPEND_DATETIME = True
 
 T5_MASK_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5 mask (including with Qwen)
 USE_T5_MASK_WITH_QWEN = False
-QWEN_MASK_ADDITIONAL_PADDING_TOKENS = 1
+QWEN_MASK_ADDITIONAL_PADDING_ATTENTION = 1
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -1857,12 +1857,12 @@ if __name__ == "__main__":
             pos_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
             neg_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
         else:
-            pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_TOKENS
-            neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_TOKENS
+            pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
+            neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
         # Empty prompts should always have at least one padding token attended
-        if not args.positive_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_TOKENS < 1:
+        if not args.positive_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_ATTENTION < 1:
             pos_add_pad = 1
-        if not args.negative_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_TOKENS < 1:
+        if not args.negative_prompt.strip() and QWEN_MASK_ADDITIONAL_PADDING_ATTENTION < 1:
             neg_add_pad = 1
 
         # Replace masked positions (attention=0) with padding token in student input and then attend
