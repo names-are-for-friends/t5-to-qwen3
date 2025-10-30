@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v10/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v11/"
+QWEN3_MODEL_NAME = "/mnt/f/models/Qwen3-Embedding-0.6B/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -78,8 +78,8 @@ For remaining unmatched tokens (due to differing tokenization) we take mean-pool
 '''
 TEXT_MATCH_HUBER_WEIGHT = 0.70
 TEXT_MATCH_COSINE_WEIGHT = 0.30
-WORD_MATCH_HUBER_WEIGHT = 0.35
-WORD_MATCH_COSINE_WEIGHT = 0.15
+WORD_MATCH_HUBER_WEIGHT = 0.00
+WORD_MATCH_COSINE_WEIGHT = 0.00
 
 # Basic weights
 TOKEN_HUBER_WEIGHT = 0.00
@@ -115,79 +115,56 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 TRAIN_PROJECTION = True
 TRAIN_MODEL = True
 
-# Layer arrangement
+# Layer arrangement - Qwen3 0.6B output is 1024 dim and only linear layers up-project this. Final output should be 4096 dim
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
-        "input_dim": 1024,
-        "hidden_dim": 2048,
-        "dim_feedforward": 8192,
+        "dim_feedforward": 4096,
+        "num_layers": 10,
         "file_num": 1,
     },
     {
-        "type": "mlp",
-        "input_dim": 2048,
-        "hidden_dim": 4096,
+        "type": "linear",
+        "output_dim": 2048,
         "file_num": 2,
     },
     {
-        "type": "linear",
-        "input_dim": 4096,
-        "output_dim": 4096,
+        "type": "activation",
         "file_num": 3,
     },
     {
-        "type": "transformer",
-        "input_dim": 4096,
-        "hidden_dim": 2048,
-        "dim_feedforward": 8192,
-        "file_num": 4,
-    },
-    {
-        "type": "mlp",
-        "input_dim": 2048,
-        "hidden_dim": 4096,
-        "file_num": 5,
-    },
-    {
         "type": "linear",
-        "input_dim": 4096,
         "output_dim": 4096,
-        "file_num": 6,
-    },
+        "file_num": 4,
+    }
 ]
 
 # ========== Projection Layers ==========
-class LinearProjectionLayer(torch.nn.Module):
+class LinearLayer(torch.nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.linear = torch.nn.Linear(input_dim, output_dim)
-        self.output_dim = output_dim
         self.layer_type = "linear"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
-class MLPProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+class ActivationLayer(torch.nn.Module):
+    def __init__(self):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         self.activation = torch.nn.GELU()
-        self.output_dim = hidden_dim
-        self.layer_type = "mlp"
+        self.layer_type = "activation"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.linear(x)
         x = self.activation(x)
         return x
 
-class TransformerProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, dim_feedforward: int, num_layers: int = 1):
+class TransformerLayer(torch.nn.Module):
+    def __init__(self, dim_feedforward: int, num_layers: int = 1, hidden_size: int = 1024):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         transformer_layer = torch.nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
+            d_model=hidden_size,
             nhead=8,
             dim_feedforward=dim_feedforward,
             dropout=0.0,
@@ -195,176 +172,11 @@ class TransformerProjectionLayer(torch.nn.Module):
             batch_first=True
         )
         self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.output_dim = hidden_dim
         self.layer_type = "transformer"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.linear(x)
         x = self.transformer(x)
         return x
-
-class LearnedInterpolationLayer(torch.nn.Module):
-    """Learned interpolation layer for stretching sequences using position-aware upsampling"""
-    def __init__(self, input_dim: int, teacher_dim: int, max_length: int = 512):
-        super().__init__()
-        self.input_dim = input_dim
-        self.teacher_dim = teacher_dim
-        self.max_length = max_length
-
-        # Position encodings for both sequences
-        self.student_pos_encoder = torch.nn.Embedding(max_length, input_dim)
-        self.teacher_pos_encoder = torch.nn.Embedding(max_length, teacher_dim)
-
-        # Learnable interpolation network using 1D convolution for upsampling
-        self.upsample_conv = torch.nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=teacher_dim,
-            kernel_size=3,
-            stride=1,
-            padding=1
-        )
-
-        # Learnable interpolation weights
-        self.weight_predictor = torch.nn.Sequential(
-            torch.nn.Linear(teacher_dim * 3, 512),  # student emb + 2 position embeddings
-            torch.nn.GELU(),
-            torch.nn.Linear(512, 3),  # weights for 3 points
-            torch.nn.Softmax(dim=-1)
-        )
-
-        # Refinement layers
-        self.refine = torch.nn.Sequential(
-            torch.nn.Linear(teacher_dim, teacher_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(teacher_dim, teacher_dim)
-        )
-
-        # Output projection
-        self.output_proj = torch.nn.Linear(teacher_dim, teacher_dim)
-        self.layer_norm = torch.nn.LayerNorm(teacher_dim)
-        self.output_dim = teacher_dim
-        self.layer_type = "interpolation"
-
-        # Add projection layer for dimension mismatch
-        if self.input_dim != self.teacher_dim:
-            self.input_to_teacher_proj = torch.nn.Linear(self.input_dim, self.teacher_dim)
-        else:
-            self.input_to_teacher_proj = None
-
-        # Add layer normalization at the end
-        self.final_norm = torch.nn.LayerNorm(teacher_dim)
-
-        # Initialize weights properly
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights to prevent collapse"""
-        for m in self.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0)
-            elif isinstance(m, torch.nn.Conv1d):
-                torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, torch.nn.Embedding):
-                torch.nn.init.normal_(m.weight, mean=0, std=0.02)
-
-    def forward(self, student_emb, s_mask, t_mask, target_length=512):
-        batch_size, s_len, _ = student_emb.shape
-        t_len = t_mask.sum(dim=1).max()
-
-        # Get actual sequence lengths
-        s_lens = s_mask.sum(dim=1)  # [B]
-        t_lens = t_mask.sum(dim=1)  # [B]
-
-        # Avoid division by zero and ensure at least one token
-        s_lens = s_lens.clamp(min=1)
-        t_lens = t_lens.clamp(min=1)
-
-        # Create position indices for the entire batch (using max lengths)
-        s_pos = torch.arange(s_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)  # [B, s_len]
-        t_pos = torch.arange(t_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)   # [B, t_len]
-
-        # Normalize positions to [0, 1] per batch
-        s_pos_norm = s_pos.float() / (s_lens.unsqueeze(1) - 1)  # [B, s_len]
-        t_pos_norm = t_pos.float() / (t_lens.unsqueeze(1) - 1)  # [B, t_len]
-
-        # Get position encodings
-        s_pos_emb = self.student_pos_encoder(s_pos)  # [B, s_len, input_dim]
-        t_pos_emb = self.teacher_pos_encoder(t_pos)  # [B, t_len, teacher_dim]
-
-        # Add position info to student embeddings
-        student_with_pos = student_emb + s_pos_emb
-
-        # Apply 1D convolution for initial upsampling (helps with local patterns)
-        student_conv = student_with_pos.transpose(1, 2)  # [B, input_dim, s_len]
-        upsampled = self.upsample_conv(student_conv)  # [B, teacher_dim, s_len]
-        upsampled = upsampled.transpose(1, 2)  # [B, s_len, teacher_dim]
-
-        # Project to teacher dimension if needed (using pre-initialized layer)
-        if self.input_to_teacher_proj is not None:
-            student_with_pos = self.input_to_teacher_proj(student_with_pos)
-
-        # For each teacher position, find 3 neighboring student positions for smooth interpolation
-        t_pos_scaled = t_pos_norm * (s_lens.unsqueeze(1) - 1)  # [B, t_len] - positions in student scale
-        t_pos_scaled = t_pos_scaled.long()  # [B, t_len]
-
-        # Calculate max valid index per batch (ensure non-negative)
-        max_index = (s_lens - 1).clamp(min=0)  # [B]
-
-        # Use tensors for min and max in clamp
-        min_val = torch.tensor(0, device=student_emb.device, dtype=torch.long)
-
-        # Get 3 neighboring indices (prev, current, next) with proper per-batch clamping
-        idx_prev = torch.clamp(t_pos_scaled - 1, min=min_val, max=max_index.unsqueeze(1))
-        idx_curr = torch.clamp(t_pos_scaled, min=min_val, max=max_index.unsqueeze(1))
-        idx_next = torch.clamp(t_pos_scaled + 1, min=min_val, max=max_index.unsqueeze(1))
-
-        # Gather embeddings at these indices
-        student_emb_prev = student_with_pos.gather(1, idx_prev.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-        student_emb_curr = student_with_pos.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-        student_emb_next = student_with_pos.gather(1, idx_next.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-
-        # Get corresponding upsampled embeddings
-        upsampled_curr = upsampled.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-
-        # Use learned weights to combine the 3 points
-        weight_input = torch.cat([student_emb_prev, student_emb_curr, student_emb_next], dim=-1)
-        weights = self.weight_predictor(weight_input)  # [B, t_len, 3]
-
-        # Interpolate
-        interpolated = (
-            weights[:, :, 0:1] * student_emb_prev +
-            weights[:, :, 1:2] * student_emb_curr +
-            weights[:, :, 2:3] * student_emb_next
-        )
-
-        # Blend with convolutional upsampling for better pattern preservation
-        blend_factor = 0.7  # Can be made learnable
-        interpolated = blend_factor * interpolated + (1 - blend_factor) * upsampled_curr
-
-        # Refine the interpolated sequence
-        interpolated = self.refine(interpolated)
-        interpolated = self.layer_norm(interpolated)
-
-        # Add teacher position encoding
-        interpolated = interpolated + t_pos_emb
-
-        # Final projection
-        output = self.output_proj(interpolated)
-
-        # Apply mask
-        output_mask = t_mask[:, :t_len].unsqueeze(-1)
-        output = output * output_mask
-
-        # Pad to target length if needed
-        if output.shape[1] < target_length:
-            padding = (0, 0, 0, target_length - output.shape[1])
-            output = F.pad(output, padding, 'constant', 0)
-
-        output = self.final_norm(output)
-
-        return output
 
 # ========== Token Alignment ==========
 def normalize_token(token):
@@ -1677,25 +1489,22 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
     """Get projection layers with inference-ready implementations"""
     projection_layers = []
 
-    # Update input_dim for first layer
-    if PROJECTION_LAYERS_CONFIG:
-        PROJECTION_LAYERS_CONFIG[0]["input_dim"] = qwen_embedding_dim
-
+    output_dim_prev = 1024
     layers_to_load = len(PROJECTION_LAYERS_CONFIG)
 
-    output_dim_prev = None
     for i in range(1, layers_to_load + 1):
         layer_config = PROJECTION_LAYERS_CONFIG[i-1]
         layer_num = layer_config["file_num"]
         layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
-        input_dim = layer_config["input_dim"]
+        input_dim = output_dim_prev
         file_num = layer_config["file_num"]
 
         if layer_config["type"] == "linear":
             output_dim = layer_config["output_dim"]
+            input_dim = output_dim_prev
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
-                projection_layer = LinearProjectionLayer(
+                projection_layer = LinearLayer(
                     input_dim=input_dim,
                     output_dim=output_dim
                 )
@@ -1703,78 +1512,50 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 print(f"Loading existing linear layer {file_num}")
                 projection_layer.is_new = False
             else:
-                projection_layer = LinearProjectionLayer(
+                projection_layer = LinearLayer(
                     input_dim=input_dim,
                     output_dim=output_dim
                 )
                 print(f"Initialising new linear layer {file_num}")
                 projection_layer.is_new = True
-            projection_layer.output_dim = output_dim
+            output_dim_prev = output_dim
 
-        elif layer_config["type"] == "mlp":
-            output_dim = layer_config["hidden_dim"]
+
+        elif layer_config["type"] == "activation":
+            output_dim = output_dim_prev
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
-                projection_layer = MLPProjectionLayer(
-                    input_dim=input_dim,
-                    hidden_dim=output_dim,
-                )
+                projection_layer = ActivationLayer()
                 projection_layer.load_state_dict(state_dict)
-                print(f"Loading existing MLP layer {file_num}")
+                print(f"Loading existing activation layer {file_num}")
                 projection_layer.is_new = False
             else:
-                projection_layer = MLPProjectionLayer(
-                    input_dim=input_dim,
-                    hidden_dim=output_dim,
-                )
-                print(f"Initialising new MLP layer {file_num}")
+                projection_layer = ActivationLayer()
+                print(f"Initialising new activation layer {file_num}")
                 projection_layer.is_new = True
-            projection_layer.output_dim = output_dim
 
         elif layer_config["type"] == "transformer":
-            output_dim = layer_config["hidden_dim"]
+            hidden_size = output_dim_prev
             dim_feedforward = layer_config["dim_feedforward"]
+            num_layers = layer_config["num_layers"]
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
-                projection_layer = TransformerProjectionLayer(
-                    input_dim=input_dim,
-                    hidden_dim=output_dim,
+                projection_layer = TransformerLayer(
                     dim_feedforward=dim_feedforward,
+                    num_layers=num_layers,
+                    hidden_size=hidden_size,
                 )
                 projection_layer.load_state_dict(state_dict)
                 print(f"Loading existing transformer layer {file_num}")
                 projection_layer.is_new = False
             else:
-                projection_layer = TransformerProjectionLayer(
-                    input_dim=input_dim,
-                    hidden_dim=output_dim,
+                projection_layer = TransformerLayer(
                     dim_feedforward=dim_feedforward,
+                    num_layers=num_layers,
+                    hidden_size=hidden_size,
                 )
                 print(f"Initialising new transformer layer {file_num}")
                 projection_layer.is_new = True
-            projection_layer.output_dim = output_dim
-
-        elif layer_config["type"] == "interpolation":
-            output_dim = layer_config["output_dim"]
-            if os.path.exists(layer_path):
-                state_dict = load_file(layer_path)
-                projection_layer = LearnedInterpolationLayer(
-                    input_dim=input_dim,
-                    teacher_dim=output_dim,
-                    max_length=512
-                )
-                projection_layer.load_state_dict(state_dict)
-                print(f"Loading existing interpolation layer {file_num}")
-                projection_layer.is_new = False
-            else:
-                projection_layer = LearnedInterpolationLayer(
-                    input_dim=input_dim,
-                    teacher_dim=output_dim,
-                    max_length=512
-                )
-                print(f"Initialising new interpolation layer {file_num}")
-                projection_layer.is_new = True
-            projection_layer.output_dim = output_dim
 
         projection_layer.file_num = layer_config["file_num"]
         projection_layers.append(projection_layer)
@@ -1890,15 +1671,7 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                         projected_student = student_hidden
 
                         for layer in projection_layers:
-                            if isinstance(layer, LearnedInterpolationLayer):
-                                    projected_student = layer(
-                                        projected_student,
-                                        s_mask=s_mask,
-                                        t_mask=t_mask,
-                                        target_length=512
-                                    )
-                            else:
-                                projected_student = layer(projected_student)
+                            projected_student = layer(projected_student)
                 else:
                     # Use no_grad and only get last hidden state when not training model
                     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
@@ -1912,17 +1685,9 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                     with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                         projected_student = student_hidden
                         for layer in projection_layers:
-                            if isinstance(layer, LearnedInterpolationLayer):
-                                    projected_student = layer(
-                                        projected_student,
-                                        s_mask=s_mask,
-                                        t_mask=t_mask,
-                                        target_length=512
-                                    )
-                            else:
-                                projected_student = layer(projected_student)
+                            projected_student = layer(projected_student)
 
-                extra_padding = random.choice([0, 1, 2, 3])
+                extra_padding = 1
                 s_mask = modify_mask_to_attend_padding(s_mask, 512, num_extra_padding=extra_padding)
                 t_mask = modify_mask_to_attend_padding(t_mask, 512, num_extra_padding=extra_padding)
 
@@ -1989,7 +1754,6 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
     num_batches = len(dataloader)
     for key in total_losses:
         total_losses[key] /= num_batches
-
 
     if align_loss_fn is not None:
         align_loss_fn.train()
@@ -2435,15 +2199,7 @@ def main():
                                 projected_student = student_hidden
 
                                 for layer in projection_layers:
-                                    if isinstance(layer, LearnedInterpolationLayer):
-                                        projected_student = layer(
-                                            projected_student,
-                                            s_mask=s_mask,
-                                            t_mask=t_mask,
-                                            target_length=512
-                                        )
-                                    else:
-                                        projected_student = layer(projected_student)
+                                    projected_student = layer(projected_student)
                         else:
                             # Use no_grad and only get last hidden state when not training model
                             with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
@@ -2457,15 +2213,7 @@ def main():
                             with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                                 projected_student = student_hidden
                                 for layer in projection_layers:
-                                    if isinstance(layer, LearnedInterpolationLayer):
-                                            projected_student = layer(
-                                                projected_student,
-                                                s_mask=s_mask,
-                                                t_mask=t_mask,
-                                                target_length=512
-                                            )
-                                    else:
-                                        projected_student = layer(projected_student)
+                                    projected_student = layer(projected_student)
 
                         if USE_CACHED_EMBEDDINGS:
                             teacher_hidden = t_embeddings.to(device).squeeze(1)
