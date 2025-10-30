@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder/v12/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -939,33 +939,30 @@ class AutoEncoder(nn.Module):
         return self.decode(self.encode(x))
 
 # ========== Projection Layers ==========
-class LinearProjectionLayer(torch.nn.Module):
+class LinearLayer(torch.nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.linear = torch.nn.Linear(input_dim, output_dim)
-        self.output_dim = output_dim
+        self.layer_type = "linear"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
-class MLPProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+class ActivationLayer(torch.nn.Module):
+    def __init__(self):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         self.activation = torch.nn.GELU()
-        self.output_dim = hidden_dim
+        self.layer_type = "activation"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.linear(x)
         x = self.activation(x)
         return x
 
-class TransformerProjectionLayer(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, dim_feedforward: int, num_layers: int = 1):
+class TransformerLayer(torch.nn.Module):
+    def __init__(self, dim_feedforward: int, num_layers: int = 1, hidden_size: int = 1024):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, hidden_dim)
         transformer_layer = torch.nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
+            d_model=hidden_size,
             nhead=8,
             dim_feedforward=dim_feedforward,
             dropout=0.0,
@@ -973,382 +970,11 @@ class TransformerProjectionLayer(torch.nn.Module):
             batch_first=True
         )
         self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.output_dim = hidden_dim
+        self.layer_type = "transformer"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.linear(x)
         x = self.transformer(x)
         return x
-
-class LearnedInterpolationLayer(torch.nn.Module):
-    """Learned interpolation layer for stretching sequences using position-aware upsampling"""
-    def __init__(self, input_dim: int, teacher_dim: int, max_length: int = 512):
-        super().__init__()
-        self.input_dim = input_dim
-        self.teacher_dim = teacher_dim
-        self.max_length = max_length
-
-        # Position encodings for both sequences
-        self.student_pos_encoder = torch.nn.Embedding(max_length, input_dim)
-        self.teacher_pos_encoder = torch.nn.Embedding(max_length, teacher_dim)
-
-        # Learnable interpolation network using 1D convolution for upsampling
-        self.upsample_conv = torch.nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=teacher_dim,
-            kernel_size=3,
-            stride=1,
-            padding=1
-        )
-
-        # Learnable interpolation weights
-        self.weight_predictor = torch.nn.Sequential(
-            torch.nn.Linear(teacher_dim * 3, 512),  # student emb + 2 position embeddings
-            torch.nn.GELU(),
-            torch.nn.Linear(512, 3),  # weights for 3 points
-            torch.nn.Softmax(dim=-1)
-        )
-
-        # Refinement layers
-        self.refine = torch.nn.Sequential(
-            torch.nn.Linear(teacher_dim, teacher_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(teacher_dim, teacher_dim)
-        )
-
-        # Output projection
-        self.output_proj = torch.nn.Linear(teacher_dim, teacher_dim)
-        self.layer_norm = torch.nn.LayerNorm(teacher_dim)
-        self.output_dim = teacher_dim
-        self.layer_type = "interpolation"
-
-        # Add projection layer for dimension mismatch
-        if self.input_dim != self.teacher_dim:
-            self.input_to_teacher_proj = torch.nn.Linear(self.input_dim, self.teacher_dim)
-        else:
-            self.input_to_teacher_proj = None
-
-        # Add layer normalization at the end
-        self.final_norm = torch.nn.LayerNorm(teacher_dim)
-
-        # Initialize weights properly
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights to prevent collapse"""
-        for m in self.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0)
-            elif isinstance(m, torch.nn.Conv1d):
-                torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, torch.nn.Embedding):
-                torch.nn.init.normal_(m.weight, mean=0, std=0.02)
-
-    def forward(self, student_emb, s_mask, t_mask, target_length=512):
-        batch_size, s_len, _ = student_emb.shape
-        t_len = t_mask.sum(dim=1).max()
-
-        # Get actual sequence lengths
-        s_lens = s_mask.sum(dim=1)  # [B]
-        t_lens = t_mask.sum(dim=1)  # [B]
-
-        # Avoid division by zero and ensure at least one token
-        s_lens = s_lens.clamp(min=1)
-        t_lens = t_lens.clamp(min=1)
-
-        # Create position indices for the entire batch (using max lengths)
-        s_pos = torch.arange(s_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)  # [B, s_len]
-        t_pos = torch.arange(t_len, device=student_emb.device).unsqueeze(0).expand(batch_size, -1)   # [B, t_len]
-
-        # Normalize positions to [0, 1] per batch
-        s_pos_norm = s_pos.float() / (s_lens.unsqueeze(1) - 1)  # [B, s_len]
-        t_pos_norm = t_pos.float() / (t_lens.unsqueeze(1) - 1)  # [B, t_len]
-
-        # Get position encodings
-        s_pos_emb = self.student_pos_encoder(s_pos)  # [B, s_len, input_dim]
-        t_pos_emb = self.teacher_pos_encoder(t_pos)  # [B, t_len, teacher_dim]
-
-        # Add position info to student embeddings
-        student_with_pos = student_emb + s_pos_emb
-
-        # Apply 1D convolution for initial upsampling (helps with local patterns)
-        student_conv = student_with_pos.transpose(1, 2)  # [B, input_dim, s_len]
-        upsampled = self.upsample_conv(student_conv)  # [B, teacher_dim, s_len]
-        upsampled = upsampled.transpose(1, 2)  # [B, s_len, teacher_dim]
-
-        # Project to teacher dimension if needed (using pre-initialized layer)
-        if self.input_to_teacher_proj is not None:
-            student_with_pos = self.input_to_teacher_proj(student_with_pos)
-
-        # For each teacher position, find 3 neighboring student positions for smooth interpolation
-        t_pos_scaled = t_pos_norm * (s_lens.unsqueeze(1) - 1)  # [B, t_len] - positions in student scale
-        t_pos_scaled = t_pos_scaled.long()  # [B, t_len]
-
-        # Calculate max valid index per batch (ensure non-negative)
-        max_index = (s_lens - 1).clamp(min=0)  # [B]
-
-        # Use tensors for min and max in clamp
-        min_val = torch.tensor(0, device=student_emb.device, dtype=torch.long)
-
-        # Get 3 neighboring indices (prev, current, next) with proper per-batch clamping
-        idx_prev = torch.clamp(t_pos_scaled - 1, min=min_val, max=max_index.unsqueeze(1))
-        idx_curr = torch.clamp(t_pos_scaled, min=min_val, max=max_index.unsqueeze(1))
-        idx_next = torch.clamp(t_pos_scaled + 1, min=min_val, max=max_index.unsqueeze(1))
-
-        # Gather embeddings at these indices
-        student_emb_prev = student_with_pos.gather(1, idx_prev.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-        student_emb_curr = student_with_pos.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-        student_emb_next = student_with_pos.gather(1, idx_next.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-
-        # Get corresponding upsampled embeddings
-        upsampled_curr = upsampled.gather(1, idx_curr.unsqueeze(-1).expand(-1, -1, self.teacher_dim))
-
-        # Use learned weights to combine the 3 points
-        weight_input = torch.cat([student_emb_prev, student_emb_curr, student_emb_next], dim=-1)
-        weights = self.weight_predictor(weight_input)  # [B, t_len, 3]
-
-        # Interpolate
-        interpolated = (
-            weights[:, :, 0:1] * student_emb_prev +
-            weights[:, :, 1:2] * student_emb_curr +
-            weights[:, :, 2:3] * student_emb_next
-        )
-
-        # Blend with convolutional upsampling for better pattern preservation
-        blend_factor = 0.7  # Can be made learnable
-        interpolated = blend_factor * interpolated + (1 - blend_factor) * upsampled_curr
-
-        # Refine the interpolated sequence
-        interpolated = self.refine(interpolated)
-        interpolated = self.layer_norm(interpolated)
-
-        # Add teacher position encoding
-        interpolated = interpolated + t_pos_emb
-
-        # Final projection
-        output = self.output_proj(interpolated)
-
-        # Apply mask
-        output_mask = t_mask[:, :t_len].unsqueeze(-1)
-        output = output * output_mask
-
-        # Pad to target length if needed
-        if output.shape[1] < target_length:
-            padding = (0, 0, 0, target_length - output.shape[1])
-            output = F.pad(output, padding, 'constant', 0)
-
-        output = self.final_norm(output)
-
-        return output
-
-class CrossAttentionProjectionLayer(torch.nn.Module):
-    """
-    Cross-attention projection layer that can be used in inference without teacher embeddings.
-    During training, it uses teacher embeddings for attention. During inference, it uses
-    self-attention or cached attention patterns.
-    """
-    def __init__(self, student_dim: int, teacher_dim: int, hidden_dim: int,
-                 num_heads: int = 8, max_length: int = 512):
-        super().__init__()
-        self.student_dim = student_dim
-        self.teacher_dim = teacher_dim
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.max_length = max_length
-        self.layer_type = "cross_attention"
-
-        # Input projections to common dimension
-        self.student_proj = torch.nn.Linear(student_dim, hidden_dim)
-        self.teacher_proj = torch.nn.Linear(teacher_dim, hidden_dim)
-
-        # Cross-attention mechanism
-        self.cross_attention = torch.nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
-            dropout=0.1
-        )
-
-        # Self-attention for refinement (used in both training and inference)
-        self.self_attention = torch.nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
-            dropout=0.1
-        )
-
-        # Layer normalizations
-        self.norm1 = torch.nn.LayerNorm(hidden_dim)
-        self.norm2 = torch.nn.LayerNorm(hidden_dim)
-        self.norm3 = torch.nn.LayerNorm(hidden_dim)
-
-        # Feed-forward network
-        self.ffn = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim, hidden_dim * 4),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(hidden_dim * 4, hidden_dim),
-            torch.nn.Dropout(0.1)
-        )
-
-        # Inference mode components
-        self.inference_mode = False
-        self.attention_cache = None
-
-        # Learnable "teacher-like" embeddings for inference
-        self.teacher_like_embeddings = torch.nn.Parameter(
-            torch.randn(max_length, hidden_dim) * 0.02
-        )
-
-        # Position encoding
-        self.pos_encoding = torch.nn.Embedding(max_length, hidden_dim)
-
-        # Gate to control cross vs self attention
-        self.attention_gate = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim * 2, hidden_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(hidden_dim, 1),
-            torch.nn.Sigmoid()
-        )
-
-    def forward(self, x: torch.Tensor, s_mask: torch.Tensor = None,
-                t_mask: torch.Tensor = None, teacher_emb: torch.Tensor = None,
-                use_cache: bool = False) -> torch.Tensor:
-        """
-        Forward pass with different behavior for training vs inference.
-
-        Args:
-            x: Input embeddings [batch_size, seq_len, student_dim]
-            s_mask: Student mask [batch_size, seq_len]
-            t_mask: Teacher mask [batch_size, teacher_seq_len] (training only)
-            teacher_emb: Teacher embeddings [batch_size, teacher_seq_len, teacher_dim] (training only)
-            use_cache: Whether to use cached attention patterns (inference)
-        """
-        batch_size, seq_len, _ = x.shape
-        device = x.device
-
-        # Add position encoding
-        pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        x = x + self.pos_encoding(pos_ids)
-
-        # Project student embeddings
-        student_proj = self.student_proj(x)  # [B, S, H]
-        student_proj = self.norm1(student_proj)
-
-        if self.training and teacher_emb is not None:
-            # Training mode: use actual teacher embeddings
-            return self._forward_train(student_proj, x, teacher_emb, s_mask, t_mask)
-        else:
-            # Inference mode: use learned patterns
-            return self._forward_inference(student_proj, x, s_mask, use_cache)
-
-    def _forward_train(self, student_proj: torch.Tensor, original_x: torch.Tensor,
-                      teacher_emb: torch.Tensor, s_mask: torch.Tensor,
-                      t_mask: torch.Tensor) -> torch.Tensor:
-        """Training forward pass with real teacher embeddings"""
-        batch_size, seq_len, _ = student_proj.shape
-
-        # Project teacher embeddings
-        teacher_proj = self.teacher_proj(teacher_emb)  # [B, T, H]
-        teacher_proj = self.norm1(teacher_proj)
-
-        # Cross-attention: student attends to teacher
-        cross_out, cross_weights = self.cross_attention(
-            query=student_proj,
-            key=teacher_proj,
-            value=teacher_proj,
-            key_padding_mask=~(t_mask.bool() if t_mask is not None else torch.ones_like(t_mask, dtype=bool, device=teacher_proj.device)),
-            need_weights=True
-        )  # [B, S, H], [B, S, T]
-
-        # Combine with gate
-        gate_input = torch.cat([student_proj, cross_out], dim=-1)
-        gate = self.attention_gate(gate_input)
-        student_proj = student_proj * (1 - gate) + cross_out * gate
-        student_proj = self.norm2(student_proj)
-
-        # Cache attention pattern for potential inference use
-        if hasattr(self, 'cache_attention_pattern'):
-            self.cache_attention_pattern = cross_weights.detach()
-
-        return self._apply_self_attention_and_output(student_proj, original_x, s_mask)
-
-    def _forward_inference(self, student_proj: torch.Tensor, original_x: torch.Tensor,
-                          s_mask: torch.Tensor, use_cache: bool) -> torch.Tensor:
-        """Inference forward pass without teacher embeddings"""
-        batch_size, seq_len, _ = student_proj.shape
-
-        if use_cache and hasattr(self, 'cached_attention_pattern'):
-            # Use cached attention pattern from training
-            cached_pattern = self.cached_attention_pattern
-            if cached_pattern.shape[1] != seq_len:
-                # Interpolate to match current sequence length
-                cached_pattern = F.interpolate(
-                    cached_pattern.unsqueeze(1),
-                    size=(seq_len, cached_pattern.shape[-1]),
-                    mode='linear',
-                    align_corners=False
-                ).squeeze(1)
-
-            # Apply cached pattern to learned teacher-like embeddings
-            teacher_like = self.teacher_like_embeddings[:seq_len].unsqueeze(0).expand(batch_size, -1, -1)
-            cross_out = torch.bmm(cached_pattern, teacher_like)
-
-        else:
-            # Use self-attention as fallback
-            cross_out, _ = self.self_attention(
-                query=student_proj,
-                key=student_proj,
-                value=student_proj,
-                key_padding_mask=~(s_mask.bool() if s_mask is not None else torch.ones_like(s_mask, dtype=bool, device=student_proj.device)),
-                need_weights=False
-            )
-
-        # Combine with gate
-        gate_input = torch.cat([student_proj, cross_out], dim=-1)
-        gate = self.attention_gate(gate_input)
-        student_proj = student_proj * (1 - gate) + cross_out * gate
-        student_proj = self.norm2(student_proj)
-
-        return self._apply_self_attention_and_output(student_proj, original_x, s_mask)
-
-    def _apply_self_attention_and_output(self, student_proj: torch.Tensor,
-                                        original_x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Common post-processing for both training and inference"""
-        # Self-attention for refinement
-        self_out, _ = self.self_attention(
-            query=student_proj,
-            key=student_proj,
-            value=student_proj,
-            key_padding_mask=~(mask.bool() if mask is not None else torch.ones_like(mask, dtype=bool, device=student_proj.device)),
-            need_weights=False
-        )
-        student_proj = student_proj + self_out
-        student_proj = self.norm3(student_proj)
-
-        # Feed-forward network
-        ffn_out = self.ffn(student_proj)
-        student_proj = student_proj + ffn_out
-
-        return student_proj
-
-    def set_inference_mode(self, mode: bool = True):
-        """Set inference mode and prepare for deployment"""
-        self.inference_mode = mode
-        if mode:
-            # Prepare for inference by freezing attention patterns
-            if hasattr(self, 'cache_attention_pattern'):
-                self.eval()
-
-    def cache_attention_pattern(self, pattern: torch.Tensor):
-        """Manually cache attention pattern for inference"""
-        self.cached_attention_pattern = pattern.detach()
-
-    def get_output_dim(self) -> int:
-        """Return output dimension for layer configuration"""
-        return self.teacher_dim
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1617,28 +1243,22 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
         projection_config = json.load(file)
 
     projection_layers = []
+    output_dim_prev = 1024
 
     for layer_config in projection_config["layers"]:
         if layer_config["type"] == "linear":
-            layer = LinearProjectionLayer(
-                layer_config["input_dim"],
+            layer = LinearLayer(
+                output_dim_prev,
                 layer_config["output_dim"],
             )
-        elif layer_config["type"] == "mlp":
-            layer = MLPProjectionLayer(
-                layer_config["input_dim"],
-                layer_config["hidden_dim"],
-            )
+            output_dim_prev = layer_config["output_dim"]
+        elif layer_config["type"] == "activation":
+            layer = ActivationLayer()
         elif layer_config["type"] == "transformer":
-            layer = TransformerProjectionLayer(
-                layer_config["input_dim"],
-                layer_config["hidden_dim"],
+            layer = TransformerLayer(
                 layer_config["dim_feedforward"],
-            )
-        elif layer_config["type"] == "interpolation":
-            layer = LearnedInterpolationLayer(
-                layer_config["input_dim"],
-                layer_config["output_dim"]
+                layer_config["num_layers"],
+                output_dim_prev,
             )
 
         file_num = layer_config["file_num"]
@@ -1810,22 +1430,8 @@ if __name__ == "__main__":
             embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
         for layer in projection_layers:
-            if isinstance(layer, (LearnedInterpolationLayer)):
-                embed = layer(
-                    embed,
-                    s_mask=attention_mask,
-                    t_mask=t5_attention_mask,
-                    target_length=512
-                )
-                embed_neg = layer(
-                    embed_neg,
-                    s_mask=attention_mask_neg,
-                    t_mask=t5_attention_mask_neg,
-                    target_length=512
-                )
-            else:
-                embed = layer(embed)
-                embed_neg = layer(embed_neg)
+            embed = layer(embed)
+            embed_neg = layer(embed_neg)
 
         if USE_T5_MASK_WITH_QWEN:
             tokenizer = load_t5_tokenizer(args.t5_folder)
