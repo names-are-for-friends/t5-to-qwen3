@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v3/restart_6"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v4/"
+QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder/v10/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder/v11/"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -68,7 +68,7 @@ SAVE_BEST_MODEL = True
 
 # Scheduler
 WARMUP_STEPS = 150
-RESTART_CYCLE_STEPS = 350
+RESTART_CYCLE_STEPS = 350 # 0 = flat LR with no restart
 REPEAT_WARMUP_AFTER_RESTART = False
 '''
 --Alignment weights & settings--
@@ -88,7 +88,7 @@ SEQUENCE_HUBER_WEIGHT = 0.00
 SEQUENCE_COSINE_WEIGHT = 0.00
 
 # Dataset
-SHUFFLE_DATASET = True
+SHUFFLE_DATASET = False
 
 # Optimizer state preservation
 REUSE_OPTIMIZER_STATE = True
@@ -113,10 +113,10 @@ ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
 
 # Training flags
 TRAIN_PROJECTION = True
-TRAIN_MODEL = False
+TRAIN_MODEL = True
 
 # Layer arrangement
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [1,2,3]
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "transformer",
@@ -383,6 +383,38 @@ def normalize_token(token):
         token = token.replace(old, new)
 
     return token.lower()
+
+def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=3):
+    """
+    Modifies attention mask to allow attention to a few extra padding tokens.
+
+    Args:
+        mask: Original attention mask (1 for tokens to attend to, 0 for masked tokens)
+        max_seq_length: Maximum sequence length of the model
+        num_extra_padding: Number of padding tokens to unmask
+
+    Returns:
+        Modified mask
+    """
+    # Get the actual sequence length from the mask
+    seq_length = mask.sum(dim=-1)
+    batch_size = mask.shape[0]
+
+    modified_mask = mask.clone()
+
+    for i in range(batch_size):
+        current_seq_len = int(seq_length[i].item())
+
+        # Only add extra padding tokens if there's room
+        if current_seq_len < max_seq_length:
+            # Calculate how many padding tokens we can unmask
+            available_padding = max_seq_length - current_seq_len
+            tokens_to_unmask = min(num_extra_padding, available_padding)
+
+            # Unmask the specified number of padding tokens right after the sequence
+            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
+
+    return modified_mask
 
 def ids_to_tokens(token_ids, tokenizer):
     """Optimized token conversion"""
@@ -825,7 +857,8 @@ def find_word_matches(student_words, teacher_words, texts_match=True, word_windo
 
 def hybrid_alignment(student_input_ids, teacher_input_ids,
                             student_tokenizer, teacher_tokenizer,
-                            student_embeddings, teacher_embeddings):
+                            student_embeddings, teacher_embeddings,
+                            exclude_tokens=None):
     """Three-stage alignment: text tokens, word pooling, window matching"""
     # Get tokens and words
     student_text = student_tokenizer.decode(student_input_ids, skip_special_tokens=True)
@@ -837,6 +870,42 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     student_tokens = ids_to_tokens(student_input_ids.cpu().numpy(), student_tokenizer)
     teacher_tokens = ids_to_tokens(teacher_input_ids.cpu().numpy(), teacher_tokenizer)
 
+    # NEW: Filter out excluded tokens (EOS tokens) from student tokens
+    if exclude_tokens is not None:
+        exclude_set = set(exclude_tokens)
+
+        # Create mapping from original indices to filtered indices
+        original_to_filtered = {}
+        filtered_to_original = {}
+
+        student_tokens_filtered = []
+        student_embeddings_filtered = []
+        student_input_ids_filtered = []
+
+        filtered_idx = 0
+        for original_idx, token in enumerate(student_tokens):
+            if original_idx not in exclude_set:
+                # Keep this token
+                original_to_filtered[original_idx] = filtered_idx
+                filtered_to_original[filtered_idx] = original_idx
+
+                student_tokens_filtered.append(token)
+                student_embeddings_filtered.append(student_embeddings[original_idx])
+                student_input_ids_filtered.append(student_input_ids[original_idx])
+                filtered_idx += 1
+
+        # Update to use filtered versions
+        student_tokens = student_tokens_filtered
+        if student_embeddings_filtered:
+            student_embeddings = torch.stack(student_embeddings_filtered)
+        else:
+            student_embeddings = torch.empty(0, device=student_embeddings.device, dtype=student_embeddings.dtype)
+        student_input_ids = torch.tensor(student_input_ids_filtered, device=student_input_ids.device)
+
+        # Create new filtered student text
+        student_text = student_tokenizer.decode(student_input_ids, skip_special_tokens=True)
+
+    # Get word mappings for both sequences
     student_words = get_word_token_mappings(student_tokens, student_tokenizer, student_text)
     teacher_words = get_word_token_mappings(teacher_tokens, teacher_tokenizer, teacher_text)
 
@@ -848,11 +917,11 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     word_matches = find_word_matches(student_words, teacher_words, texts_match=texts_match, word_window_size=2)
 
     # Track all matches
-    all_token_matches = []  # Global indices
-    all_weighted_matches = []  # Global indices with weights
+    all_token_matches = []  # Global indices (in filtered space)
+    all_weighted_matches = []  # Global indices with weights (in filtered space)
     word_pooling_pairs = []  # (s_word_idx, t_word_idx, student_pooled, teacher_pooled, word_weight, num_unmatched_tokens)
 
-    # Track aligned tokens globally
+    # Track aligned tokens globally (in filtered space)
     aligned_student_tokens = set()  # Global indices
     aligned_teacher_tokens = set()  # Global indices
 
@@ -876,8 +945,6 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
         if any(idx < 0 or idx >= len(teacher_embeddings) for idx in teacher_word['tokens']):
             continue
 
-        # For non-matching texts, reduce the cosine threshold to be more permissive
-
         # Filter embeddings to word boundaries
         s_word_embs = student_embeddings[student_word['tokens']]
         t_word_embs = teacher_embeddings[teacher_word['tokens']]
@@ -890,7 +957,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
             teacher_tokenizer=teacher_tokenizer
         )
 
-        # Convert word-local to global indices
+        # Convert word-local to global indices (in filtered space)
         for s_local, t_local in text_matches:
             s_global = student_word['tokens'][s_local]
             t_global = teacher_word['tokens'][t_local]
@@ -955,7 +1022,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
             token_cosine_threshold=0.7
         )
 
-        # Adjust back to global positions
+        # Adjust back to global positions (in filtered space)
         remaining_student_list = list(remaining_student)
         remaining_teacher_list = list(remaining_teacher)
 
@@ -967,6 +1034,21 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
             # Lower weight for window matches, even lower for non-matching texts
             window_weight = 0.5 if texts_match else 0.3
             all_weighted_matches.append((s_global_idx, t_global_idx, window_weight))
+
+    if exclude_tokens is not None:
+        # Convert token matches back to original indices
+        original_token_matches = []
+        for s_filtered_idx, t_idx in all_token_matches:
+            s_original_idx = filtered_to_original[s_filtered_idx]
+            original_token_matches.append((s_original_idx, t_idx))
+        all_token_matches = original_token_matches
+
+        # Convert weighted matches back to original indices
+        original_weighted_matches = []
+        for s_filtered_idx, t_idx, weight in all_weighted_matches:
+            s_original_idx = filtered_to_original[s_filtered_idx]
+            original_weighted_matches.append((s_original_idx, t_idx, weight))
+        all_weighted_matches = original_weighted_matches
 
     return all_token_matches, all_weighted_matches, word_pooling_pairs, student_words, teacher_words
 
@@ -1014,47 +1096,97 @@ class AlignmentLoss(torch.nn.Module):
         total_word_aligned_tokens = 0
         total_student_tokens = 0
 
+        # Get special token IDs
+        student_pad_id = self.student_tokenizer.pad_token_id if self.student_tokenizer else None
+        teacher_pad_id = self.teacher_tokenizer.pad_token_id if self.teacher_tokenizer else None
+
         for i in range(batch_size):
-            # Get actual tokens
+            # Get actual tokens based on masks (these are the modified masks from modify_mask_to_attend_padding)
             t_indices = (teacher_mask[i] == 1).nonzero(as_tuple=True)[0]
             s_indices = (student_mask[i] == 1).nonzero(as_tuple=True)[0]
 
             if len(t_indices) == 0 or len(s_indices) == 0:
                 continue
 
-            # Count valid student tokens
+            # Count valid student tokens (excluding special tokens except EOS)
             valid_student_tokens = 0
             for idx in s_indices:
-                if student_input_ids[i][idx].item() not in [
-                    self.student_tokenizer.pad_token_id,
-                    self.student_tokenizer.bos_token_id,
-                    self.student_tokenizer.eos_token_id
+                token_id = student_input_ids[i][idx].item()
+                if token_id not in [
+                    self.student_tokenizer.pad_token_id if hasattr(self.student_tokenizer, 'pad_token_id') else None,
+                    self.student_tokenizer.bos_token_id if hasattr(self.student_tokenizer, 'bos_token_id') else None,
                 ]:
-                    valid_student_tokens += 1
+                    # Count EOS tokens only if they're not at the very end (actual sequence EOS)
+                    if token_id != student_pad_id or idx < len(student_input_ids[i]) - 1:
+                        valid_student_tokens += 1
             total_student_tokens += valid_student_tokens
 
             # Get embeddings for this batch item
             student_embs = student_output[i]
             teacher_embs = teacher_output[i]
 
-            # Use improved alignment
+            # Stage 1: Handle EOS to <pad> matching for ONLY unmasked positions
+            eos_to_pad_matches = []
+            if student_pad_id is not None and teacher_pad_id is not None:
+                # Find EOS tokens in student that are currently unmasked
+                student_eos_positions = []
+                for pos in s_indices:
+                    if student_input_ids[i][pos].item() == student_pad_id:
+                        student_eos_positions.append(pos)
+
+                # Find <pad> tokens in teacher that are currently unmasked
+                teacher_pad_positions = []
+                for pos in t_indices:
+                    if teacher_input_ids[i][pos].item() == teacher_pad_id:
+                        teacher_pad_positions.append(pos)
+
+                # Match EOS tokens to pad tokens (any-to-any matching)
+                if student_eos_positions and teacher_pad_positions:
+                    # Simple 1-to-1 matching for now, can be extended
+                    num_matches = min(len(student_eos_positions), len(teacher_pad_positions))
+                    for j in range(num_matches):
+                        eos_to_pad_matches.append((student_eos_positions[j], teacher_pad_positions[j]))
+
+            # Stage 2: Use improved alignment for regular tokens
             token_matches, weighted_matches, word_pooling_pairs, student_words, teacher_words = hybrid_alignment(
                 student_input_ids[i], teacher_input_ids[i],
                 self.student_tokenizer, self.teacher_tokenizer,
                 student_embs, teacher_embs
             )
 
-            # Stage 1: Text-based token matches
-            if token_matches:
-                student_token_embs = student_embs[[pair[0] for pair in token_matches]]
-                teacher_token_embs = teacher_embs[[pair[1] for pair in token_matches]]
+            # Stage 3: Combine EOS-to-pad matches with regular token matches
+            # Filter out any matches that involve EOS or pad tokens from regular matching
+            filtered_token_matches = []
+            for s_idx, t_idx in token_matches:
+                s_token = student_input_ids[i][s_idx].item()
+                t_token = teacher_input_ids[i][t_idx].item()
+                # Only include if not EOS-to-pad (these are handled separately)
+                if not (s_token == student_pad_id and t_token == teacher_pad_id):
+                    filtered_token_matches.append((s_idx, t_idx))
 
-                # Create weights tensor
+            # Convert EOS tensors to integers before combining
+            eos_to_pad_matches_idx = []
+            for s_idx, t_idx in eos_to_pad_matches:
+                s_idx_int = s_idx.item()
+                t_idx_int = t_idx.item()
+                eos_to_pad_matches_idx.append((s_idx_int, t_idx_int))
+
+            all_token_matches = filtered_token_matches + eos_to_pad_matches_idx
+
+            # Stage 4: Text-based token matches (including EOS-to-pad)
+            if all_token_matches:
+                student_token_embs = student_embs[[pair[0] for pair in all_token_matches]]
+                teacher_token_embs = teacher_embs[[pair[1] for pair in all_token_matches]]
+
+                # Create weights tensor (lower weight for EOS-to-pad matches)
                 weight_map = {(s, t): w for s, t, w in weighted_matches}
-                token_weights = torch.tensor(
-                    [weight_map.get((s, t), 1.0) for s, t in token_matches],
-                    device=device, dtype=student_token_embs.dtype
-                )
+                token_weights = []
+                for s, t in all_token_matches:
+                    if (s, t) in eos_to_pad_matches:
+                        token_weights.append(0.5)  # Lower weight for EOS-to-pad
+                    else:
+                        token_weights.append(weight_map.get((s, t), 1.0))
+                token_weights = torch.tensor(token_weights, device=device, dtype=student_token_embs.dtype)
 
                 # Compute weighted losses
                 token_huber_loss = F.huber_loss(
@@ -1069,9 +1201,9 @@ class AlignmentLoss(torch.nn.Module):
 
                 total_text_huber_loss += token_huber_loss
                 total_text_cosine_loss += token_cosine_loss
-                total_text_aligned_tokens += len(token_matches)
+                total_text_aligned_tokens += len(all_token_matches)
 
-            # Stage 2: Word-level pooling losses
+            # Stage 5: Word-level pooling losses (unchanged, but should not include EOS/pad tokens)
             if word_pooling_pairs:
                 word_huber_losses = []
                 word_cosine_losses = []
@@ -1678,7 +1810,6 @@ def initialize_optimizer(parameters: List[torch.nn.Parameter], max_lr: float, mi
             optimizer,
             start_factor=1.0,
             end_factor=1.0,
-            total_iters=1000 - WARMUP_STEPS
         )
 
     warmup_scheduler = None
@@ -1790,6 +1921,10 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                                     )
                             else:
                                 projected_student = layer(projected_student)
+
+                extra_padding = random.choice([0, 1, 2, 3])
+                s_mask = modify_mask_to_attend_padding(s_mask, 512, num_extra_padding=extra_padding)
+                t_mask = modify_mask_to_attend_padding(t_mask, 512, num_extra_padding=extra_padding)
 
                 eval_loss = torch.tensor(0.0, device=device)
                 eval_align_huber = torch.tensor(0.0, device=device)
@@ -2301,12 +2436,12 @@ def main():
 
                                 for layer in projection_layers:
                                     if isinstance(layer, LearnedInterpolationLayer):
-                                            projected_student = layer(
-                                                projected_student,
-                                                s_mask=s_mask,
-                                                t_mask=t_mask,
-                                                target_length=512
-                                            )
+                                        projected_student = layer(
+                                            projected_student,
+                                            s_mask=s_mask,
+                                            t_mask=t_mask,
+                                            target_length=512
+                                        )
                                     else:
                                         projected_student = layer(projected_student)
                         else:
@@ -2343,6 +2478,11 @@ def main():
                                 )
                                 teacher_hidden = teacher_outputs.last_hidden_state
                                 teacher_hidden = teacher_hidden.to(device)
+
+                        # Modify masks to randomly attend to extra padding tokens
+                        extra_padding = random.choice([0, 1, 2, 3])
+                        s_mask = modify_mask_to_attend_padding(s_mask, 512, num_extra_padding=extra_padding)
+                        t_mask = modify_mask_to_attend_padding(t_mask, 512, num_extra_padding=extra_padding)
 
                         total_loss = torch.tensor(0.0, device=device)
                         align_loss_huber = torch.tensor(0.0, device=device)
