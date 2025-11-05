@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-11/v2/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -948,18 +948,8 @@ class LinearLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
-class ActivationLayer(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.activation = torch.nn.GELU()
-        self.layer_type = "activation"
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.activation(x)
-        return x
-
 class TransformerLayer(torch.nn.Module):
-    def __init__(self, dim_feedforward: int, hidden_size: int = 1024, num_layers: int = 1):
+    def __init__(self, dim_feedforward: int, num_heads: int = 8, hidden_size: int = 4096, dropout_rate: int = 0.1):
         super().__init__()
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=hidden_size,
@@ -969,12 +959,245 @@ class TransformerLayer(torch.nn.Module):
             activation='gelu',
             batch_first=True
         )
-        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.layer_type = "transformer"
+        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=1)
+        self.layer_type = "transformer_encoder"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         x = self.transformer(x)
         return x
+
+# ========== T5 Layers ==========
+class T5RMSNorm(torch.nn.Module):
+    """T5's RMSNorm (no mean subtraction, just scaling)"""
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm: normalize by root mean square, no mean subtraction
+        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        x = x / torch.sqrt(variance + self.variance_epsilon)
+
+        # Cast back to original dtype if needed
+        if self.weight.dtype == torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
+        return self.weight * x
+
+class T5RelativePositionBias(torch.nn.Module):
+    """T5's relative position bias for attention"""
+    def __init__(self, num_heads: int, relative_attention_num_buckets: int = 32):
+        super().__init__()
+        self.num_heads = num_heads
+        self.relative_attention_num_buckets = relative_attention_num_buckets
+        self.relative_attention_bias = torch.nn.Parameter(
+            torch.zeros(num_heads, relative_attention_num_buckets)
+        )
+
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position: torch.Tensor,
+        bidirectional: bool = True,
+        num_buckets: int = 32,
+        max_distance: int = 128
+    ) -> torch.Tensor:
+
+        ret = 0
+        if bidirectional:
+            num_buckets //= 2
+            ret += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+
+        # Now n is in the range [0, inf)
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        # The other half are for larger distances
+        relative_position_if_large = torch.log(relative_position.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        relative_position_if_large = torch.clamp(relative_position_if_large.round().long(), min=0, max=num_buckets - 1)
+
+        ret += torch.where(is_small, relative_position, relative_position_if_large)
+        return ret
+
+    def forward(self, query_length: int, key_length: int) -> torch.Tensor:
+        """Compute relative position bias"""
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,
+            bidirectional=True,
+            num_buckets=self.relative_attention_num_buckets
+        )
+
+        device = self.relative_attention_bias.device
+        relative_position_bucket = relative_position_bucket.to(device)
+
+        bias_expanded = self.relative_attention_bias.unsqueeze(1).expand(-1, query_length, -1)
+
+        values = bias_expanded.gather(
+            2,  # Gather along the bucket dimension (dim=2 in expanded bias)
+            relative_position_bucket.unsqueeze(0).expand(self.num_heads, -1, -1)
+        )
+        return values
+
+class T5Attention(torch.nn.Module):
+    """T5's multi-head self-attention with relative position biases"""
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout_rate: float = 0.1,
+        relative_attention_num_buckets: int = 32
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Q, K, V projections (no bias)
+        self.q = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Output projection
+        self.o = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Relative position bias
+        self.relative_attention_bias = T5RelativePositionBias(
+            num_heads=num_heads,
+            relative_attention_num_buckets=relative_attention_num_buckets
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, seq_length, hidden_size = hidden_states.size()
+
+        # Project to Q, K, V
+        query_states = self.q(hidden_states)
+        key_states = self.k(hidden_states)
+        value_states = self.v(hidden_states)
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Compute attention scores
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Add relative position bias
+        relative_bias = self.relative_attention_bias(seq_length, seq_length)
+        attn_scores = attn_scores + relative_bias.unsqueeze(0)
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        # Softmax and dropout
+        attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_probs, value_states)
+
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, hidden_size)
+        attn_output = self.o(attn_output)
+
+        return attn_output
+
+
+class T5FeedForward(torch.nn.Module):
+    """T5's feed-forward network (DenseReluDense)"""
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dropout_rate: float = 0.1
+    ):
+        super().__init__()
+        # Dense layers (no bias)
+        self.wi = torch.nn.Linear(hidden_size, intermediate_size, bias=False)  # Input/Intermediate
+        self.wo = torch.nn.Linear(intermediate_size, hidden_size, bias=False)   # Output
+
+        # Activation and dropout
+        self.activation = torch.nn.GELU()
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.wi(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.wo(hidden_states)
+        return hidden_states
+
+class T5EncoderBlock(torch.nn.Module):
+    """
+    Architecture:
+    1. LayerNorm (RMSNorm)
+    2. Self-Attention (with relative position biases)
+    3. Dropout + Residual
+    4. LayerNorm (RMSNorm)
+    5. Feed-Forward Network
+    6. Dropout + Residual
+    """
+    def __init__(
+        self,
+        hidden_size: int = 4096,
+        num_heads: int = 64,
+        dropout_rate: float = 0.1,
+        relative_attention_num_buckets: int = 32,
+        dim_feedforward: int = 10240
+    ):
+        super().__init__()
+
+        # Self-attention layer
+        self.layer_norm_self_attention = T5RMSNorm(hidden_size)
+        self.self_attention = T5Attention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            relative_attention_num_buckets=relative_attention_num_buckets
+        )
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Feed-forward layer
+        self.layer_norm_feed_forward = T5RMSNorm(hidden_size)
+        self.feed_forward = T5FeedForward(
+            hidden_size=hidden_size,
+            intermediate_size=dim_feedforward,
+            dropout_rate=dropout_rate
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Self-attention block with pre-norm and residual
+        normed_hidden_states = self.layer_norm_self_attention(hidden_states)
+        attn_output = self.self_attention(
+            hidden_states=normed_hidden_states,
+            attention_mask=attention_mask
+        )
+        attn_output = self.dropout(attn_output)
+        hidden_states = hidden_states + attn_output
+
+        # Feed-forward block with pre-norm and residual
+        normed_hidden_states = self.layer_norm_feed_forward(hidden_states)
+        ff_output = self.feed_forward(normed_hidden_states)
+        ff_output = self.dropout(ff_output)
+        hidden_states = hidden_states + ff_output
+
+        return hidden_states
 
 # === Utility Functions ===
 def get_noise(num_samples: int, height: int, width: int, device: torch.device, dtype: torch.dtype, seed: int):
@@ -1252,13 +1475,25 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
                 output_dim=layer_config["output_dim"],
             )
             output_dim_prev = layer_config["output_dim"]
-        elif layer_config["type"] == "activation":
-            layer = ActivationLayer()
-        elif layer_config["type"] == "transformer":
+        elif layer_config["type"] == "transformer_encoder":
             layer = TransformerLayer(
-                dim_feedforward=layer_config["dim_feedforward"],
-                hidden_size=output_dim_prev,
-            )
+                        hidden_size=output_dim_prev,
+                        num_heads=layer_config["num_heads"],
+                        dropout_rate=layer_config["dropout_rate"],
+                        dim_feedforward=layer_config["dim_feedforward"]
+                    )
+        elif layer_config["type"] == "t5_encoder":
+            layer = T5EncoderBlock(
+                        hidden_size=output_dim_prev,
+                        num_heads=layer_config["num_heads"],
+                        dropout_rate=layer_config["dropout_rate"],
+                        relative_attention_num_buckets=layer_config["relative_attention_num_buckets"],
+                        dim_feedforward=layer_config["dim_feedforward"]
+                    )
+        elif layer_config["type"] == "t5_rmsnorm":
+            layer = T5RMSNorm(
+                    hidden_size=output_dim_prev,
+                )
 
         file_num = layer_config["file_num"]
         layer_path = os.path.join(qwen3_folder, f"projection_layer_{file_num}.safetensors")
@@ -1420,7 +1655,6 @@ if __name__ == "__main__":
             )
             embed = output.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        with torch.no_grad():
             output_neg = qwen3_model(
                 input_ids=text_inputs_neg["input_ids"],
                 attention_mask=attention_mask_neg,
@@ -1428,9 +1662,9 @@ if __name__ == "__main__":
             )
             embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
-        for layer in projection_layers:
-            embed = layer(embed)
-            embed_neg = layer(embed_neg)
+            for layer in projection_layers:
+                embed = layer(embed)
+                embed_neg = layer(embed_neg)
 
         if USE_T5_MASK_WITH_QWEN:
             tokenizer = load_t5_tokenizer(args.t5_folder)
