@@ -20,16 +20,17 @@ import gc
 import sys
 import datetime
 import logging
+import math
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.DEBUG)
 
 # ========== Configuration ==========
 # Paths
-DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
-T5_MODEL_NAME = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_NAME = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v1/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-2/v2/"
+DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
+T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
+QWEN3_MODEL_DIR = "/home/naff/q3-xxs_script/Qwen3-Embedding-0.6B/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-10/v1"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -38,7 +39,7 @@ PREFETCH_FACTOR = 3
 
 # Evaluation
 USE_SEPARATE_EVALUATION_DATASET = True
-EVALUATION_DATASET_PATH = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
+EVALUATION_DATASET_DIR = "/mnt/f/q5_xxs_training_script/eval_prompts.txt"
 
 # Logging
 ENABLE_LOGGING = True
@@ -51,10 +52,10 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 8e-5
-MIN_LEARNING_RATE_MODEL = 8e-6
-MAX_LEARNING_RATE_PROJ = 15e-5
-MIN_LEARNING_RATE_PROJ = 15e-6
+MAX_LEARNING_RATE_MODEL = 5e-5
+MIN_LEARNING_RATE_MODEL = 5e-6
+MAX_LEARNING_RATE_PROJ = 10e-5
+MIN_LEARNING_RATE_PROJ = 10e-6
 
 # Saving
 SAVE_EVERY_X_STEPS = 0
@@ -74,21 +75,20 @@ REPEAT_WARMUP_AFTER_RESTART = False
 --Alignment weights & settings--
 This is the main loss type, and the one you should be using normally
 We index the words, and then match individual tokens by text via normalised position in matched words - this is TEXT_MATCH loss
-For remaining unmatched tokens (due to differing tokenization) we take mean-pooling loss - this is WORD_MATCH loss
 '''
-TEXT_MATCH_HUBER_WEIGHT = 0.70
-TEXT_MATCH_COSINE_WEIGHT = 0.30
-WORD_MATCH_HUBER_WEIGHT = 0.00
-WORD_MATCH_COSINE_WEIGHT = 0.00
+TEXT_MATCH_HUBER_WEIGHT = 1.00
+TEXT_MATCH_COSINE_WEIGHT = 1.00
+WORD_MATCH_HUBER_WEIGHT = 0.50
+WORD_MATCH_COSINE_WEIGHT = 0.50
 
 # Basic weights
 TOKEN_HUBER_WEIGHT = 0.00
 TOKEN_COSINE_WEIGHT = 0.00
-SEQUENCE_HUBER_WEIGHT = 0.00
-SEQUENCE_COSINE_WEIGHT = 0.00
+SEQUENCE_HUBER_WEIGHT = 0.20
+SEQUENCE_COSINE_WEIGHT = 0.20
 
 # Dataset
-SHUFFLE_DATASET = True
+SHUFFLE_DATASET = False
 
 # Optimizer state preservation
 REUSE_OPTIMIZER_STATE = True
@@ -101,28 +101,28 @@ LOG_VRAM_USAGE = True
 TRAIN_PROJECTION = True
 TRAIN_MODEL = True
 
-# Layer arrangement - Qwen3 0.6B output is 1024 dim and only linear layers up-project this. Final output should be 4096 dim
+# Layer arrangement - We use T5-like blocks to both project the dim and refine the output towards the target. Final output should be 4096
+# If you keep default T5 encoder and RMSNorm config, we'll extract the matching final encoder block and RMSNorm from T5 directly
+# I'm keeping input_dim implicit since it can be inferred by code, and hidden_dim/size == input_dim so same for that
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
-        "type": "transformer",
-        "dim_feedforward": 4096,
-        "file_num": 1,
-    },
-    {
-        "type": "linear",
-        "output_dim": 2048,
-        "file_num": 2,
-    },
-    {
-        "type": "activation",
-        "file_num": 3,
-    },
-    {
         "type": "linear",
         "output_dim": 4096,
-        "file_num": 4,
-    }
+        "file_num": 1
+    },
+    {
+        "type": "t5_encoder",
+        "num_heads": 64,
+        "dropout_rate": 0.1,
+        "relative_attention_num_buckets": 32,
+        "dim_feedforward": 10240,
+        "file_num": 2
+    },
+    {
+        "type": "t5_rmsnorm",
+        "file_num": 3
+    },
 ]
 
 # ========== Experimental/Unused Configuration ==========
@@ -135,7 +135,7 @@ SKIP_DROPOUT_IF_NORMAL_STUDENT_ENHANCED_TEACHER = True
 
 # Enhanced dataset - experimental option that is not really useful at the moment
 ENHANCED_DATASET = True
-ENHANCED_DATASET_PATH = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
+ENHANCED_DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset_enhanced.txt"
 UNTAMPERED_STUDENT_AND_TEACHER_RATIO = 0.50
 ENHANCED_TEACHER_EMBEDDING_RATIO = 0.00
 ENHANCED_STUDENT_AND_TEACHER_RATIO = 0.50
@@ -150,37 +150,438 @@ class LinearLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
-class ActivationLayer(torch.nn.Module):
-    def __init__(self):
+# ========== T5 Layers ==========
+class T5RMSNorm(torch.nn.Module):
+    """T5's RMSNorm (no mean subtraction, just scaling)"""
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.activation = torch.nn.GELU()
-        self.layer_type = "activation"
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.activation(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm: normalize by root mean square, no mean subtraction
+        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        x = x / torch.sqrt(variance + self.variance_epsilon)
 
-class TransformerLayer(torch.nn.Module):
-    def __init__(self, dim_feedforward: int, num_layers: int = 1, hidden_size: int = 1024):
+        # Cast back to original dtype if needed
+        if self.weight.dtype == torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
+        return self.weight * x
+
+class T5RelativePositionBias(torch.nn.Module):
+    """T5's relative position bias for attention"""
+    def __init__(self, num_heads: int, relative_attention_num_buckets: int = 32):
         super().__init__()
-        transformer_layer = torch.nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=8,
-            dim_feedforward=dim_feedforward,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True
+        self.num_heads = num_heads
+        self.relative_attention_num_buckets = relative_attention_num_buckets
+        self.relative_attention_bias = torch.nn.Parameter(
+            torch.zeros(num_heads, relative_attention_num_buckets)
         )
-        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.layer_type = "transformer"
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.transformer(x)
-        return x
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position: torch.Tensor,
+        bidirectional: bool = True,
+        num_buckets: int = 32,
+        max_distance: int = 128
+    ) -> torch.Tensor:
+
+        ret = 0
+        if bidirectional:
+            num_buckets //= 2
+            ret += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+
+        # Now n is in the range [0, inf)
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        # The other half are for larger distances
+        relative_position_if_large = torch.log(relative_position.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        relative_position_if_large = torch.clamp(relative_position_if_large.round().long(), min=0, max=num_buckets - 1)
+
+        ret += torch.where(is_small, relative_position, relative_position_if_large)
+        return ret
+
+    def forward(self, query_length: int, key_length: int) -> torch.Tensor:
+        """Compute relative position bias"""
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,
+            bidirectional=True,
+            num_buckets=self.relative_attention_num_buckets
+        )
+
+        device = self.relative_attention_bias.device
+        relative_position_bucket = relative_position_bucket.to(device)
+
+        bias_expanded = self.relative_attention_bias.unsqueeze(1).expand(-1, query_length, -1)
+
+        values = bias_expanded.gather(
+            2,  # Gather along the bucket dimension (dim=2 in expanded bias)
+            relative_position_bucket.unsqueeze(0).expand(self.num_heads, -1, -1)
+        )
+        return values
+
+class T5Attention(torch.nn.Module):
+    """T5's multi-head self-attention with relative position biases"""
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout_rate: float = 0.1,
+        relative_attention_num_buckets: int = 32
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Q, K, V projections (no bias)
+        self.q = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Output projection
+        self.o = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Relative position bias
+        self.relative_attention_bias = T5RelativePositionBias(
+            num_heads=num_heads,
+            relative_attention_num_buckets=relative_attention_num_buckets
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, seq_length, hidden_size = hidden_states.size()
+
+        # Project to Q, K, V
+        query_states = self.q(hidden_states)
+        key_states = self.k(hidden_states)
+        value_states = self.v(hidden_states)
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Compute attention scores
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Add relative position bias
+        relative_bias = self.relative_attention_bias(seq_length, seq_length)
+        attn_scores = attn_scores + relative_bias.unsqueeze(0)
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        # Softmax and dropout
+        attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_probs, value_states)
+
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, hidden_size)
+        attn_output = self.o(attn_output)
+
+        return attn_output
+
+
+class T5FeedForward(torch.nn.Module):
+    """T5's feed-forward network (DenseReluDense)"""
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dropout_rate: float = 0.1
+    ):
+        super().__init__()
+        # Dense layers (no bias)
+        self.wi = torch.nn.Linear(hidden_size, intermediate_size, bias=False)  # Input/Intermediate
+        self.wo = torch.nn.Linear(intermediate_size, hidden_size, bias=False)   # Output
+
+        # Activation and dropout
+        self.activation = torch.nn.GELU()
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.wi(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.wo(hidden_states)
+        return hidden_states
+
+class T5EncoderBlock(torch.nn.Module):
+    """
+    Architecture:
+    1. LayerNorm (RMSNorm)
+    2. Self-Attention (with relative position biases)
+    3. Dropout + Residual
+    4. LayerNorm (RMSNorm)
+    5. Feed-Forward Network
+    6. Dropout + Residual
+    """
+    def __init__(
+        self,
+        hidden_size: int = 4096,
+        num_heads: int = 64,
+        dropout_rate: float = 0.1,
+        relative_attention_num_buckets: int = 32,
+        dim_feedforward: int = 10240
+    ):
+        super().__init__()
+
+        # Self-attention layer
+        self.layer_norm_self_attention = T5RMSNorm(hidden_size)
+        self.self_attention = T5Attention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            relative_attention_num_buckets=relative_attention_num_buckets
+        )
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Feed-forward layer
+        self.layer_norm_feed_forward = T5RMSNorm(hidden_size)
+        self.feed_forward = T5FeedForward(
+            hidden_size=hidden_size,
+            intermediate_size=dim_feedforward,
+            dropout_rate=dropout_rate
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Self-attention block with pre-norm and residual
+        normed_hidden_states = self.layer_norm_self_attention(hidden_states)
+        attn_output = self.self_attention(
+            hidden_states=normed_hidden_states,
+            attention_mask=attention_mask
+        )
+        attn_output = self.dropout(attn_output)
+        hidden_states = hidden_states + attn_output
+
+        # Feed-forward block with pre-norm and residual
+        normed_hidden_states = self.layer_norm_feed_forward(hidden_states)
+        ff_output = self.feed_forward(normed_hidden_states)
+        ff_output = self.dropout(ff_output)
+        hidden_states = hidden_states + ff_output
+
+        return hidden_states
+
+# ========== T5 Helper Functions ==========
+def extract_t5_layer(t5_model, layer_type: str, layer_config: dict):
+    """Extract a layer from the T5-xxl model or create one with same config"""
+    try:
+        if layer_type == "t5_encoder":
+            # Get T5 config
+            config = t5_model.config
+            t5_hidden_size = config.d_model
+            t5_num_heads = config.num_heads
+            t5_dropout_rate = config.dropout_rate
+            t5_relative_attention_num_buckets = config.relative_attention_num_buckets
+
+            # Get requested config from PROJECTION_LAYERS_CONFIG
+            requested_hidden_size = layer_config.get("hidden_size", 4096)
+            requested_num_heads = layer_config.get("num_heads", 64)
+            requested_dropout_rate = layer_config.get("dropout_rate", 0.1)
+            requested_relative_attention_num_buckets = layer_config.get("relative_attention_num_buckets", 32)
+
+            # Check if requested dimensions match T5-xxl config
+            dimensions_match = (
+                (requested_hidden_size == t5_hidden_size) and
+                (requested_num_heads == t5_num_heads) and
+                (requested_dropout_rate == t5_dropout_rate) and
+                (requested_relative_attention_num_buckets == t5_relative_attention_num_buckets)
+            )
+
+            if dimensions_match:
+                print(f"Loading T5 encoder weights from T5-xxl (hidden_size={requested_hidden_size}, heads={requested_num_heads})")
+                # Extract the actual last encoder block
+                block = t5_model.encoder.block[-1]
+
+                # Create new block with requested dimensions
+                new_block = T5EncoderBlock(
+                    hidden_size=requested_hidden_size,
+                    num_heads=requested_num_heads,
+                    dropout_rate=requested_dropout_rate,
+                    relative_attention_num_buckets=requested_relative_attention_num_buckets
+                )
+
+                # Load weights from T5 block
+                try:
+                    # T5Block structure: block has 'layer' with sublayers
+                    # Sublayer 0: SelfAttention (T5LayerSelfAttention)
+                    # Sublayer 1: FeedForward (T5LayerFF)
+
+                    # Load self-attention weights
+                    self_attention = block.layer[0]  # T5LayerSelfAttention
+                    attention = self_attention.SelfAttention  # T5Attention
+
+                    # Load Q, K, V, O projections
+                    new_block.self_attention.q.weight.data = attention.q.weight.data.clone()
+                    new_block.self_attention.k.weight.data = attention.k.weight.data.clone()
+                    new_block.self_attention.v.weight.data = attention.v.weight.data.clone()
+                    new_block.self_attention.o.weight.data = attention.o.weight.data.clone()
+
+                    # Load relative position bias - handle different locations
+                    rel_bias_loaded = False
+                    if hasattr(attention, 'relative_attention_bias'):
+                        new_block.self_attention.relative_attention_bias.relative_attention_bias.data = \
+                            attention.relative_attention_bias.relative_attention_bias.data.clone()
+                        rel_bias_loaded = True
+                    elif hasattr(self_attention, 'SelfAttention'):
+                        if hasattr(self_attention.SelfAttention, 'relative_attention_bias'):
+                            new_block.self_attention.relative_attention_bias.relative_attention_bias.data = \
+                                self_attention.SelfAttention.relative_attention_bias.relative_attention_bias.data.clone()
+                            rel_bias_loaded = True
+                    elif hasattr(block, 'relative_attention_bias'):
+                        new_block.self_attention.relative_attention_bias.relative_attention_bias.data = \
+                            block.relative_attention_bias.relative_attention_bias.data.clone()
+                        rel_bias_loaded = True
+
+                    if not rel_bias_loaded:
+                        # Try to find it in the state dict
+                        state_dict = block.state_dict()
+                        rel_bias_key = None
+                        for key in state_dict.keys():
+                            if 'relative_attention_bias' in key and 'bias' in key:
+                                rel_bias_key = key
+                                break
+                        if rel_bias_key:
+                            new_block.self_attention.relative_attention_bias.relative_attention_bias.data = \
+                                state_dict[rel_bias_key].clone()
+                        else:
+                            print("Warning: Could not find relative_attention_bias in T5 block, initializing randomly")
+
+                    # Load layer norm for self-attention
+                    new_block.layer_norm_self_attention.weight.data = \
+                        self_attention.layer_norm.weight.data.clone()
+
+                    # Load feed-forward weights - handle different implementations
+                    feed_forward = block.layer[1]  # T5LayerFF
+
+                    # Check which type of feed-forward we have
+                    if hasattr(feed_forward, 'DenseReluDense'):
+                        # Standard DenseReluDense
+                        dense_relu_dense = feed_forward.DenseReluDense
+                        new_block.feed_forward.wi.weight.data = dense_relu_dense.wi.weight.data.clone()
+                        new_block.feed_forward.wo.weight.data = dense_relu_dense.wo.weight.data.clone()
+                    elif hasattr(feed_forward, 'DenseGatedActDense'):
+                        # Gated version - combine gate and projection
+                        dense_gated = feed_forward.DenseGatedActDense
+                        # T5 gated has: wi (gate), wi_ (projection), wo (output)
+                        # We need to combine the gate and projection for our simple wi layer
+                        # For simplicity, we'll just use the projection (wi_) as our wi
+                        if hasattr(dense_gated, 'wi_'):
+                            new_block.feed_forward.wi.weight.data = dense_gated.wi_.weight.data.clone()
+                        elif hasattr(dense_gated, 'wi'):
+                            # Fallback to using the gate weight
+                            new_block.feed_forward.wi.weight.data = dense_gated.wi.weight.data.clone()
+                        else:
+                            print("Warning: Could not find feed-forward input weights, initializing randomly")
+
+                        if hasattr(dense_gated, 'wo'):
+                            new_block.feed_forward.wo.weight.data = dense_gated.wo.weight.data.clone()
+                        else:
+                            print("Warning: Could not find feed-forward output weights, initializing randomly")
+                    else:
+                        # Try to find weights in state dict
+                        state_dict = feed_forward.state_dict()
+                        wi_key = None
+                        wo_key = None
+                        for key in state_dict.keys():
+                            if 'wi' in key and 'weight' in key and '_gate' not in key:
+                                wi_key = key
+                            elif 'wo' in key and 'weight' in key:
+                                wo_key = key
+
+                        if wi_key:
+                            new_block.feed_forward.wi.weight.data = state_dict[wi_key].clone()
+                        else:
+                            print("Warning: Could not find feed-forward input weights in state dict, initializing randomly")
+
+                        if wo_key:
+                            new_block.feed_forward.wo.weight.data = state_dict[wo_key].clone()
+                        else:
+                            print("Warning: Could not find feed-forward output weights in state dict, initializing randomly")
+
+                    # Load layer norm for feed-forward
+                    new_block.layer_norm_feed_forward.weight.data = \
+                        feed_forward.layer_norm.weight.data.clone()
+
+                    new_block.extracted_from_t5 = True
+                    return new_block
+
+                except Exception as e:
+                    print(f"Failed to load weights from T5 block: {e}")
+                    # Fall back to new initialization
+                    pass
+
+            # Dimensions don't match or weight loading failed - create new block
+            print(f"Initializing new T5 encoder block with config (hidden_size={requested_hidden_size}, heads={requested_num_heads})")
+            new_block = T5EncoderBlock(
+                hidden_size=requested_hidden_size,
+                num_heads=requested_num_heads,
+                dropout_rate=requested_dropout_rate,
+                relative_attention_num_buckets=requested_relative_attention_num_buckets
+            )
+            new_block.extracted_from_t5 = False
+            return new_block
+
+        elif layer_type == "t5_rmsnorm":
+            # Get the final layer norm
+            if hasattr(t5_model, 'encoder') and hasattr(t5_model.encoder, 'final_layer_norm'):
+                norm = t5_model.encoder.final_layer_norm
+                t5_hidden_size = norm.weight.size(0)
+
+                # For RMSNorm, we need to match the previous layer's output
+                requested_hidden_size = layer_config.get("hidden_size", 4096)
+
+                # Check if dimensions match
+                if requested_hidden_size == t5_hidden_size:
+                    print(f"Loading T5 RMSNorm weights from T5-xxl (hidden_size={requested_hidden_size})")
+                    new_norm = T5RMSNorm(
+                        hidden_size=requested_hidden_size,
+                        eps=norm.variance_epsilon
+                    )
+                    new_norm.weight.data = norm.weight.data.clone()
+                    new_norm.extracted_from_t5 = True
+                    return new_norm
+                else:
+                    print(f"Initializing new T5 RMSNorm (hidden_size={requested_hidden_size})")
+                    new_norm = T5RMSNorm(
+                        hidden_size=requested_hidden_size,
+                        eps=1e-6
+                    )
+                    new_norm.extracted_from_t5 = False
+                    return new_norm
+            else:
+                return None
+
+        else:
+            return None
+
+    except Exception as e:
+        print(f"Warning: Failed to extract T5 layer ({layer_type}): {e}")
+        return None
 
 # ========== Token Alignment ==========
 def normalize_token(token):
-    """More conservative normalization"""
     prefixes_to_remove = ['Ġ', '▁', '▔', '▃', '�']
     for prefix in prefixes_to_remove:
         if token.startswith(prefix):
@@ -1068,22 +1469,6 @@ class AlignmentLoss(torch.nn.Module):
             total_loss, total_huber_loss, total_cosine_loss, text_aligned_ratio
         )
 
-    def compute_huber_cosine_loss(self, student_embs, teacher_embs, huber_weight, cosine_weight):
-        """Compute combined Huber and cosine loss"""
-        if len(student_embs) == 0:
-            return torch.tensor(0.0, device=student_embs.device, requires_grad=True), \
-                   torch.tensor(0.0, device=student_embs.device, requires_grad=True), \
-                   torch.tensor(0.0, device=student_embs.device, requires_grad=True)
-
-        # Huber loss
-        huber_loss = self.huber_loss(student_embs, teacher_embs)
-
-        # Cosine loss
-        cos_sim = self.cosine_loss(student_embs, teacher_embs)
-        cosine_loss = (1 - cos_sim).mean()
-
-        return huber_loss, cosine_loss
-
 class TokenLoss(torch.nn.Module):
     """Loss for token-level position matching with optional position targeting"""
     def __init__(self, huber_weight: float = 0.7, cosine_weight: float = 0.3,
@@ -1215,7 +1600,7 @@ class PreTokenizedDataset(Dataset):
                  cache_path: Optional[str] = None):
         self.max_length = max_length
         if USE_SEPARATE_EVALUATION_DATASET and is_eval:
-            file_path = EVALUATION_DATASET_PATH
+            file_path = EVALUATION_DATASET_DIR
             sample_rate = None
 
         with open(file_path, "r", encoding="utf-8") as f:
@@ -1226,7 +1611,7 @@ class PreTokenizedDataset(Dataset):
 
         self.enhanced_lines = []
         if ENHANCED_DATASET:
-            with open(ENHANCED_DATASET_PATH, "r", encoding="utf-8") as f:
+            with open(ENHANCED_DATASET_DIR, "r", encoding="utf-8") as f:
                 self.enhanced_lines = [line.strip() for line in f.readlines() if line.strip()]
 
             if len(self.enhanced_lines) < len(self.lines):
@@ -1268,7 +1653,7 @@ class PreTokenizedDataset(Dataset):
                 self.mask_files = [os.path.join(self.cache_folder, f"{i}_mask.pt") for i in range(len(self.lines))]
 
                 if ENHANCED_DATASET:
-                    enhanced_base_name = os.path.basename(ENHANCED_DATASET_PATH)
+                    enhanced_base_name = os.path.basename(ENHANCED_DATASET_DIR)
                     enhanced_cache_folder = os.path.join(cache_path, enhanced_base_name)
                     enhanced_validation_file = os.path.join(enhanced_cache_folder, f"{enhanced_base_name}.validation")
 
@@ -1277,7 +1662,7 @@ class PreTokenizedDataset(Dataset):
                         self.enhanced_embedding_files = [os.path.join(enhanced_cache_folder, f"{i}.pt") for i in range(len(self.enhanced_lines))]
                         self.enhanced_mask_files = [os.path.join(enhanced_cache_folder, f"{i}_mask.pt") for i in range(len(self.enhanced_lines))]
                     else:
-                        print(f"Generating and caching enhanced embeddings for {ENHANCED_DATASET_PATH}")
+                        print(f"Generating and caching enhanced embeddings for {ENHANCED_DATASET_DIR}")
                         os.makedirs(enhanced_cache_folder, exist_ok=True)
                         for i, line in enumerate(tqdm(self.enhanced_lines, desc="Generating enhanced embeddings")):
                             teacher_inputs = teacher_tokenizer(
@@ -1486,16 +1871,34 @@ class PreTokenizedDataset(Dataset):
 
 # ========== Projection Function ==========
 def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embedding_dim: int) -> Tuple[List[torch.nn.Module], int]:
-    """Get projection layers with inference-ready implementations"""
+    """Get projection layers with T5-xxl layer extraction and fallback"""
     projection_layers = []
 
     output_dim_prev = 1024
     layers_to_load = len(PROJECTION_LAYERS_CONFIG)
 
+    # Load T5 model once if we need to extract layers
+    t5_model = None
+    needs_t5_model = any(
+        layer_config["type"] in ["t5_rmsnorm"]
+        and not os.path.exists(os.path.join(QWEN3_MODEL_DIR, f"projection_layer_{layer_config['file_num']}.safetensors"))
+        for layer_config in PROJECTION_LAYERS_CONFIG
+    )
+
+    if needs_t5_model:
+        print("Loading T5-xxl model for layer extraction (CPU-only)...")
+        t5_model = T5EncoderModel.from_pretrained(
+            T5_MODEL_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",  # Keep on CPU
+            low_cpu_mem_usage=True
+        )
+        t5_model.eval()  # Ensure it's in eval mode
+
     for i in range(1, layers_to_load + 1):
         layer_config = PROJECTION_LAYERS_CONFIG[i-1]
         layer_num = layer_config["file_num"]
-        layer_path = os.path.join(QWEN3_MODEL_NAME, f"projection_layer_{layer_num}.safetensors")
+        layer_path = os.path.join(QWEN3_MODEL_DIR, f"projection_layer_{layer_num}.safetensors")
         input_dim = output_dim_prev
         file_num = layer_config["file_num"]
 
@@ -1520,39 +1923,70 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 projection_layer.is_new = True
             output_dim_prev = output_dim
 
-
-        elif layer_config["type"] == "activation":
-            output_dim = output_dim_prev
-            if os.path.exists(layer_path):
-                state_dict = load_file(layer_path)
-                projection_layer = ActivationLayer()
-                projection_layer.load_state_dict(state_dict)
-                print(f"Loading existing activation layer {file_num}")
-                projection_layer.is_new = False
-            else:
-                projection_layer = ActivationLayer()
-                print(f"Initialising new activation layer {file_num}")
-                projection_layer.is_new = True
-
-        elif layer_config["type"] == "transformer":
+        elif layer_config["type"] == "t5_encoder":
             hidden_size = output_dim_prev
-            dim_feedforward = layer_config["dim_feedforward"]
+            num_heads = layer_config.get("num_heads", 64)
+            dropout_rate = layer_config.get("dropout_rate", 0.1)
+            relative_attention_num_buckets = layer_config.get("relative_attention_num_buckets", 32)
+            dim_feedforward = layer_config.get("dim_feedforward", 10240)
             if os.path.exists(layer_path):
                 state_dict = load_file(layer_path)
-                projection_layer = TransformerLayer(
-                    dim_feedforward=dim_feedforward,
+                projection_layer = T5EncoderBlock(
                     hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    dropout_rate=dropout_rate,
+                    relative_attention_num_buckets=relative_attention_num_buckets,
+                    dim_feedforward=dim_feedforward
                 )
                 projection_layer.load_state_dict(state_dict)
-                print(f"Loading existing transformer layer {file_num}")
+                print(f"Loading existing T5 encoder block {file_num}")
                 projection_layer.is_new = False
             else:
-                projection_layer = TransformerLayer(
-                    dim_feedforward=dim_feedforward,
+                projection_layer = T5EncoderBlock(
                     hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    dropout_rate=dropout_rate,
+                    relative_attention_num_buckets=relative_attention_num_buckets,
+                    dim_feedforward=dim_feedforward
                 )
-                print(f"Initialising new transformer layer {file_num}")
+                print(f"Initialising new T5 encoder block {file_num}")
                 projection_layer.is_new = True
+
+        elif layer_config["type"] == "t5_rmsnorm":
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = T5RMSNorm(
+                    hidden_size=output_dim_prev,
+                )
+                projection_layer.load_state_dict(state_dict)
+                print(f"Loading existing T5 RMSNorm layer {file_num}")
+                projection_layer.is_new = False
+            else:
+                # Try to extract from T5-xxl model
+                if t5_model is None:
+                    print("Loading T5-xxl model for layer extraction (CPU-only)...")
+                    t5_model = T5EncoderModel.from_pretrained(
+                        T5_MODEL_DIR,
+                        torch_dtype=torch.bfloat16,
+                        device_map="cpu",
+                        low_cpu_mem_usage=True
+                    )
+                    t5_model.eval()
+
+                extracted_layer = extract_t5_layer(t5_model, "t5_rmsnorm", {"hidden_size": output_dim_prev})
+                if extracted_layer is not None:
+                    projection_layer = extracted_layer
+                    print(f"Extracting T5 RMSNorm from T5-xxl for layer {file_num}")
+                    projection_layer.is_new = True
+                    projection_layer.extracted_from_t5 = True
+                else:
+                    # Fallback to new initialization
+                    projection_layer = T5RMSNorm(
+                        hidden_size=output_dim_prev,
+                    )
+                    print(f"Failed to extract T5 RMSNorm, initializing new layer {file_num}")
+                    projection_layer.is_new = True
+                    projection_layer.extracted_from_t5 = False
 
         projection_layer.file_num = layer_config["file_num"]
         projection_layers.append(projection_layer)
@@ -1965,7 +2399,7 @@ def main():
 
     print("Loading Qwen3 model...")
     student_model, student_tokenizer = FastLanguageModel.from_pretrained(
-        QWEN3_MODEL_NAME,
+        QWEN3_MODEL_DIR,
         max_seq_length=512,
         load_in_4bit=False,
         dtype=torch.bfloat16,
@@ -1977,7 +2411,7 @@ def main():
     student_tokenizer.padding_side = "right"
     student_tokenizer.truncation_side = "right"
 
-    teacher_tokenizer = T5TokenizerFast.from_pretrained(T5_MODEL_NAME)
+    teacher_tokenizer = T5TokenizerFast.from_pretrained(T5_MODEL_DIR)
     teacher_tokenizer.padding_side = "right"
     teacher_tokenizer.truncation_side = "right"
 
@@ -1989,21 +2423,21 @@ def main():
     if not USE_CACHED_EMBEDDINGS:
         print("Loading T5-xxl model...")
         teacher_model = T5EncoderModel.from_pretrained(
-            T5_MODEL_NAME,
+            T5_MODEL_DIR,
             torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         teacher_model.eval()
     else:
-        base_name = os.path.basename(DATASET_PATH)
+        base_name = os.path.basename(DATASET_DIR)
         cache_folder = os.path.join(CACHE_PATH, base_name)
         validation_file = os.path.join(cache_folder, f"{base_name}.validation")
-        enhanced_base_name = os.path.basename(ENHANCED_DATASET_PATH)
+        enhanced_base_name = os.path.basename(ENHANCED_DATASET_DIR)
         enhanced_cache_folder = os.path.join(CACHE_PATH, enhanced_base_name)
         enhanced_validation_file = os.path.join(enhanced_cache_folder, f"{enhanced_base_name}.validation")
         if not os.path.exists(validation_file) or (ENHANCED_DATASET and not os.path.exists(enhanced_validation_file)):
             teacher_model = T5EncoderModel.from_pretrained(
-                T5_MODEL_NAME,
+                T5_MODEL_DIR,
                 torch_dtype=torch.bfloat16,
                 device_map="auto"
             )
@@ -2038,7 +2472,7 @@ def main():
 
     # ========== Dataset and Dataloader ==========
     train_dataset = PreTokenizedDataset(
-        DATASET_PATH,
+        DATASET_DIR,
         student_tokenizer,
         teacher_tokenizer,
         512,
@@ -2050,7 +2484,7 @@ def main():
     )
 
     eval_dataset = PreTokenizedDataset(
-        EVALUATION_DATASET_PATH if USE_SEPARATE_EVALUATION_DATASET else DATASET_PATH,
+        EVALUATION_DATASET_DIR if USE_SEPARATE_EVALUATION_DATASET else DATASET_DIR,
         student_tokenizer,
         teacher_tokenizer,
         512,
@@ -2099,7 +2533,7 @@ def main():
             accumulation_step = 0
 
             try:
-                with open(os.path.join(QWEN3_MODEL_NAME, "config.json"), "r") as f:
+                with open(os.path.join(QWEN3_MODEL_DIR, "config.json"), "r") as f:
                     qwen_config = json.load(f)
                 qwen_embedding_dim = qwen_config["hidden_size"]
             except Exception as e:
@@ -2138,7 +2572,7 @@ def main():
                 model_parameters = [p for p in student_model.parameters() if p.requires_grad]
                 model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
 
-            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_NAME, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection, new_layer_exists):
+            if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_DIR, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection, new_layer_exists):
                 # Update learning rates to match scheduler current state
                 if TRAIN_MODEL and scheduler_model:
                     for param_group, lr in zip(model_optimizer.param_groups, scheduler_model.get_last_lr()):
@@ -2253,22 +2687,24 @@ def main():
                         total_loss += total_align_loss
 
                         if token_loss_fn is not None:
-                            token_loss, token_huber, token_cos, num_token = token_loss_fn(
-                                projected_student,
-                                teacher_hidden,
-                                t_mask,
-                                student_mask=s_mask
-                            )
-                            total_loss += token_loss
+                            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                token_loss, token_huber, token_cos, num_token = token_loss_fn(
+                                    projected_student,
+                                    teacher_hidden,
+                                    t_mask,
+                                    student_mask=s_mask
+                                )
+                                total_loss += token_loss
 
                         if sequence_loss_fn is not None:
-                            sequence_loss, sequence_huber, sequence_cos, num_sequence = sequence_loss_fn(
-                                projected_student,
-                                teacher_hidden,
-                                s_mask,
-                                t_mask
-                            )
-                            total_loss += sequence_loss
+                            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                sequence_loss, sequence_huber, sequence_cos, num_sequence = sequence_loss_fn(
+                                    projected_student,
+                                    teacher_hidden,
+                                    s_mask,
+                                    t_mask
+                                )
+                                total_loss += sequence_loss
 
                         # Scale loss for gradient accumulation
                         scaled_loss = total_loss / GRAD_ACCUM_STEPS
@@ -2460,7 +2896,7 @@ def main():
                     if not USE_CACHED_EMBEDDINGS and teacher_model is None:
                         print("Loading T5-xxl model for evaluation...")
                         teacher_model = T5EncoderModel.from_pretrained(
-                            T5_MODEL_NAME,
+                            T5_MODEL_DIR,
                             torch_dtype=torch.bfloat16,
                             device_map="auto"
                         )
