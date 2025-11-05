@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.DEBUG)
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
 QWEN3_MODEL_DIR = "/home/naff/q3-xxs_script/Qwen3-Embedding-0.6B/"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-10/v1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-12/v1"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -52,10 +52,10 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 5e-5
-MIN_LEARNING_RATE_MODEL = 5e-6
-MAX_LEARNING_RATE_PROJ = 10e-5
-MIN_LEARNING_RATE_PROJ = 10e-6
+MAX_LEARNING_RATE_MODEL = 4e-5
+MIN_LEARNING_RATE_MODEL = 4e-6
+MAX_LEARNING_RATE_PROJ = 8e-5
+MIN_LEARNING_RATE_PROJ = 8e-6
 
 # Saving
 SAVE_EVERY_X_STEPS = 0
@@ -77,18 +77,18 @@ This is the main loss type, and the one you should be using normally
 We index the words, and then match individual tokens by text via normalised position in matched words - this is TEXT_MATCH loss
 '''
 TEXT_MATCH_HUBER_WEIGHT = 1.00
-TEXT_MATCH_COSINE_WEIGHT = 1.00
+TEXT_MATCH_COSINE_WEIGHT = 0.50
 WORD_MATCH_HUBER_WEIGHT = 0.50
-WORD_MATCH_COSINE_WEIGHT = 0.50
+WORD_MATCH_COSINE_WEIGHT = 0.25
 
 # Basic weights
 TOKEN_HUBER_WEIGHT = 0.00
 TOKEN_COSINE_WEIGHT = 0.00
-SEQUENCE_HUBER_WEIGHT = 0.20
-SEQUENCE_COSINE_WEIGHT = 0.20
+SEQUENCE_HUBER_WEIGHT = 0.10
+SEQUENCE_COSINE_WEIGHT = 0.05
 
 # Dataset
-SHUFFLE_DATASET = False
+SHUFFLE_DATASET = True
 
 # Optimizer state preservation
 REUSE_OPTIMIZER_STATE = True
@@ -102,8 +102,7 @@ TRAIN_PROJECTION = True
 TRAIN_MODEL = True
 
 # Layer arrangement - We use T5-like blocks to both project the dim and refine the output towards the target. Final output should be 4096
-# If you keep default T5 encoder and RMSNorm config, we'll extract the matching final encoder block and RMSNorm from T5 directly
-# I'm keeping input_dim implicit since it can be inferred by code, and hidden_dim/size == input_dim so same for that
+# If you use T5RMSNorm, we'll extract the matching final encoder block and RMSNorm from T5 directly. Recommended for final output to match T5
 EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
 PROJECTION_LAYERS_CONFIG = [
     {
@@ -115,8 +114,8 @@ PROJECTION_LAYERS_CONFIG = [
         "type": "t5_encoder",
         "num_heads": 64,
         "dropout_rate": 0.1,
-        "relative_attention_num_buckets": 32,
         "dim_feedforward": 10240,
+        "relative_attention_num_buckets": 32,
         "file_num": 2
     },
     {
@@ -149,6 +148,24 @@ class LinearLayer(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
+
+class TransformerLayer(torch.nn.Module):
+    def __init__(self, dim_feedforward: int, num_heads: int = 8, hidden_size: int = 4096, dropout_rate: int = 0.1):
+        super().__init__()
+        transformer_layer = torch.nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=8,
+            dim_feedforward=dim_feedforward,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=1)
+        self.layer_type = "transformer_encoder"
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self.transformer(x)
+        return x
 
 # ========== T5 Layers ==========
 class T5RMSNorm(torch.nn.Module):
@@ -1880,7 +1897,7 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
     # Load T5 model once if we need to extract layers
     t5_model = None
     needs_t5_model = any(
-        layer_config["type"] in ["t5_rmsnorm"]
+        layer_config["type"] in ["t5_encoder", "t5_rmsnorm"]
         and not os.path.exists(os.path.join(QWEN3_MODEL_DIR, f"projection_layer_{layer_config['file_num']}.safetensors"))
         for layer_config in PROJECTION_LAYERS_CONFIG
     )
@@ -1922,6 +1939,33 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                 print(f"Initialising new linear layer {file_num}")
                 projection_layer.is_new = True
             output_dim_prev = output_dim
+
+        elif layer_config["type"] == "transformer_encoder":
+            hidden_size = output_dim_prev
+            num_heads = layer_config.get("num_heads", 64)
+            dropout_rate = layer_config.get("dropout_rate", 0.1)
+            dim_feedforward = layer_config.get("dim_feedforward", 10240)
+
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = TransformerLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    dropout_rate=dropout_rate,
+                    dim_feedforward=dim_feedforward
+                )
+                projection_layer.load_state_dict(state_dict)
+                print(f"Loading existing standard transformer encoder block {file_num}")
+                projection_layer.is_new = False
+            else:
+                projection_layer = TransformerLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    dropout_rate=dropout_rate,
+                    dim_feedforward=dim_feedforward
+                )
+                print(f"Initialising new standard transformer encoder block {file_num}")
+                projection_layer.is_new = True
 
         elif layer_config["type"] == "t5_encoder":
             hidden_size = output_dim_prev
