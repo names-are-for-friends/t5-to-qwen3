@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-11/v2/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/1layer_a/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -948,14 +948,35 @@ class LinearLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
+class MLPLayer(torch.nn.Module):
+    """Multi-Layer Perceptron with configurable layers"""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout_rate: float = 0.1):
+        super().__init__()
+        layers = []
+
+        # Input layer
+        self.linear1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.GELU()
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Output layer
+        self.linear2 = torch.nn.Linear(hidden_dim, output_dim)
+        self.layer_type = "mlp"
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return self.linear2(x)
+
 class TransformerLayer(torch.nn.Module):
     def __init__(self, dim_feedforward: int, num_heads: int = 8, hidden_size: int = 4096, dropout_rate: int = 0.1):
         super().__init__()
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=hidden_size,
-            nhead=8,
+            nhead=num_heads,
             dim_feedforward=dim_feedforward,
-            dropout=0.0,
+            dropout=dropout_rate,
             activation='gelu',
             batch_first=True
         )
@@ -963,8 +984,7 @@ class TransformerLayer(torch.nn.Module):
         self.layer_type = "transformer_encoder"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.transformer(x)
-        return x
+        return self.transformer(x)
 
 # ========== T5 Layers ==========
 class T5RMSNorm(torch.nn.Module):
@@ -1115,8 +1135,7 @@ class T5Attention(torch.nn.Module):
         return attn_output
 
 
-class T5FeedForward(torch.nn.Module):
-    """T5's feed-forward network (DenseReluDense)"""
+class T5FeedForwardGated(torch.nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -1124,31 +1143,37 @@ class T5FeedForward(torch.nn.Module):
         dropout_rate: float = 0.1
     ):
         super().__init__()
-        # Dense layers (no bias)
-        self.wi = torch.nn.Linear(hidden_size, intermediate_size, bias=False)  # Input/Intermediate
-        self.wo = torch.nn.Linear(intermediate_size, hidden_size, bias=False)   # Output
+        # Two parallel dense layers for the gating mechanism (no bias)
+        self.wi_0 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)  # Gate layer
+        self.wi_1 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)  # Input layer
 
-        # Activation and dropout
+        # Output layer (no bias)
+        self.wo = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+
+        # Activation and dropout (applied after gating)
         self.activation = torch.nn.GELU()
         self.dropout = torch.nn.Dropout(dropout_rate)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.wi(hidden_states)
-        hidden_states = self.activation(hidden_states)
+        # Project through both parallel layers
+        hidden_gates = self.wi_0(hidden_states)
+        hidden_linear = self.wi_1(hidden_states)
+
+        # Apply activation only to the gate
+        hidden_gates = self.activation(hidden_gates)
+
+        # Element-wise multiplication (gating)
+        hidden_states = hidden_gates * hidden_linear
+
+        # Apply dropout
         hidden_states = self.dropout(hidden_states)
+
+        # Project to original dimension
         hidden_states = self.wo(hidden_states)
+
         return hidden_states
 
 class T5EncoderBlock(torch.nn.Module):
-    """
-    Architecture:
-    1. LayerNorm (RMSNorm)
-    2. Self-Attention (with relative position biases)
-    3. Dropout + Residual
-    4. LayerNorm (RMSNorm)
-    5. Feed-Forward Network
-    6. Dropout + Residual
-    """
     def __init__(
         self,
         hidden_size: int = 4096,
@@ -1169,9 +1194,9 @@ class T5EncoderBlock(torch.nn.Module):
         )
         self.dropout = torch.nn.Dropout(dropout_rate)
 
-        # Feed-forward layer
+        # Gated Feed-forward layer
         self.layer_norm_feed_forward = T5RMSNorm(hidden_size)
-        self.feed_forward = T5FeedForward(
+        self.feed_forward = T5FeedForwardGated(
             hidden_size=hidden_size,
             intermediate_size=dim_feedforward,
             dropout_rate=dropout_rate
@@ -1475,6 +1500,17 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
                 output_dim=layer_config["output_dim"],
             )
             output_dim_prev = layer_config["output_dim"]
+        elif layer_config["type"] == "mlp":
+            input_dim = output_dim_prev
+            hidden_dim = layer_config.get("hidden_dim", input_dim)
+            output_dim = layer_config.get("output_dim", hidden_dim)
+            layer = MLPLayer(
+                input_dim=output_dim_prev,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                dropout_rate=layer_config["dropout_rate"]
+            )
+            output_dim_prev = output_dim
         elif layer_config["type"] == "transformer_encoder":
             layer = TransformerLayer(
                         hidden_size=output_dim_prev,
