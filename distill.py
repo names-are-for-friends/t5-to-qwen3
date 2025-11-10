@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-13/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-14"
+QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-19/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-20"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -49,6 +49,7 @@ WRITE_TO_LOG_EVERY_X_STEPS = 10
 
 # Debug output
 ENABLE_ALIGNMENT_DEBUG = False
+ENABLE_SPACE_TOKEN_MATCHING_DEBUG = False
 
 # Training parameters
 BATCH_SIZE = 32
@@ -78,7 +79,6 @@ RESTART_CYCLE_STEPS = 350 # 0 = flat LR with no restart
 REPEAT_WARMUP_AFTER_RESTART = False
 '''
 --Loss weights--
-This is the main loss type, and the one you should be using normally
 We index the words, and then match individual tokens by text via normalised position in matched words - this is TEXT_MATCH loss
 Then, we attempt to match single or multiple student tokens to single or multiple teacher tokens by text - this is SPLIT_TOKEN loss
 Finally, we can use mean pooling loss for extra reinforcement - this is SEQUENCE loss
@@ -90,12 +90,12 @@ SPLIT_TOKEN_COSINE_WEIGHT = 0.10
 SEQUENCE_HUBER_WEIGHT = 0.10
 SEQUENCE_COSINE_WEIGHT = 0.01
 
-# Padding options - You can match tokens after the attended sequence. T5 has one EOS then repeated pad, Qwen has just one repeated post-sequence joint pad/EOS token
-MIN_EXTRA_MATCHED_PADDING = 1
-MAX_EXTRA_MATCHED_PADDING = 1
+# Padding options - You can match tokens after the attended sequence. T5 has one EOS then repeated pad, Qwen has just one repeated post-sequence joint pad/EOS token. Loss fluctuation is normal with a wider range and higher loss weight
+MIN_EXTRA_MATCHED_PADDING = 0
+MAX_EXTRA_MATCHED_PADDING = 3
 PADDING_LOSS_WEIGHT = 0.2
 
-# Cosine thresholds - turn this to zero at first, since semantic representations will be unrelated until trained
+# Cosine thresholds - turn TEXT_MATCH threshold to zero at first, since semantic representations will be unrelated until trained
 TEXT_MATCH_COSINE_THRESHOLD = 0.0
 SPLIT_TOKEN_COSINE_THRESHOLD = 0.0
 
@@ -747,7 +747,7 @@ def create_word_info(tokens, reconstructed_text, token_positions, original_text,
         'token_char_positions': [t['char_start'] for t in tokens]
     }
 
-def get_word_exterior_sequences(tokens, words):
+def get_word_exterior_sequences(tokens, words, tokenizer):
     """Identify sequences of space tokens between words"""
     if not words:
         return []
@@ -757,13 +757,43 @@ def get_word_exterior_sequences(tokens, words):
     for word in words:
         word_tokens.update(word['tokens'])
 
-    # Find space tokens (tokens that are empty after normalization)
+    # Find space tokens using original token text
     space_tokens = []
     for idx, token in enumerate(tokens):
         if idx not in word_tokens:
+            # Check if this is a space token using multiple criteria
+            is_space = False
+
+            # Method 1: Check for space prefixes before normalization
+            # Added more common space prefixes
+            space_prefixes = ['Ġ', '▁', '▔', '▃', 'Ċ', 'ĉ', 'ľ', 'ŀ', '­', '﻿', ' ', '\t', '\n', '##', '#']
+            if any(token.startswith(prefix) for prefix in space_prefixes):
+                is_space = True
+
+            # Method 2: Check if normalized token is empty or space
             norm_token = normalize_token(token)
-            # Check if this is effectively a space (empty after normalization)
-            if norm_token == '' or norm_token == ' ':
+            if norm_token == '' or norm_token == ' ' or norm_token.isspace():
+                is_space = True
+
+            # Method 3: Check tokenizer conversion
+            if hasattr(tokenizer, 'convert_tokens_to_string'):
+                try:
+                    token_str = tokenizer.convert_tokens_to_string([token])
+                    if token_str.isspace() or token_str == '':
+                        is_space = True
+                except:
+                    pass
+
+            # Method 4: Check if the token ID corresponds to a space character
+            if hasattr(tokenizer, 'decode'):
+                try:
+                    decoded = tokenizer.decode([tokenizer.convert_tokens_to_ids([token])[0]])
+                    if decoded.isspace() or decoded == '':
+                        is_space = True
+                except:
+                    pass
+
+            if is_space:
                 space_tokens.append(idx)
 
     # Group contiguous space tokens into sequences
@@ -782,79 +812,227 @@ def get_word_exterior_sequences(tokens, words):
 
     return sequences
 
+def get_space_tokens_simple(tokens, tokenizer, exclude_tokens=None):
+    """Simple approach: Get all non-word tokens (excluding special tokens)"""
+    if exclude_tokens is None:
+        exclude_tokens = set()
+
+    space_tokens = []
+
+    for idx, token in enumerate(tokens):
+        # Skip if this is a special token
+        if hasattr(tokenizer, 'convert_tokens_to_ids'):
+            try:
+                token_id = tokenizer.convert_tokens_to_ids([token])[0]
+                if token_id in exclude_tokens:
+                    continue
+            except:
+                pass
+
+        # Check if this is a space token by multiple criteria
+        is_space = False
+
+        # Method 1: Check for common space prefixes
+        if any(token.startswith(prefix) for prefix in ['Ġ', '▁', ' ', '\t', '\n']):
+            is_space = True
+
+        # Method 2: Check if normalized token is empty or just a space
+        norm_token = normalize_token(token)
+        if norm_token == '' or norm_token == ' ' or norm_token.isspace():
+            is_space = True
+
+        # Method 3: Check if decoded token is a space
+        try:
+            decoded = tokenizer.decode([tokenizer.convert_tokens_to_ids([token])[0]])
+            if decoded.isspace() or decoded == '':
+                is_space = True
+        except:
+            pass
+
+        # Method 4: Check if the token contains only space characters
+        if all(c.isspace() for c in token):
+            is_space = True
+
+        if is_space:
+            space_tokens.append(idx)
+
+    return space_tokens
+
+def match_space_tokens_simple(student_spaces, teacher_spaces,
+                             student_embeddings, teacher_embeddings,
+                             cosine_threshold=0.5):
+    """Simple space token matching with leading space token handling"""
+    if not student_spaces or not teacher_spaces:
+        return []
+
+    # Check if teacher has a leading space token (at position 0)
+    # This is a common quirk where teacher tokenizer adds a space at the start
+    teacher_spaces_filtered = teacher_spaces
+    if teacher_spaces and teacher_spaces[0] == 0:
+        # Remove the leading space token from teacher spaces
+        teacher_spaces_filtered = teacher_spaces[1:]
+        if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+            print(f"DEBUG - Removed leading space token from teacher (was at position 0)")
+
+    # Get the actual embeddings for space tokens
+    student_space_embs = student_embeddings[student_spaces]
+    teacher_space_embs = teacher_embeddings[teacher_spaces_filtered]
+
+    matches = []
+
+    # Case 1: Equal number of space tokens - match sequentially
+    if len(student_spaces) == len(teacher_spaces_filtered):
+        for s_idx, t_idx in zip(student_spaces, teacher_spaces_filtered):
+            matches.append((s_idx, t_idx))
+
+    # Case 2: Unequal number - match by position and similarity
+    else:
+        # Calculate normalized positions within the space token sequence
+        student_norm_positions = [(i / max(len(student_spaces) - 1, 1))
+                                 for i in range(len(student_spaces))]
+        teacher_norm_positions = [(i / max(len(teacher_spaces_filtered) - 1, 1))
+                                 for i in range(len(teacher_spaces_filtered))]
+
+        used_student = set()
+        used_teacher = set()
+
+        # For each student space token, find best match
+        for s_seq_idx, s_token_idx in enumerate(student_spaces):
+            if s_token_idx in used_student:
+                continue
+
+            s_norm_pos = student_norm_positions[s_seq_idx]
+            s_emb = student_space_embs[s_seq_idx]
+
+            # Find closest teacher token by position
+            best_t_idx = None
+            best_similarity = -1
+
+            for t_seq_idx, t_token_idx in enumerate(teacher_spaces_filtered):
+                if t_token_idx in used_teacher:
+                    continue
+
+                t_norm_pos = teacher_norm_positions[t_seq_idx]
+                t_emb = teacher_space_embs[t_seq_idx]
+
+                # Check if positions are close
+                pos_diff = abs(s_norm_pos - t_norm_pos)
+                if pos_diff > 0.3:  # Don't match if positions are too different
+                    continue
+
+                # Calculate cosine similarity
+                similarity = F.cosine_similarity(s_emb.unsqueeze(0), t_emb.unsqueeze(0), dim=-1)
+
+                if similarity > best_similarity and similarity >= cosine_threshold:
+                    best_similarity = similarity
+                    best_t_idx = t_token_idx
+
+            if best_t_idx is not None:
+                matches.append((s_token_idx, best_t_idx))
+                used_student.add(s_token_idx)
+                used_teacher.add(best_t_idx)
+
+    return matches
+
 def match_space_sequences(student_spaces, teacher_spaces,
                          student_words, teacher_words,
                          window_size=2):
-    """Match space sequences based on surrounding words"""
+    """Match space sequences based on surrounding words and positions"""
     if not student_spaces or not teacher_spaces:
         return []
 
     matches = []
 
-    # For each student space sequence
-    for s_seq in student_spaces:
-        # Find surrounding words
-        s_prev_word = None
-        s_next_word = None
+    # Create a mapping from word boundaries to space sequences with positions
+    def create_space_to_words_map(spaces, words):
+        space_info = []
+        for seq in spaces:
+            # Find surrounding words
+            prev_word = None
+            next_word = None
 
-        # Find previous word (word ending before this space)
-        for word in reversed(student_words):
-            if word['last_token_idx'] < s_seq[0]:
-                s_prev_word = word
-                break
+            # Find previous word (word ending before this space)
+            for word in reversed(words):
+                if word['last_token_idx'] < seq[0]:
+                    prev_word = word
+                    break
 
-        # Find next word (word starting after this space)
-        for word in student_words:
-            if word['first_token_idx'] > s_seq[-1]:
-                s_next_word = word
-                break
+            # Find next word (word starting after this space)
+            for word in words:
+                if word['first_token_idx'] > seq[-1]:
+                    next_word = word
+                    break
 
-        # Find matching teacher space sequence
+            # Calculate normalized position within sequence
+            seq_len = len(seq)
+            if seq_len > 1:
+                positions = [(i / (seq_len - 1)) for i in range(seq_len)]
+            else:
+                positions = [0.5]  # Center position for single token
+
+            space_info.append({
+                'sequence': seq,
+                'prev_word': prev_word,
+                'next_word': next_word,
+                'positions': positions
+            })
+        return space_info
+
+    student_space_info = create_space_to_words_map(student_spaces, student_words)
+    teacher_space_info = create_space_to_words_map(teacher_spaces, teacher_words)
+
+    # For each student space sequence, find best matching teacher sequence
+    for s_info in student_space_info:
+        s_seq = s_info['sequence']
+        s_prev = s_info['prev_word']
+        s_next = s_info['next_word']
+        s_positions = s_info['positions']
+
         best_t_seq = None
         best_score = -1
 
-        for t_seq in teacher_spaces:
-            # Find surrounding words for teacher sequence
-            t_prev_word = None
-            t_next_word = None
-
-            for word in reversed(teacher_words):
-                if word['last_token_idx'] < t_seq[0]:
-                    t_prev_word = word
-                    break
-
-            for word in teacher_words:
-                if word['first_token_idx'] > t_seq[-1]:
-                    t_next_word = word
-                    break
+        for t_info in teacher_space_info:
+            t_seq = t_info['sequence']
+            t_prev = t_info['prev_word']
+            t_next = t_info['next_word']
+            t_positions = t_info['positions']
 
             # Score based on word matches
             score = 0
-            if s_prev_word and t_prev_word:
-                if normalize_token(s_prev_word['text']) == normalize_token(t_prev_word['text']):
-                    score += 1
-            if s_next_word and t_next_word:
-                if normalize_token(s_next_word['text']) == normalize_token(t_next_word['text']):
-                    score += 1
+            if s_prev and t_prev:
+                if normalize_token(s_prev['text']) == normalize_token(t_prev['text']):
+                    score += 2  # Higher weight for previous word
+            if s_next and t_next:
+                if normalize_token(s_next['text']) == normalize_token(t_next['text']):
+                    score += 2  # Higher weight for next word
 
             # Prefer sequences with similar length
             length_diff = abs(len(s_seq) - len(t_seq))
-            score = score - (length_diff * 0.1)
+            score = score - (length_diff * 0.5)  # Penalty for length difference
 
             if score > best_score:
                 best_score = score
                 best_t_seq = t_seq
+                best_t_positions = t_positions
 
-        # Match tokens within sequences by position
+        # Match tokens within sequences using positions
         if best_t_seq and best_score > 0:
+            # Match tokens by position using normalized positions
             for i, s_idx in enumerate(s_seq):
-                # Calculate normalized position
-                s_norm_pos = i / max(len(s_seq) - 1, 1)
-                t_pos_approx = int(s_norm_pos * len(best_t_seq))
+                s_norm_pos = s_positions[i]
 
-                # Find closest teacher token
-                t_idx = best_t_seq[min(t_pos_approx, len(best_t_seq) - 1)]
-                matches.append((s_idx, t_idx))
+                # Find closest teacher token by position
+                best_t_idx = None
+                min_dist = float('inf')
+
+                for j, t_norm_pos in enumerate(best_t_positions):
+                    dist = abs(s_norm_pos - t_norm_pos)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_t_idx = best_t_seq[j]
+
+                if best_t_idx is not None:
+                    matches.append((s_idx, best_t_idx))
 
     return matches
 
@@ -1495,7 +1673,7 @@ def find_direct_token_matches(
 def hybrid_alignment(student_input_ids, teacher_input_ids,
                             student_tokenizer, teacher_tokenizer,
                             student_embeddings, teacher_embeddings,
-                            exclude_tokens=None, enable_logging=False):
+                            exclude_tokens=None):
     """Three-stage alignment: text tokens, space tokens, split token matching"""
     # Get tokens and words
     student_text = student_tokenizer.decode(student_input_ids, skip_special_tokens=True)
@@ -1507,7 +1685,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     student_tokens = ids_to_tokens(student_input_ids.cpu().numpy(), student_tokenizer)
     teacher_tokens = ids_to_tokens(teacher_input_ids.cpu().numpy(), teacher_tokenizer)
 
-    # Filter out special tokens only (NOT spaces or padding tokens)
+    # Only filter out actual special tokens (NOT spaces or padding)
     if exclude_tokens is not None:
         exclude_set = set(exclude_tokens)
 
@@ -1521,9 +1699,9 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
 
         filtered_idx = 0
         for original_idx, token in enumerate(student_tokens):
-            # Only exclude actual special tokens, not spaces or padding
+            # Only exclude actual special tokens by ID
             token_id = student_input_ids[original_idx].item()
-            if original_idx not in exclude_set and token_id not in exclude_set:
+            if token_id not in exclude_set:
                 original_to_filtered[original_idx] = filtered_idx
                 filtered_to_original[filtered_idx] = original_idx
 
@@ -1550,8 +1728,9 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
 
         filtered_idx = 0
         for original_idx, token in enumerate(teacher_tokens):
+            # Only exclude actual special tokens by ID
             token_id = teacher_input_ids[original_idx].item()
-            if original_idx not in exclude_set and token_id not in exclude_set:
+            if token_id not in exclude_set:
                 teacher_original_to_filtered[original_idx] = filtered_idx
                 teacher_filtered_to_original[filtered_idx] = original_idx
 
@@ -1570,6 +1749,18 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     # Get word mappings
     student_words = get_word_token_mappings(student_tokens, student_tokenizer, student_text)
     teacher_words = get_word_token_mappings(teacher_tokens, teacher_tokenizer, teacher_text)
+
+    # Update word token indices to use filtered indices
+    if exclude_tokens is not None:
+        for word in student_words:
+            word['tokens'] = [original_to_filtered[idx] for idx in word['tokens'] if idx in original_to_filtered]
+            word['first_token_idx'] = original_to_filtered.get(word['first_token_idx'], -1)
+            word['last_token_idx'] = original_to_filtered.get(word['last_token_idx'], -1)
+
+        for word in teacher_words:
+            word['tokens'] = [teacher_original_to_filtered[idx] for idx in word['tokens'] if idx in teacher_original_to_filtered]
+            word['first_token_idx'] = teacher_original_to_filtered.get(word['first_token_idx'], -1)
+            word['last_token_idx'] = teacher_original_to_filtered.get(word['last_token_idx'], -1)
 
     if len(student_words) == 0 or len(teacher_words) == 0:
         return [], [], [], [], []
@@ -1624,21 +1815,64 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
             t_global = teacher_word['tokens'][t_local]
             all_weighted_matches.append((s_global, t_global, weight))
 
-    # Stage 2: Space token matching
-    student_spaces = get_word_exterior_sequences(student_tokens, student_words)
-    teacher_spaces = get_word_exterior_sequences(teacher_tokens, teacher_words)
+    # Stage 2: Space token matching - using simplified approach
+    # Get special token IDs for exclusion
+    student_special_ids = set()
+    teacher_special_ids = set()
+
+    if student_tokenizer:
+        student_special_ids.update([
+            getattr(student_tokenizer, 'pad_token_id', None),
+            getattr(student_tokenizer, 'bos_token_id', None),
+            getattr(student_tokenizer, 'eos_token_id', None),
+            getattr(student_tokenizer, 'unk_token_id', None),
+        ])
+        student_special_ids = {t for t in student_special_ids if t is not None}
+
+    if teacher_tokenizer:
+        teacher_special_ids.update([
+            getattr(teacher_tokenizer, 'pad_token_id', None),
+            getattr(teacher_tokenizer, 'bos_token_id', None),
+            getattr(teacher_tokenizer, 'eos_token_id', None),
+            getattr(teacher_tokenizer, 'unk_token_id', None),
+        ])
+        teacher_special_ids = {t for t in teacher_special_ids if t is not None}
+
+    # Get space tokens using simple approach
+    student_spaces = get_space_tokens_simple(student_tokens, student_tokenizer, student_special_ids)
+    teacher_spaces = get_space_tokens_simple(teacher_tokens, teacher_tokenizer, teacher_special_ids)
+
+    if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+        print(f"DEBUG - Student space tokens: {student_spaces}")
+        print(f"DEBUG - Teacher space tokens (raw): {teacher_spaces}")
+
+    # Check for and handle leading space token in teacher
+    if teacher_spaces and teacher_spaces[0] == 0:
+        teacher_spaces = teacher_spaces[1:]
+        if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+            print(f"DEBUG - Filtered teacher space tokens: {teacher_spaces} (removed leading position 0)")
+
+    if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+        print(f"DEBUG - Final student space tokens: {student_spaces}")
+        print(f"DEBUG - Final teacher space tokens: {teacher_spaces}")
 
     if student_spaces and teacher_spaces:
-        space_matches = match_space_sequences(
+        # Match space tokens
+        space_matches = match_space_tokens_simple(
             student_spaces, teacher_spaces,
-            student_words, teacher_words,
-            window_size=2
+            student_embeddings, teacher_embeddings,
+            cosine_threshold=0.5
         )
+
+        if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+            print(f"DEBUG - Space matches: {space_matches}")
 
         for s_idx, t_idx in space_matches:
             all_token_matches.append((s_idx, t_idx))
             aligned_student_tokens.add(s_idx)
             aligned_teacher_tokens.add(t_idx)
+    elif ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
+        print("DEBUG - No space tokens found")
 
     # Stage 3: Split token matching for remaining tokens in matched words
     for s_word_idx, t_word_idx in word_matches:
@@ -1691,8 +1925,8 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
         teacher_to_local = {idx: i for i, idx in enumerate(teacher_word['tokens'])}
 
         # Convert unmatched to local indices and positions
-        unmatched_student_local = [(student_to_local[idx], student_positions[student_to_local[idx]]) for idx in unmatched_student]
-        unmatched_teacher_local = [(teacher_to_local[idx], teacher_positions[teacher_to_local[idx]]) for idx in unmatched_teacher]
+        unmatched_student_local = [(student_to_local[idx], student_positions[student_to_local[idx]]) for idx in unmatched_student if idx in student_to_local]
+        unmatched_teacher_local = [(teacher_to_local[idx], teacher_positions[teacher_to_local[idx]]) for idx in unmatched_teacher if idx in teacher_to_local]
 
         # Match by closest position
         for s_local_idx, s_pos in unmatched_student_local:
@@ -1750,7 +1984,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
         split_token_matches = original_split_matches
 
     # Enable detailed logging if requested
-    if enable_logging:
+    if ENABLE_ALIGNMENT_DEBUG:
         log_alignment_details(
             student_input_ids, teacher_input_ids,
             student_tokenizer, teacher_tokenizer,
@@ -1858,8 +2092,7 @@ class AlignmentLoss(torch.nn.Module):
                 student_input_ids[i], teacher_input_ids[i],
                 self.student_tokenizer, self.teacher_tokenizer,
                 student_embs, teacher_embs,
-                exclude_tokens=exclude_tokens,
-                enable_logging=enable_logging
+                exclude_tokens=exclude_tokens
             )
 
             # Text-based token matches
