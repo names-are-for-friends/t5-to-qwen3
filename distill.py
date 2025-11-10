@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-19/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-final/stage3-20"
+QWEN3_MODEL_DIR = "/home/naff/q3-xxs_script/Qwen3-Embedding-0.6B/"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/1layer_a"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -84,16 +84,16 @@ Then, we attempt to match single or multiple student tokens to single or multipl
 Finally, we can use mean pooling loss for extra reinforcement - this is SEQUENCE loss
 '''
 TEXT_MATCH_HUBER_WEIGHT = 1.00
-TEXT_MATCH_COSINE_WEIGHT = 0.10
+TEXT_MATCH_COSINE_WEIGHT = 0.30
 SPLIT_TOKEN_HUBER_WEIGHT = 1.00
-SPLIT_TOKEN_COSINE_WEIGHT = 0.10
-SEQUENCE_HUBER_WEIGHT = 0.10
-SEQUENCE_COSINE_WEIGHT = 0.01
+SPLIT_TOKEN_COSINE_WEIGHT = 0.30
+SEQUENCE_HUBER_WEIGHT = 0.20
+SEQUENCE_COSINE_WEIGHT = 0.06
 
 # Padding options - You can match tokens after the attended sequence. T5 has one EOS then repeated pad, Qwen has just one repeated post-sequence joint pad/EOS token. Loss fluctuation is normal with a wider range and higher loss weight
-MIN_EXTRA_MATCHED_PADDING = 0
-MAX_EXTRA_MATCHED_PADDING = 3
-PADDING_LOSS_WEIGHT = 0.2
+MIN_EXTRA_MATCHED_PADDING = 1
+MAX_EXTRA_MATCHED_PADDING = 1
+PADDING_LOSS_WEIGHT = 1.0
 
 # Cosine thresholds - turn TEXT_MATCH threshold to zero at first, since semantic representations will be unrelated until trained
 TEXT_MATCH_COSINE_THRESHOLD = 0.0
@@ -119,7 +119,7 @@ TRAIN_MODEL = True
 
 # Layer arrangement - We use T5-like blocks to both project the dim and refine the output towards the target. Final output should be 4096
 # If you use T5RMSNorm, we'll extract the weights from T5 directly. Recommended for final output to match T5
-EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = []
+EXCLUDE_TRAINING_PROJECTION_LAYER_NUMS = [4]
 PROJECTION_LAYERS_CONFIG = [
     {
         "type": "linear",
@@ -128,33 +128,20 @@ PROJECTION_LAYERS_CONFIG = [
     },
     {
         "type": "transformer_encoder",
-        "num_heads": 64,
+        "num_heads": 32,
         "dropout_rate": 0.1,
         "dim_feedforward": 8192,
         "file_num": 2
     },
     {
-        "type": "transformer_encoder",
-        "num_heads": 64,
+        "type": "mlp",
+        "hidden_dim": 4096,
         "dropout_rate": 0.1,
-        "dim_feedforward": 8192,
         "file_num": 3
     },
     {
-        "type": "transformer_encoder",
-        "num_heads": 64,
-        "dropout_rate": 0.1,
-        "dim_feedforward": 8192,
-        "file_num": 4
-    },
-    {
-        "type": "linear",
-        "output_dim": 4096,
-        "file_num": 5
-    },
-    {
         "type": "t5_rmsnorm",
-        "file_num": 6
+        "file_num": 4
     },
 ]
 
@@ -183,14 +170,35 @@ class LinearLayer(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
+class MLPLayer(torch.nn.Module):
+    """Multi-Layer Perceptron with configurable layers"""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout_rate: float = 0.1):
+        super().__init__()
+        layers = []
+
+        # Input layer
+        self.linear1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.GELU()
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+        # Output layer
+        self.linear2 = torch.nn.Linear(hidden_dim, output_dim)
+        self.layer_type = "mlp"
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return self.linear2(x)
+
 class TransformerLayer(torch.nn.Module):
     def __init__(self, dim_feedforward: int, num_heads: int = 8, hidden_size: int = 4096, dropout_rate: int = 0.1):
         super().__init__()
         transformer_layer = torch.nn.TransformerEncoderLayer(
             d_model=hidden_size,
-            nhead=8,
+            nhead=num_heads,
             dim_feedforward=dim_feedforward,
-            dropout=0.0,
+            dropout=dropout_rate,
             activation='gelu',
             batch_first=True
         )
@@ -198,8 +206,7 @@ class TransformerLayer(torch.nn.Module):
         self.layer_type = "transformer_encoder"
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.transformer(x)
-        return x
+        return self.transformer(x)
 
 # ========== T5 Layers ==========
 class T5RMSNorm(torch.nn.Module):
@@ -1842,6 +1849,8 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     student_spaces = get_space_tokens_simple(student_tokens, student_tokenizer, student_special_ids)
     teacher_spaces = get_space_tokens_simple(teacher_tokens, teacher_tokenizer, teacher_special_ids)
 
+    num_student_spaces = len(student_spaces)
+
     if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
         print(f"DEBUG - Student space tokens: {student_spaces}")
         print(f"DEBUG - Teacher space tokens (raw): {teacher_spaces}")
@@ -2160,7 +2169,7 @@ class AlignmentLoss(torch.nn.Module):
                     total_split_cosine_loss += split_cosine_loss
                     total_split_aligned_tokens += len(split_token_matches)
 
-            # Stage 4: Padding token alignment
+            # Padding token alignment
             # Find the actual sequence end for student (first pad token)
             student_seq_end = 0
             for idx in range(len(student_input_ids[i])):
@@ -2240,7 +2249,7 @@ class AlignmentLoss(torch.nn.Module):
             self.text_cosine_weight * total_text_cosine_loss +
             self.split_huber_weight * total_split_huber_loss +
             self.split_cosine_weight * total_split_cosine_loss +
-            self.text_huber_weight * total_padding_huber_loss +  # Use text weights for padding
+            self.text_huber_weight * total_padding_huber_loss +
             self.text_cosine_weight * total_padding_cosine_loss
         )
 
@@ -2279,21 +2288,19 @@ class SequenceLoss(torch.nn.Module):
         total_positions = 0
 
         for i in range(batch_size):
-            # Get mask for this sequence
-            position_mask = teacher_mask[i].bool()
-
-            if not position_mask.any():
-                continue
+            # The T5 cache ids have a leading space token for some reason... I need to check the actual encodes but for now I'm masking it
+            teacher_mask[i][0] = 0
 
             # Apply position mask to embeddings for this sequence
-            masked_student = student_output[i] * position_mask.unsqueeze(-1)
-            masked_teacher = teacher_output[i] * position_mask.unsqueeze(-1)
+            masked_student = student_output[i] * student_mask[i].unsqueeze(-1)
+            masked_teacher = teacher_output[i] * teacher_mask[i].unsqueeze(-1)
 
             # Mean pooling across sequence dimension
-            # Sum across sequence, divide by number of actual tokens in this sequence
-            pool_denominator = position_mask.sum().clamp(min=1)
-            student_pooled = masked_student.sum(dim=0) / pool_denominator
-            teacher_pooled = masked_teacher.sum(dim=0) / pool_denominator
+            # Sum across sequence, divide by number of actual tokens in this sequenced
+            pool_denominator_student = student_mask[i].sum().clamp(min=1)
+            pool_denominator_teacher = teacher_mask[i].sum().clamp(min=1)
+            student_pooled = masked_student.sum(dim=0) / pool_denominator_student
+            teacher_pooled = masked_teacher.sum(dim=0) / pool_denominator_teacher
 
             # Compute losses
             huber_loss = self.huber_loss(student_pooled.unsqueeze(0), teacher_pooled.unsqueeze(0))
@@ -2307,7 +2314,7 @@ class SequenceLoss(torch.nn.Module):
             )
 
             # Accumulate losses (weighted by number of positions)
-            num_positions = position_mask.sum().item()
+            num_positions = student_mask[i].sum().item()
             total_loss += loss * num_positions
             total_huber_loss += huber_loss * num_positions
             total_cos_loss += cos_loss * num_positions
@@ -2650,6 +2657,34 @@ def get_projection_layers(restart_cycle: int, layers_to_load: int, qwen_embeddin
                     output_dim=output_dim
                 )
                 print(f"Initialising new linear layer {file_num}")
+                projection_layer.is_new = True
+            output_dim_prev = output_dim
+
+        elif layer_config["type"] == "mlp":
+            input_dim = output_dim_prev
+            hidden_dim = layer_config.get("hidden_dim", input_dim)
+            output_dim = layer_config.get("output_dim", hidden_dim)
+            dropout_rate = layer_config.get("dropout_rate", 0.1)
+
+            if os.path.exists(layer_path):
+                state_dict = load_file(layer_path)
+                projection_layer = MLPLayer(
+                    input_dim=input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    dropout_rate=dropout_rate
+                )
+                projection_layer.load_state_dict(state_dict)
+                print(f"Loading existing MLP layer {file_num}")
+                projection_layer.is_new = False
+            else:
+                projection_layer = MLPLayer(
+                    input_dim=input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    dropout_rate=dropout_rate
+                )
+                print(f"Initializing new MLP layer {file_num}")
                 projection_layer.is_new = True
             output_dim_prev = output_dim
 
@@ -3218,6 +3253,7 @@ def main():
             huber_weight=SEQUENCE_HUBER_WEIGHT,
             cosine_weight=SEQUENCE_COSINE_WEIGHT
         ).to(device, dtype=torch.bfloat16)
+        sequence_loss_fn.teacher_tokenizer = teacher_tokenizer
 
     # ========== Dataset and Dataloader ==========
     train_dataset = PreTokenizedDataset(
