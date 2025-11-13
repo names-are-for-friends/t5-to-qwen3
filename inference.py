@@ -6,7 +6,7 @@ from torch.nn import Module, Embedding
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, T5EncoderModel, T5TokenizerFast, AutoModel
-from typing import Callable, List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional, Union
 from dataclasses import dataclass
 import requests
 from PIL import Image
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/1layer_a/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v5/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -940,51 +940,361 @@ class AutoEncoder(nn.Module):
 
 # ========== Projection Layers ==========
 class LinearLayer(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+    """Enhanced linear layer with normalization, activation, and residual options"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        bias: bool = True,
+        activation: Optional[str] = None,
+        use_layer_norm: bool = True,
+        use_residual: bool = False,
+        dropout_rate: float = 0.0,
+        init_strategy: str = "kaiming"
+    ):
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, output_dim)
+        self.linear = torch.nn.Linear(input_dim, output_dim, bias=bias)
         self.layer_type = "linear"
 
+        # Normalization
+        if use_layer_norm:
+            self.norm = torch.nn.LayerNorm(output_dim)
+        else:
+            self.norm = None
+
+        # Activation
+        if activation == "gelu":
+            self.activation = torch.nn.GELU()
+        elif activation == "swish":
+            self.activation = torch.nn.SiLU()
+        elif activation == "relu":
+            self.activation = torch.nn.ReLU()
+        elif activation == "tanh":
+            self.activation = torch.nn.Tanh()
+        else:
+            self.activation = None
+
+        # Residual connection (only if dimensions match)
+        self.use_residual = use_residual and (input_dim == output_dim)
+
+        # Dropout
+        self.dropout = torch.nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+        # Initialize weights
+        self._initialize_weights(init_strategy)
+
+    def _initialize_weights(self, strategy: str):
+        if strategy == "kaiming":
+            torch.nn.init.kaiming_normal_(self.linear.weight, mode='fan_out', nonlinearity='relu')
+        elif strategy == "xavier":
+            torch.nn.init.xavier_uniform_(self.linear.weight)
+        elif strategy == "normal":
+            torch.nn.init.normal_(self.linear.weight, 0, 0.02)
+
+        if self.linear.bias is not None:
+            torch.nn.init.constant_(self.linear.bias, 0)
+
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.linear(x)
+        residual = x if self.use_residual else None
+        x = self.linear(x)
+
+        if self.norm is not None:
+            x = self.norm(x)
+
+        if self.activation is not None:
+            x = self.activation(x)
+
+        if self.dropout is not None:
+            x = self.dropout(x)
+
+        if residual is not None:
+            x = x + residual
+
+        return x
 
 class MLPLayer(torch.nn.Module):
-    """Multi-Layer Perceptron with configurable layers"""
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout_rate: float = 0.1):
+    """Enhanced MLP with residual connections, proper normalization, and multiple hidden layers"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Union[int, List[int]],
+        output_dim: Optional[int] = None,
+        activation: str = "gelu",
+        dropout_rate: float = 0.1,
+        use_layer_norm: bool = True,
+        use_residual: bool = True,
+        num_hidden_layers: int = 1,
+        init_strategy: str = "kaiming"
+    ):
         super().__init__()
-        layers = []
-
-        # Input layer
-        self.linear1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.GELU()
-        self.dropout = torch.nn.Dropout(dropout_rate)
-
-        # Output layer
-        self.linear2 = torch.nn.Linear(hidden_dim, output_dim)
         self.layer_type = "mlp"
 
+        # Handle hidden_dims
+        if isinstance(hidden_dims, int):
+            if num_hidden_layers == 1:
+                hidden_dims = [hidden_dims]
+            else:
+                # Distribute dimensions across layers
+                hidden_dims = [hidden_dims] * num_hidden_layers
+
+        if output_dim is None:
+            output_dim = hidden_dims[-1]
+
+        self.use_residual = use_residual
+        self.layers = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList() if use_layer_norm else None
+        self.dropouts = torch.nn.ModuleList()
+
+        # Input projection
+        self.layers.append(torch.nn.Linear(input_dim, hidden_dims[0]))
+        if use_layer_norm:
+            self.norms.append(torch.nn.LayerNorm(hidden_dims[0]))
+        self.dropouts.append(torch.nn.Dropout(dropout_rate))
+
+        # Hidden layers
+        for i in range(1, len(hidden_dims)):
+            self.layers.append(torch.nn.Linear(hidden_dims[i-1], hidden_dims[i]))
+            if use_layer_norm:
+                self.norms.append(torch.nn.LayerNorm(hidden_dims[i]))
+            self.dropouts.append(torch.nn.Dropout(dropout_rate))
+
+        # Output projection
+        self.layers.append(torch.nn.Linear(hidden_dims[-1], output_dim))
+        if use_layer_norm:
+            self.norms.append(torch.nn.LayerNorm(output_dim))
+        self.dropouts.append(torch.nn.Dropout(dropout_rate))
+
+        # Activation
+        if activation == "gelu":
+            self.activation = torch.nn.GELU()
+        elif activation == "swish":
+            self.activation = torch.nn.SiLU()
+        elif activation == "relu":
+            self.activation = torch.nn.ReLU()
+        else:
+            self.activation = torch.nn.GELU()
+
+        # Initialize weights
+        self._initialize_weights(init_strategy)
+
+    def _initialize_weights(self, strategy: str):
+        for layer in self.layers:
+            if strategy == "kaiming":
+                torch.nn.init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
+            elif strategy == "xavier":
+                torch.nn.init.xavier_uniform_(layer.weight)
+            elif strategy == "normal":
+                torch.nn.init.normal_(layer.weight, 0, 0.02)
+
+            if layer.bias is not None:
+                torch.nn.init.constant_(layer.bias, 0)
+
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        return self.linear2(x)
+        residual = x if self.use_residual else None
+
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+
+            if self.norms is not None:
+                x = self.norms[i](x)
+
+            # Don't apply activation after final layer
+            if i < len(self.layers) - 1:
+                x = self.activation(x)
+
+            x = self.dropouts[i](x)
+
+        if residual is not None and x.shape[-1] == residual.shape[-1]:
+            x = x + residual
+
+        return x
 
 class TransformerLayer(torch.nn.Module):
-    def __init__(self, dim_feedforward: int, num_heads: int = 8, hidden_size: int = 4096, dropout_rate: int = 0.1):
+    def __init__(
+        self,
+        dim_feedforward: int,
+        num_heads: int = 8,
+        hidden_size: int = 4096,
+        dropout_rate: float = 0.1,
+        num_layers: int = 1,
+        output_dim: Optional[int] = None,
+        use_pre_norm: bool = True,
+        use_post_norm: bool = True,
+        max_seq_length: int = 512
+    ):
         super().__init__()
-        transformer_layer = torch.nn.TransformerEncoderLayer(
+        self.layer_type = "transformer_encoder"
+
+        encoder_layer = torch.nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout_rate,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=use_pre_norm
         )
-        self.transformer = torch.nn.TransformerEncoder(transformer_layer, num_layers=1)
-        self.layer_type = "transformer_encoder"
+
+        self.transformer = torch.nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False
+        )
+
+        # Normalization
+        if use_post_norm:
+            self.final_norm = torch.nn.LayerNorm(hidden_size)
+        else:
+            self.final_norm = None
+
+        # Optional output projection
+        if output_dim is not None and output_dim != hidden_size:
+            self.output_proj = torch.nn.Linear(hidden_size, output_dim)
+            self.output_norm = torch.nn.LayerNorm(output_dim)
+        else:
+            self.output_proj = None
+            self.output_norm = None
+
+        # Positional encoding
+        self.pos_encoding = None
+        if max_seq_length > 0:
+            self.pos_encoding = self._create_positional_encoding(max_seq_length, hidden_size)
+
+    def _create_positional_encoding(self, max_len: int, d_model: int):
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        # Add positional encoding if available
+        if self.pos_encoding is not None and x.dim() == 3:
+            seq_len = x.size(1)
+            if seq_len <= self.pos_encoding.size(1):
+                x = x + self.pos_encoding[:, :seq_len].to(x.device)
+
+        # Fix attention mask format (but maintain student sequence length)
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.int64 or attention_mask.dtype == torch.int32:
+                # Convert to boolean mask for PyTorch
+                attention_mask = attention_mask.bool()
+
+        # Transformer maintains the same sequence length
+        x = self.transformer(x, src_key_padding_mask=attention_mask)
+
+        if self.final_norm is not None:
+            x = self.final_norm(x)
+
+        if self.output_proj is not None:
+            x = self.output_proj(x)
+            if self.output_norm is not None:
+                x = self.output_norm(x)
+
+        return x
+
+class AdaptiveAttentionLayer(torch.nn.Module):
+    """Attention layer that can adapt to different sequence lengths and dimensions"""
+
+    def __init__(
+        self,
+        query_dim: int,
+        key_dim: int,
+        value_dim: int,
+        num_heads: int = 8,
+        dropout_rate: float = 0.1,
+        use_flash_attention: bool = False
+    ):
+        super().__init__()
+        self.layer_type = "adaptive_attention"
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+
+        assert query_dim % num_heads == 0, "query_dim must be divisible by num_heads"
+
+        self.q_proj = torch.nn.Linear(query_dim, query_dim)
+        self.k_proj = torch.nn.Linear(key_dim, query_dim)
+        self.v_proj = torch.nn.Linear(value_dim, query_dim)
+        self.out_proj = torch.nn.Linear(query_dim, query_dim)
+
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.scale = math.sqrt(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+
+        if context is None:
+            context = x
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+
+        if attention_mask is not None:
+            scores = scores.masked_fill(attention_mask == 0, -1e9)
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        output = torch.matmul(attn_weights, v)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(output)
+
+        return output
+
+class ResidualBlock(torch.nn.Module):
+    """Simple residual block for better gradient flow"""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: Optional[int] = None,
+        activation: str = "gelu",
+        dropout_rate: float = 0.1
+    ):
+        super().__init__()
+        self.layer_type = "residual_block"
+
+        if hidden_dim is None:
+            hidden_dim = dim * 2
+
+        self.fc1 = torch.nn.Linear(dim, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, dim)
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.norm2 = torch.nn.LayerNorm(dim)
+
+        if activation == "gelu":
+            self.activation = torch.nn.GELU()
+        elif activation == "swish":
+            self.activation = torch.nn.SiLU()
+        else:
+            self.activation = torch.nn.ReLU()
+
+        self.dropout = torch.nn.Dropout(dropout_rate)
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.transformer(x)
+        residual = x
+        x = self.norm1(x)
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        x = x + residual
+        x = self.norm2(x)
+        return x
 
 # ========== T5 Layers ==========
 class T5RMSNorm(torch.nn.Module):
@@ -1496,40 +1806,81 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
     for layer_config in projection_config["layers"]:
         if layer_config["type"] == "linear":
             layer = LinearLayer(
-                input_dim=output_dim_prev,
+                input_dim=layer_config.get("input_dim", output_dim_prev),
                 output_dim=layer_config["output_dim"],
+                bias=layer_config.get("bias", True),
+                activation=layer_config.get("activation", None),
+                use_layer_norm=layer_config.get("use_layer_norm", True),
+                use_residual=layer_config.get("use_residual", False),
+                dropout_rate=layer_config.get("dropout_rate", 0.0),
+                init_strategy=layer_config.get("init_strategy", "kaiming")
             )
             output_dim_prev = layer_config["output_dim"]
+
         elif layer_config["type"] == "mlp":
-            input_dim = output_dim_prev
-            hidden_dim = layer_config.get("hidden_dim", input_dim)
-            output_dim = layer_config.get("output_dim", hidden_dim)
             layer = MLPLayer(
-                input_dim=output_dim_prev,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                dropout_rate=layer_config["dropout_rate"]
+                input_dim=layer_config.get("input_dim", output_dim_prev),
+                hidden_dims=layer_config.get("hidden_dims", 2048),
+                output_dim=layer_config.get("output_dim"),
+                activation=layer_config.get("activation", "gelu"),
+                dropout_rate=layer_config.get("dropout_rate", 0.1),
+                use_layer_norm=layer_config.get("use_layer_norm", True),
+                use_residual=layer_config.get("use_residual", True),
+                init_strategy=layer_config.get("init_strategy", "kaiming")
             )
-            output_dim_prev = output_dim
+            output_dim_prev = layer_config.get("output_dim", layer_config.get("hidden_dims", 2048))
+
         elif layer_config["type"] == "transformer_encoder":
+            hidden_size = layer_config.get("hidden_size", output_dim_prev)
             layer = TransformerLayer(
-                        hidden_size=output_dim_prev,
-                        num_heads=layer_config["num_heads"],
-                        dropout_rate=layer_config["dropout_rate"],
-                        dim_feedforward=layer_config["dim_feedforward"]
-                    )
+                dim_feedforward=layer_config.get("dim_feedforward", hidden_size * 4),
+                num_heads=layer_config.get("num_heads", 8),
+                hidden_size=hidden_size,
+                dropout_rate=layer_config.get("dropout_rate", 0.1),
+                num_layers=layer_config.get("num_layers", 1),
+                output_dim=layer_config.get("output_dim"),
+                use_pre_norm=layer_config.get("use_pre_norm", True),
+                use_post_norm=layer_config.get("use_post_norm", True),
+                max_seq_length=layer_config.get("max_seq_length", 512)
+            )
+            output_dim_prev = layer_config.get("output_dim", hidden_size)
+
+        elif layer_config["type"] == "residual_block":
+            dim = layer_config.get("dim", output_dim_prev)
+            layer = ResidualBlock(
+                dim=dim,
+                hidden_dim=layer_config.get("hidden_dim"),
+                activation=layer_config.get("activation", "gelu"),
+                dropout_rate=layer_config.get("dropout_rate", 0.1)
+            )
+
+        elif layer_config["type"] == "adaptive_attention":
+            query_dim = layer_config.get("query_dim", output_dim_prev)
+            key_dim = layer_config.get("key_dim", output_dim_prev)
+            value_dim = layer_config.get("value_dim", output_dim_prev)
+            layer = AdaptiveAttentionLayer(
+                query_dim=query_dim,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads=layer_config.get("num_heads", 8),
+                dropout_rate=layer_config.get("dropout_rate", 0.1),
+                use_flash_attention=layer_config.get("use_flash_attention", False)
+            )
+            output_dim_prev = query_dim
+
         elif layer_config["type"] == "t5_encoder":
             layer = T5EncoderBlock(
-                        hidden_size=output_dim_prev,
-                        num_heads=layer_config["num_heads"],
-                        dropout_rate=layer_config["dropout_rate"],
-                        relative_attention_num_buckets=layer_config["relative_attention_num_buckets"],
-                        dim_feedforward=layer_config["dim_feedforward"]
-                    )
+                hidden_size=output_dim_prev,
+                num_heads=layer_config.get("num_heads", 8),
+                dropout_rate=layer_config.get("dropout_rate", 0.1),
+                relative_attention_num_buckets=layer_config.get("relative_attention_num_buckets", 32),
+                dim_feedforward=layer_config.get("dim_feedforward", output_dim_prev * 4)
+            )
+
         elif layer_config["type"] == "t5_rmsnorm":
             layer = T5RMSNorm(
-                    hidden_size=output_dim_prev,
-                )
+                hidden_size=output_dim_prev,
+            )
 
         file_num = layer_config["file_num"]
         layer_path = os.path.join(qwen3_folder, f"projection_layer_{file_num}.safetensors")
@@ -1547,8 +1898,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
         device_map="auto",
         trust_remote_code=True,
         attn_implementation="flash_attention_2"
-    ).to(device)
-    model.eval()
+    ).to(device, dtype=torch.bfloat16).eval()
 
     return model, projection_layers, tokenizer
 
@@ -1643,7 +1993,7 @@ if __name__ == "__main__":
         attention_mask = text_inputs["attention_mask"].to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=dtype):
             embed = t5_model(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=attention_mask,
@@ -1683,7 +2033,7 @@ if __name__ == "__main__":
         attention_mask = text_inputs["attention_mask"].to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=dtype):
             output = qwen3_model(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=attention_mask,
@@ -1699,8 +2049,12 @@ if __name__ == "__main__":
             embed_neg = output_neg.hidden_states[-1].to(device, dtype=dtype)  # Last hidden state
 
             for layer in projection_layers:
-                embed = layer(embed)
-                embed_neg = layer(embed_neg)
+                if hasattr(layer, 'layer_type') and layer.layer_type == "transformer_encoder":
+                    embed = layer(embed, attention_mask=attention_mask)
+                    embed_neg = layer(embed_neg, attention_mask=attention_mask_neg)
+                else:
+                    embed = layer(embed)
+                    embed_neg = layer(embed_neg)
 
         if USE_T5_MASK_WITH_QWEN:
             tokenizer = load_t5_tokenizer(args.t5_folder)
