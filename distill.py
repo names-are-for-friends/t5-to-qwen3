@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v4/restart_20"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v5"
+QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v8/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v9"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -58,10 +58,10 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 1.5e-4
-MIN_LEARNING_RATE_MODEL = 1.5e-5
-MAX_LEARNING_RATE_PROJ = 2.5e-4
-MIN_LEARNING_RATE_PROJ = 2.5e-5
+MAX_LEARNING_RATE_MODEL = 1e-4
+MIN_LEARNING_RATE_MODEL = 1e-5
+MAX_LEARNING_RATE_PROJ = 2e-4
+MIN_LEARNING_RATE_PROJ = 2e-5
 
 # Saving
 SAVE_EVERY_X_STEPS = 0
@@ -74,7 +74,7 @@ EVAL_EVERY_X_EPOCHS = 1
 SAVE_BEST_MODEL = True
 
 # Scheduler
-WARMUP_STEPS = 500
+WARMUP_STEPS = 0
 RESTART_CYCLE_STEPS = 1000 # 0 = flat LR with no restart
 REPEAT_WARMUP_AFTER_RESTART = False
 '''
@@ -97,7 +97,11 @@ PADDING_LOSS_WEIGHT = 1.0
 
 # Cosine thresholds - turn TEXT_MATCH threshold to zero at first, since semantic representations will be unrelated until trained
 TEXT_MATCH_COSINE_THRESHOLD = 0.0
-SPLIT_TOKEN_COSINE_THRESHOLD = 0.0
+SPLIT_TOKEN_COSINE_THRESHOLD = 0.7
+
+# Skip connection - pass a residual from projected model output to final output (uses model optimizer) to enhance gradient flow
+ENABLE_MODEL_TO_FINAL_SKIP = True
+MODEL_TO_FINAL_RESIDUAL_SCALE = 0.1
 
 # Dataset
 SHUFFLE_DATASET = True
@@ -2195,8 +2199,6 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     student_spaces = get_space_tokens_simple(student_tokens, student_tokenizer, student_special_ids)
     teacher_spaces = get_space_tokens_simple(teacher_tokens, teacher_tokenizer, teacher_special_ids)
 
-    num_student_spaces = len(student_spaces)
-
     if ENABLE_SPACE_TOKEN_MATCHING_DEBUG:
         print(f"DEBUG - Student space tokens: {student_spaces}")
         print(f"DEBUG - Teacher space tokens (raw): {teacher_spaces}")
@@ -2373,10 +2375,6 @@ class AlignmentLoss(torch.nn.Module):
         # Weight for padding token losses
         self.padding_loss_weight = PADDING_LOSS_WEIGHT
 
-        # Loss functions
-        self.huber_loss = torch.nn.HuberLoss(delta=1.0, reduction='mean')
-        self.cosine_loss = torch.nn.CosineSimilarity(dim=-1)
-
     def forward(self, student_output: torch.Tensor, teacher_output: torch.Tensor,
                 student_mask: torch.Tensor, teacher_mask: torch.Tensor,
                 student_input_ids: Optional[torch.Tensor] = None,
@@ -2384,19 +2382,26 @@ class AlignmentLoss(torch.nn.Module):
         device = student_output.device
         batch_size = student_output.size(0)
 
-        # Initialize losses
-        total_text_huber_loss = torch.tensor(0.0, device=device)
-        total_text_cosine_loss = torch.tensor(0.0, device=device)
-        total_split_huber_loss = torch.tensor(0.0, device=device)
-        total_split_cosine_loss = torch.tensor(0.0, device=device)
-        total_padding_huber_loss = torch.tensor(0.0, device=device)
-        total_padding_cosine_loss = torch.tensor(0.0, device=device)
+        # Initialize loss accumulators (sum of weighted losses and sum of weights)
+        text_huber_sum = torch.tensor(0.0, device=device)
+        text_huber_weight_sum = torch.tensor(0.0, device=device)
+        text_cosine_sum = torch.tensor(0.0, device=device)
+        text_cosine_weight_sum = torch.tensor(0.0, device=device)
+
+        split_huber_sum = torch.tensor(0.0, device=device)
+        split_huber_weight_sum = torch.tensor(0.0, device=device)
+        split_cosine_sum = torch.tensor(0.0, device=device)
+        split_cosine_weight_sum = torch.tensor(0.0, device=device)
+
+        pad_huber_sum = torch.tensor(0.0, device=device)
+        pad_cosine_sum = torch.tensor(0.0, device=device)
+        pad_count = 0  # Padding tokens have weight=1
 
         # Initialize counters
         total_text_aligned_tokens = 0
         total_split_aligned_tokens = 0
         total_padding_aligned_tokens = 0
-        total_attended_tokens = 0  # Will include padding tokens that are attended
+        total_attended_tokens = 0
 
         # Get special token IDs
         student_pad_id = self.student_tokenizer.pad_token_id if self.student_tokenizer else None
@@ -2411,9 +2416,6 @@ class AlignmentLoss(torch.nn.Module):
         }
         exclude_tokens = {t for t in exclude_tokens if t is not None}
 
-        # Enable logging for first few batches
-        enable_logging = ENABLE_ALIGNMENT_DEBUG
-
         for i in range(batch_size):
             # Get actual tokens based on masks
             t_indices = (teacher_mask[i] == 1).nonzero(as_tuple=True)[0]
@@ -2423,11 +2425,7 @@ class AlignmentLoss(torch.nn.Module):
                 continue
 
             # Count ALL attended tokens (including padding tokens that are attended)
-            attended_tokens = []
-            for idx in s_indices:
-                token_id = student_input_ids[i][idx].item()
-                attended_tokens.append(idx)
-            total_attended_tokens += len(attended_tokens)
+            total_attended_tokens += len(s_indices)
 
             # Count valid student tokens (non-special tokens within mask) for alignment
             valid_student_indices = []
@@ -2435,8 +2433,6 @@ class AlignmentLoss(torch.nn.Module):
                 token_id = student_input_ids[i][idx].item()
                 if token_id not in exclude_tokens:
                     valid_student_indices.append(idx)
-
-            actual_student_tokens = len(valid_student_indices)
 
             # Get embeddings
             student_embs = student_output[i]
@@ -2455,24 +2451,32 @@ class AlignmentLoss(torch.nn.Module):
                 student_token_embs = student_embs[[pair[0] for pair in token_matches]]
                 teacher_token_embs = teacher_embs[[pair[1] for pair in token_matches]]
 
+                # Get weights
                 weight_map = {(s, t): w for s, t, w in weighted_matches}
-                token_weights = []
-                for s, t in token_matches:
-                    token_weights.append(weight_map.get((s, t), 1.0))
-                token_weights = torch.tensor(token_weights, device=device, dtype=student_token_embs.dtype)
+                token_weights = torch.tensor(
+                    [weight_map.get((s, t), 1.0) for s, t in token_matches],
+                    device=device, dtype=student_token_embs.dtype
+                )
 
+                # Huber loss (per token, averaged over hidden dim)
                 token_huber_loss = F.huber_loss(
                     student_token_embs, teacher_token_embs, reduction='none'
-                )
-                token_huber_loss = (token_huber_loss * token_weights.unsqueeze(-1)).mean()
+                ).mean(dim=-1)  # [num_tokens]
 
+                # Accumulate weighted sum and weights
+                text_huber_sum += (token_huber_loss * token_weights).sum()
+                text_huber_weight_sum += token_weights.sum()
+
+                # Cosine loss
                 token_cosine_sim = F.cosine_similarity(
                     student_token_embs, teacher_token_embs, dim=-1
                 )
-                token_cosine_loss = ((1 - token_cosine_sim) * token_weights).mean()
+                token_cosine_loss = 1 - token_cosine_sim  # [num_tokens]
 
-                total_text_huber_loss += token_huber_loss
-                total_text_cosine_loss += token_cosine_loss
+                # Accumulate weighted sum and weights
+                text_cosine_sum += (token_cosine_loss * token_weights).sum()
+                text_cosine_weight_sum += token_weights.sum()
+
                 total_text_aligned_tokens += len(token_matches)
 
             # Split token matches
@@ -2482,12 +2486,9 @@ class AlignmentLoss(torch.nn.Module):
                 split_weights = []
 
                 for s_idx, t_indices_list, weight in split_token_matches:
-                    # Skip if teacher indices list is empty
                     if not t_indices_list:
                         continue
                     student_emb = student_embs[s_idx]
-
-                    # Average the teacher embeddings
                     teacher_embs_list = [teacher_embs[t_idx] for t_idx in t_indices_list]
                     teacher_avg_emb = torch.stack(teacher_embs_list).mean(dim=0)
 
@@ -2495,24 +2496,32 @@ class AlignmentLoss(torch.nn.Module):
                     split_teacher_embs.append(teacher_avg_emb)
                     split_weights.append(weight)
 
-                # Only process if we have at least one match
                 if split_student_embs:
                     split_student_embs = torch.stack(split_student_embs)
                     split_teacher_embs = torch.stack(split_teacher_embs)
-                    split_weights = torch.tensor(split_weights, device=device, dtype=split_student_embs.dtype)
+                    split_weights = torch.tensor(
+                        split_weights, device=device, dtype=split_student_embs.dtype
+                    )
 
+                    # Huber loss (per token, averaged over hidden dim)
                     split_huber_loss = F.huber_loss(
                         split_student_embs, split_teacher_embs, reduction='none'
-                    )
-                    split_huber_loss = (split_huber_loss * split_weights.unsqueeze(-1)).mean()
+                    ).mean(dim=-1)  # [num_splits]
 
+                    # Accumulate weighted sum and weights
+                    split_huber_sum += (split_huber_loss * split_weights).sum()
+                    split_huber_weight_sum += split_weights.sum()
+
+                    # Cosine loss
                     split_cosine_sim = F.cosine_similarity(
                         split_student_embs, split_teacher_embs, dim=-1
                     )
-                    split_cosine_loss = ((1 - split_cosine_sim) * split_weights).mean()
+                    split_cosine_loss = 1 - split_cosine_sim  # [num_splits]
 
-                    total_split_huber_loss += split_huber_loss
-                    total_split_cosine_loss += split_cosine_loss
+                    # Accumulate weighted sum and weights
+                    split_cosine_sum += (split_cosine_loss * split_weights).sum()
+                    split_cosine_weight_sum += split_weights.sum()
+
                     total_split_aligned_tokens += len(split_token_matches)
 
             # Padding token alignment
@@ -2523,38 +2532,34 @@ class AlignmentLoss(torch.nn.Module):
                     student_seq_end = idx
                     break
             if student_seq_end == 0:
-                student_seq_end = len(student_input_ids[i])  # No padding found
+                student_seq_end = len(student_input_ids[i])
 
             # Find the actual sequence end for teacher (first EOS token, then pad)
             teacher_seq_end = 0
             for idx in range(len(teacher_input_ids[i])):
                 if teacher_input_ids[i][idx].item() == teacher_eos_id:
-                    teacher_seq_end = idx + 1  # Include EOS
+                    teacher_seq_end = idx + 1
                     break
             if teacher_seq_end == 0:
-                # No EOS found, find first pad
                 for idx in range(len(teacher_input_ids[i])):
                     if teacher_input_ids[i][idx].item() == teacher_pad_id:
                         teacher_seq_end = idx
                         break
             if teacher_seq_end == 0:
-                teacher_seq_end = len(teacher_input_ids[i])  # No padding found
+                teacher_seq_end = len(teacher_input_ids[i])
 
-            # Count attended padding tokens (mask == 1 but after sequence end)
+            # Count attended padding tokens
             student_pad_tokens = []
             teacher_pad_tokens = []
 
-            # Get all pad tokens that are attended (mask == 1)
             for idx in range(len(student_input_ids[i])):
                 if idx >= student_seq_end and student_mask[i][idx].item() == 1:
-                    token_id = student_input_ids[i][idx].item()
-                    if token_id == student_pad_id:
+                    if student_input_ids[i][idx].item() == student_pad_id:
                         student_pad_tokens.append(idx)
 
             for idx in range(len(teacher_input_ids[i])):
                 if idx >= teacher_seq_end and teacher_mask[i][idx].item() == 1:
-                    token_id = teacher_input_ids[i][idx].item()
-                    if token_id == teacher_pad_id:
+                    if teacher_input_ids[i][idx].item() == teacher_pad_id:
                         teacher_pad_tokens.append(idx)
 
             # Match padding tokens one-to-one by position
@@ -2565,46 +2570,52 @@ class AlignmentLoss(torch.nn.Module):
                     s_idx = student_pad_tokens[j]
                     t_idx = teacher_pad_tokens[j]
 
-                    # Ensure indices are within bounds
                     if s_idx < len(student_embs) and t_idx < len(teacher_embs):
-                        # Calculate loss for each padding pair
                         pad_student_emb = student_embs[s_idx].unsqueeze(0)
                         pad_teacher_emb = teacher_embs[t_idx].unsqueeze(0)
 
-                        pad_huber_loss = F.huber_loss(pad_student_emb, pad_teacher_emb)
-                        pad_cosine_sim = F.cosine_similarity(pad_student_emb, pad_teacher_emb, dim=-1)
-                        pad_cosine_loss = (1 - pad_cosine_sim).mean()
+                        # Huber loss (per token, averaged over hidden dim)
+                        pad_huber_loss = F.huber_loss(
+                            pad_student_emb, pad_teacher_emb, reduction='none'
+                        ).mean()  # scalar
+                        pad_huber_sum += pad_huber_loss
 
-                        # Apply padding loss weight of 0.5
-                        total_padding_huber_loss += self.padding_loss_weight * pad_huber_loss
-                        total_padding_cosine_loss += self.padding_loss_weight * pad_cosine_loss
+                        # Cosine loss
+                        pad_cosine_sim = F.cosine_similarity(
+                            pad_student_emb, pad_teacher_emb, dim=-1
+                        )
+                        pad_cosine_loss = (1 - pad_cosine_sim).mean()
+                        pad_cosine_sum += pad_cosine_loss
+
+                        pad_count += 1
                         total_padding_aligned_tokens += 1
 
-        # Average across batch
-        if batch_size > 0:
-            total_text_huber_loss = total_text_huber_loss / batch_size
-            total_text_cosine_loss = total_text_cosine_loss / batch_size
-            total_split_huber_loss = total_split_huber_loss / batch_size
-            total_split_cosine_loss = total_split_cosine_loss / batch_size
-            total_padding_huber_loss = total_padding_huber_loss / batch_size
-            total_padding_cosine_loss = total_padding_cosine_loss / batch_size
+        # Compute average losses (weighted sum / sum of weights)
+        text_huber_loss = text_huber_sum / text_huber_weight_sum if text_huber_weight_sum > 0 else torch.tensor(0.0, device=device)
+        text_cosine_loss = text_cosine_sum / text_cosine_weight_sum if text_cosine_weight_sum > 0 else torch.tensor(0.0, device=device)
+        split_huber_loss = split_huber_sum / split_huber_weight_sum if split_huber_weight_sum > 0 else torch.tensor(0.0, device=device)
+        split_cosine_loss = split_cosine_sum / split_cosine_weight_sum if split_cosine_weight_sum > 0 else torch.tensor(0.0, device=device)
+        pad_huber_loss = pad_huber_sum / pad_count if pad_count > 0 else torch.tensor(0.0, device=device)
+        pad_cosine_loss = pad_cosine_sum / pad_count if pad_count > 0 else torch.tensor(0.0, device=device)
 
-        # Combine all losses
-        total_loss = (
-            self.text_huber_weight * total_text_huber_loss +
-            self.text_cosine_weight * total_text_cosine_loss +
-            self.split_huber_weight * total_split_huber_loss +
-            self.split_cosine_weight * total_split_cosine_loss +
-            self.text_huber_weight * total_padding_huber_loss +
-            self.text_cosine_weight * total_padding_cosine_loss
+        # Combine losses (without arbitrary division by 3)
+        total_huber_loss = (
+            self.text_huber_weight * text_huber_loss +
+            self.split_huber_weight * split_huber_loss +
+            self.padding_loss_weight * pad_huber_loss
+        )
+        total_cosine_loss = (
+            self.text_cosine_weight * text_cosine_loss +
+            self.split_cosine_weight * split_cosine_loss +
+            self.padding_loss_weight * pad_cosine_loss
         )
 
-        # Calculate token match ratio properly (include attended padding tokens in denominator)
+        # Combine all losses
+        total_loss = total_huber_loss + total_cosine_loss
+
+        # Calculate token match ratio
         total_aligned_tokens = total_text_aligned_tokens + total_split_aligned_tokens + total_padding_aligned_tokens
         text_aligned_ratio = total_aligned_tokens / max(total_attended_tokens, 1)
-
-        total_huber_loss = total_text_huber_loss + total_split_huber_loss + total_padding_huber_loss
-        total_cosine_loss = total_text_cosine_loss + total_split_cosine_loss + total_padding_cosine_loss
 
         return (
             total_loss, total_huber_loss, total_cosine_loss, text_aligned_ratio
@@ -3496,7 +3507,8 @@ def get_memory_usage() -> List[float]:
     return [0.0, 0.0, 0.0]
 
 def save_trained_model(save_path: str, model: torch.nn.Module, tokenizer,
-                      projection_layers: List[torch.nn.Module], qwen_embedding_dim: int,
+                      projection_layers: List[torch.nn.Module], student_residual_projector: torch.nn.Module,
+                      qwen_embedding_dim: int,
                       model_optimizer=None, projection_optimizer=None,
                       align_loss_fn=None) -> None:
     """Save trained model with all components"""
@@ -3509,6 +3521,12 @@ def save_trained_model(save_path: str, model: torch.nn.Module, tokenizer,
         layer_path = os.path.join(save_path, f"projection_layer_{layer.file_num}.safetensors")
         save_file(layer_state, layer_path)
 
+    if student_residual_projector is not None:
+        # Save the student residual projector
+        residual_state = student_residual_projector.state_dict()
+        residual_path = os.path.join(save_path, "student_residual_projector.safetensors")
+        save_file(residual_state, residual_path)
+
     projection_config_path = os.path.join(save_path, "projection_config.json")
     save_projection_config(projection_config_path, qwen_embedding_dim)
 
@@ -3516,7 +3534,6 @@ def save_trained_model(save_path: str, model: torch.nn.Module, tokenizer,
     save_optimizer_states(save_path, model_optimizer, projection_optimizer)
 
 def save_projection_config(projection_config_path: str, embedding_dim: int) -> None:
-    """Save projection configuration"""
     projection_config = {
         "layers": PROJECTION_LAYERS_CONFIG,
     }
@@ -3524,7 +3541,6 @@ def save_projection_config(projection_config_path: str, embedding_dim: int) -> N
         json.dump(projection_config, f)
 
 def set_training_mode(model, projection_layers, train_model_flag=True, train_projection_flag=True):
-    """Set training mode only for layers that are being trained"""
     if train_model_flag:
         model.train()
     else:
@@ -3749,6 +3765,31 @@ def main():
                 print(f"Error loading Qwen config: {e}")
                 qwen_embedding_dim = 1024
 
+            final_output_dim = 4096
+
+            if ENABLE_MODEL_TO_FINAL_SKIP:
+                # We're now using a specific linear to produce a residual for a skip connection directly from model output to final output
+                student_residual_projector = torch.nn.Linear(qwen_embedding_dim, final_output_dim)
+                torch.nn.init.kaiming_normal_(student_residual_projector.weight, a=0.0, nonlinearity='relu')
+
+                # Attempt to load the state dict
+                residual_projector_path = os.path.join(QWEN3_MODEL_DIR, "student_residual_projector.safetensors")
+                if os.path.exists(residual_projector_path):
+                    try:
+                        residual_state_dict = load_file(residual_projector_path, device=device)
+                        student_residual_projector.load_state_dict(residual_state_dict)
+                        print(f"Successfully loaded residual projector state from {residual_projector_path}")
+                    except Exception as e:
+                        print(f"Warning: Could not load residual projector state from {residual_projector_path}. Error: {e}")
+                        print("Initializing residual projector with new weights.")
+                else:
+                    print("Initializing residual projector with new weights.")
+
+                student_residual_projector.to(device, dtype=torch.bfloat16)
+
+            else:
+                student_residual_projector = None
+
             restart_cycle = 1
             layers_to_load = 1
             projection_layers, layers_to_load = get_projection_layers(restart_cycle, layers_to_load, qwen_embedding_dim)
@@ -3779,6 +3820,8 @@ def main():
             scheduler_model = None
             if TRAIN_MODEL:
                 model_parameters = [p for p in student_model.parameters() if p.requires_grad]
+                if student_residual_projector is not None:
+                    model_parameters.extend(list(student_residual_projector.parameters()))
                 model_optimizer, scheduler_model = initialize_optimizer(model_parameters, MAX_LEARNING_RATE_MODEL, MIN_LEARNING_RATE_MODEL)
 
             if REUSE_OPTIMIZER_STATE and load_optimizer_states(QWEN3_MODEL_DIR, model_optimizer, scheduler_model, projection_optimizer, scheduler_projection, new_layer_exists):
@@ -3836,12 +3879,16 @@ def main():
                                     output_hidden_states=True
                                 )
                                 student_hidden = student_outputs.hidden_states[-1]
+                                if student_residual_projector is not None:
+                                    residual = student_residual_projector(student_hidden)
                                 projected_student = student_hidden
 
                                 for layer in projection_layers:
                                     projected_student = layer(projected_student)
+
+                                if student_residual_projector is not None:
+                                    projected_student = projected_student + residual * MODEL_TO_FINAL_RESIDUAL_SCALE
                         else:
-                            # Use no_grad and only get last hidden state when not training model
                             with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                                 student_outputs = student_model(
                                     input_ids=s_input_ids,
@@ -3851,9 +3898,14 @@ def main():
                                 student_hidden = student_outputs.hidden_states[-1]
 
                             with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                                if student_residual_projector is not None:
+                                    residual = student_residual_projector(student_hidden)
                                 projected_student = student_hidden
                                 for layer in projection_layers:
                                     projected_student = layer(projected_student)
+
+                                if student_residual_projector is not None:
+                                    projected_student = projected_student + residual * MODEL_TO_FINAL_RESIDUAL_SCALE
 
                         if USE_CACHED_EMBEDDINGS:
                             teacher_hidden = t_embeddings.to(device).squeeze(1)
@@ -4024,7 +4076,7 @@ def main():
                             if SAVE_EVERY_X_STEPS > 0 and global_step % SAVE_EVERY_X_STEPS == 0:
                                 print(f"\nSaving checkpoint at step {global_step}\n")
                                 save_path = os.path.join(OUTPUT_DIR, f"checkpoint_step_{global_step}")
-                                save_trained_model(save_path, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
+                                save_trained_model(save_path, student_model, student_tokenizer, projection_layers, student_residual_projector, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
 
                             # Define cycle length for restart-based training
                             if REPEAT_WARMUP_AFTER_RESTART or (restart_cycle == 1 and WARMUP_STEPS > 0):
@@ -4040,7 +4092,7 @@ def main():
                                 if SAVE_EVERY_X_RESTARTS > 0 and restart_cycle % SAVE_EVERY_X_RESTARTS == 0:
                                     print(f"\nSaving checkpoint at restart {restart_cycle}\n")
                                     save_path = os.path.join(OUTPUT_DIR, f"restart_{restart_cycle}")
-                                    save_trained_model(save_path, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
+                                    save_trained_model(save_path, student_model, student_tokenizer, projection_layers, student_residual_projector, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
 
                                 restart_cycle += 1
 
@@ -4080,7 +4132,7 @@ def main():
                 if next_epoch % SAVE_EVERY_X_EPOCHS == 0:
                     print(f"\nSaving checkpoint at epoch {next_epoch}\n")
                     save_path = os.path.join(OUTPUT_DIR, f"epoch_{next_epoch}")
-                    save_trained_model(save_path, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
+                    save_trained_model(save_path, student_model, student_tokenizer, projection_layers, student_residual_projector, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
 
                 if next_epoch % EVAL_EVERY_X_EPOCHS == 0:
                     eval_start_time = time.time()
@@ -4125,7 +4177,7 @@ def main():
                         best_loss = avg_eval_loss
                         print(f"\nNew best model at loss {best_loss:.6f}, saving...")
                         best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
-                        save_trained_model(best_model_dir, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
+                        save_trained_model(best_model_dir, student_model, student_tokenizer, projection_layers, student_residual_projector, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
 
                     eval_end_time = time.time()
                     eval_delta_time += (eval_end_time - eval_start_time)
@@ -4139,7 +4191,7 @@ def main():
 
     # ========== Save Final Model ==========
     print(f"\nSaving final model to {OUTPUT_DIR}...")
-    save_trained_model(OUTPUT_DIR, student_model, student_tokenizer, projection_layers, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
+    save_trained_model(OUTPUT_DIR, student_model, student_tokenizer, projection_layers, student_residual_projector, qwen_embedding_dim, model_optimizer, projection_optimizer, align_loss_fn)
 
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
