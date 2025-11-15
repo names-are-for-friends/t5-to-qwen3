@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v15/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v16"
+QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v3/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v4"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -57,8 +57,8 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 5e-5
-MIN_LEARNING_RATE_MODEL = 5e-6
+MAX_LEARNING_RATE_MODEL = 1e-5
+MIN_LEARNING_RATE_MODEL = 1e-6
 MAX_LEARNING_RATE_PROJ = 2e-4
 MIN_LEARNING_RATE_PROJ = 2e-5
 
@@ -86,21 +86,16 @@ TEXT_MATCH_HUBER_WEIGHT = 1.00
 TEXT_MATCH_COSINE_WEIGHT = 0.10
 SPLIT_TOKEN_HUBER_WEIGHT = 0.50
 SPLIT_TOKEN_COSINE_WEIGHT = 0.05
-SEQUENCE_HUBER_WEIGHT = 0.20
-SEQUENCE_COSINE_WEIGHT = 0.02
-
-# Padding options - You can match tokens after the attended sequence. T5 has one EOS then repeated pad, Qwen has just one repeated post-sequence joint pad/EOS token. Loss fluctuation is normal with a wider range and higher loss weight
-MIN_EXTRA_MATCHED_PADDING = 1
-MAX_EXTRA_MATCHED_PADDING = 1
-PADDING_LOSS_WEIGHT = 1.0
+SEQUENCE_HUBER_WEIGHT = 0.10
+SEQUENCE_COSINE_WEIGHT = 0.01
 
 # Cosine thresholds - turn TEXT_MATCH threshold to zero at first, since semantic representations will be unrelated until trained
 TEXT_MATCH_COSINE_THRESHOLD = 0.0
 SPLIT_TOKEN_COSINE_THRESHOLD = 0.7
 
 # Skip connection - pass a residual from projected model output to final output (using linear projector on model optimizer) to enhance gradient flow
-ENABLE_MODEL_TO_FINAL_SKIP = False
-MODEL_TO_FINAL_RESIDUAL_SCALE = 0.00
+ENABLE_MODEL_TO_FINAL_SKIP = True
+MODEL_TO_FINAL_RESIDUAL_SCALE = 0.10
 
 # Dataset
 SHUFFLE_DATASET = True
@@ -966,30 +961,6 @@ def normalize_token(token):
 
     return token.lower()
 
-def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=3):
-    """
-    Modifies attention mask to allow attention to a few extra padding tokens.
-    """
-    # Get the actual sequence length from the mask
-    seq_length = mask.sum(dim=-1)
-    batch_size = mask.shape[0]
-
-    modified_mask = mask.clone()
-
-    for i in range(batch_size):
-        current_seq_len = int(seq_length[i].item())
-
-        # Only add extra padding tokens if there's room
-        if current_seq_len < max_seq_length:
-            # Calculate how many padding tokens we can unmask
-            available_padding = max_seq_length - current_seq_len
-            tokens_to_unmask = min(num_extra_padding, available_padding)
-
-            # Unmask the specified number of padding tokens right after the sequence
-            modified_mask[i, current_seq_len : current_seq_len + tokens_to_unmask] = 1
-
-    return modified_mask
-
 def ids_to_tokens(token_ids, tokenizer):
     """Optimized token conversion"""
     return tokenizer.convert_ids_to_tokens(token_ids)
@@ -1111,27 +1082,27 @@ def match_padding_tokens(student_input_ids, teacher_input_ids, student_mask, tea
     teacher_eos_id = teacher_tokenizer.eos_token_id
     teacher_bos_id = getattr(teacher_tokenizer, 'bos_token_id', None)
 
-    # Find attended padding/EOS tokens after sequence ends
+    # Find attended padding/EOS tokens within the modified mask
     student_pad_tokens = []
     teacher_pad_tokens = []
 
-    # For student: find pad tokens after sequence end that are attended
+    # For student: find pad tokens within the attended mask
     for idx in range(len(student_input_ids)):
         if idx < len(student_embeddings) and student_mask[idx] == 1:
             token_id = student_input_ids[idx].item()
             if token_id == student_pad_id:
                 student_pad_tokens.append(idx)
-        if student_mask[idx] == 0:
-            break
 
-    # For teacher: find EOS or pad tokens after sequence end that are attended
+    # For teacher: find EOS or pad tokens within the attended mask
     for idx in range(len(teacher_input_ids)):
         if idx < len(teacher_embeddings) and teacher_mask[idx] == 1:
             token_id = teacher_input_ids[idx].item()
             if token_id == teacher_pad_id or token_id == teacher_eos_id:
                 teacher_pad_tokens.append(idx)
-        if teacher_mask[idx] == 0:
-            break
+
+    if ENABLE_ALIGNMENT_DEBUG:
+        print(f"DEBUG - Student pad tokens found in mask: {student_pad_tokens}")
+        print(f"DEBUG - Teacher pad/EOS tokens found in mask: {teacher_pad_tokens}")
 
     # Match one-to-one by position (sequential matching)
     matches = []
@@ -1141,8 +1112,11 @@ def match_padding_tokens(student_input_ids, teacher_input_ids, student_mask, tea
             s_idx = student_pad_tokens[j]
             t_idx = teacher_pad_tokens[j]
             matches.append((s_idx, t_idx))
+            if ENABLE_ALIGNMENT_DEBUG:
+                print(f"DEBUG - Matched padding: student[{s_idx}] -> teacher[{t_idx}]")
 
     return matches
+
 
 def calculate_token_boundaries_in_word(word_info, word_text):
     """Calculate actual normalized boundaries for tokens in a word"""
@@ -1393,29 +1367,34 @@ def find_word_matches(student_words, teacher_words, texts_match=True, word_windo
 def log_alignment_details(student_input_ids, teacher_input_ids, student_tokenizer, teacher_tokenizer,
                          token_matches, split_token_matches,
                          student_words, teacher_words, exclude_tokens,
+                         student_mask, teacher_mask,
                          padding_matches=None):
     """Log detailed alignment information for diagnosis"""
     # Get original texts
     student_text = student_tokenizer.decode(student_input_ids, skip_special_tokens=True)
     teacher_text = teacher_tokenizer.decode(teacher_input_ids, skip_special_tokens=True)
 
-    # Find actual sequence boundaries
+    # Find actual sequence boundaries - same logic as in hybrid_alignment
     student_pad_id = student_tokenizer.pad_token_id
-    teacher_eos_id = teacher_tokenizer.eos_token_id  # Usually same for both tokenizers
+    teacher_pad_id = teacher_tokenizer.pad_token_id
+    teacher_eos_id = teacher_tokenizer.eos_token_id
 
-    # Find first padding in student sequence
+    # Find first padding in student sequence that's NOT attended
     student_seq_end = len(student_input_ids)
     for i, token_id in enumerate(student_input_ids):
         if token_id == student_pad_id:
-            student_seq_end = i
-            break
+            # This is a padding token - check if it's attended
+            if i < len(student_mask) and student_mask[i] == 0:
+                student_seq_end = i
+                break
 
-    # Find first EOS in teacher sequence
+    # Find first EOS/padding in teacher sequence that's NOT attended
     teacher_seq_end = len(teacher_input_ids)
     for i, token_id in enumerate(teacher_input_ids):
-        if token_id == teacher_eos_id:
-            teacher_seq_end = i
-            break
+        if token_id == teacher_eos_id or token_id == teacher_pad_id:
+            if i < len(teacher_mask) and teacher_mask[i] == 0:
+                teacher_seq_end = i
+                break
 
     # Count valid tokens (excluding padding and special tokens)
     exclude_set = set(exclude_tokens) if exclude_tokens else set()
@@ -1885,9 +1864,8 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
 
         filtered_idx = 0
         for original_idx, token in enumerate(student_tokens):
-            # Only exclude actual special tokens by ID
-            token_id = student_input_ids[original_idx].item()
-            if token_id not in exclude_set:
+            # Keep the token only if the mask value is 1
+            if student_mask[original_idx].item() == 1:
                 original_to_filtered[original_idx] = filtered_idx
                 filtered_to_original[filtered_idx] = original_idx
 
@@ -1904,6 +1882,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
         student_input_ids = torch.tensor(student_input_ids_filtered, device=student_input_ids.device)
         student_tokens = student_tokens_filtered
 
+
         # Create mappings for teacher
         teacher_original_to_filtered = {}
         teacher_filtered_to_original = {}
@@ -1914,9 +1893,8 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
 
         filtered_idx = 0
         for original_idx, token in enumerate(teacher_tokens):
-            # Only exclude actual special tokens by ID
-            token_id = teacher_input_ids[original_idx].item()
-            if token_id not in exclude_set:
+            # Keep the token only if the mask value is 1
+            if teacher_mask[original_idx].item() == 1:
                 teacher_original_to_filtered[original_idx] = filtered_idx
                 teacher_filtered_to_original[filtered_idx] = original_idx
 
@@ -1925,6 +1903,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
                 teacher_input_ids_filtered.append(teacher_input_ids[original_idx])
                 filtered_idx += 1
 
+        # Convert to tensors
         if teacher_embeddings_filtered:
             teacher_embeddings = torch.stack(teacher_embeddings_filtered)
         else:
@@ -2078,37 +2057,6 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
         split_token_matches = word_split_matches
 
     # Stage 3: Padding token matching
-    # Find the actual sequence end for student (first pad token)
-    student_pad_id = student_tokenizer.pad_token_id
-    teacher_pad_id = teacher_tokenizer.pad_token_id
-    teacher_eos_id = teacher_tokenizer.eos_token_id
-
-    student_seq_end = 0
-    for idx in range(len(student_input_ids)):
-        if student_input_ids[idx].item() == student_pad_id:
-            student_seq_end = idx
-            break
-    if student_seq_end == 0:
-        student_seq_end = len(student_input_ids)
-
-    # Find the actual sequence end for teacher (first EOS token, then pad)
-    teacher_seq_end = 0
-    for idx in range(len(teacher_input_ids)):
-        if teacher_input_ids[idx].item() == teacher_eos_id:
-            teacher_seq_end = idx + 1
-            break
-    if teacher_seq_end == 0:
-        for idx in range(len(teacher_input_ids)):
-            if teacher_input_ids[idx].item() == teacher_pad_id:
-                teacher_seq_end = idx
-                break
-    if teacher_seq_end == 0:
-        teacher_seq_end = len(teacher_input_ids)
-
-    if ENABLE_ALIGNMENT_DEBUG:
-        print(f"DEBUG - Sequence ends: student={student_seq_end}, teacher={teacher_seq_end}")
-
-    # Stage 3: Padding token matching
     padding_matches = match_padding_tokens(
         student_input_ids, teacher_input_ids,
         student_mask, teacher_mask,
@@ -2119,7 +2067,31 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
     if ENABLE_ALIGNMENT_DEBUG:
         print(f"DEBUG - Padding matches found: {len(padding_matches)}")
 
-    # Filter padding matches
+    # Now find sequence ends for logging purposes (but NOT for filtering)
+    student_pad_id = student_tokenizer.pad_token_id
+    teacher_pad_id = teacher_tokenizer.pad_token_id
+    teacher_eos_id = teacher_tokenizer.eos_token_id
+
+    # Find the original sequence end (first pad/EOS before any extra unmasked padding)
+    student_seq_end = len(student_input_ids)
+    for idx in range(len(student_input_ids)):
+        if student_input_ids[idx].item() == student_pad_id:
+            # Check if this is the FIRST pad token (not one we unmasked)
+            # The original sequence end is the first pad that's NOT attended
+            if idx >= len(student_mask) or student_mask[idx] == 0:
+                student_seq_end = idx
+                break
+
+    teacher_seq_end = len(teacher_input_ids)
+    for idx in range(len(teacher_input_ids)):
+        token_id = teacher_input_ids[idx].item()
+        if token_id == teacher_eos_id or token_id == teacher_pad_id:
+            # Check if this is the FIRST special token that's NOT attended
+            if idx >= len(teacher_mask) or teacher_mask[idx] == 0:
+                teacher_seq_end = idx
+                break
+
+    # Filter padding matches (but allow them even if they're at sequence ends)
     filtered_padding_matches = []
     for s_idx, t_idx in padding_matches:
         if s_idx not in aligned_student_tokens and t_idx not in aligned_teacher_tokens:
@@ -2137,6 +2109,7 @@ def hybrid_alignment(student_input_ids, teacher_input_ids,
             student_tokenizer, teacher_tokenizer,
             all_token_matches, split_token_matches,
             student_words, teacher_words, exclude_tokens,
+            student_mask, teacher_mask,
             padding_token_matches
         )
 
@@ -2165,8 +2138,6 @@ class AlignmentLoss(torch.nn.Module):
         self.text_cosine_weight = text_cosine_weight
         self.split_huber_weight = split_huber_weight
         self.split_cosine_weight = split_cosine_weight
-        # Weight for padding token losses
-        self.padding_loss_weight = PADDING_LOSS_WEIGHT
 
     def forward(self, student_output: torch.Tensor, teacher_output: torch.Tensor,
                     student_mask: torch.Tensor, teacher_mask: torch.Tensor,
@@ -2379,12 +2350,12 @@ class AlignmentLoss(torch.nn.Module):
         total_huber_loss = (
             self.text_huber_weight * text_huber_loss +
             self.split_huber_weight * split_huber_loss +
-            self.padding_loss_weight * pad_huber_loss
+            self.text_huber_weight * pad_huber_loss
         )
         total_cosine_loss = (
             self.text_cosine_weight * text_cosine_loss +
             self.split_cosine_weight * split_cosine_loss +
-            self.padding_loss_weight * pad_cosine_loss
+            self.text_cosine_weight * pad_cosine_loss
         )
         total_loss = total_huber_loss + total_cosine_loss
 
@@ -3144,10 +3115,6 @@ def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, projection_la
                             else:
                                 projected_student = layer(projected_student)
 
-                extra_padding = 1
-                s_mask = modify_mask_to_attend_padding(s_mask, 512, num_extra_padding=extra_padding)
-                t_mask = modify_mask_to_attend_padding(t_mask, 512, num_extra_padding=extra_padding)
-
                 eval_loss = torch.tensor(0.0, device=device)
                 eval_align_huber = torch.tensor(0.0, device=device)
                 eval_align_cos = torch.tensor(0.0, device=device)
@@ -3699,12 +3666,6 @@ def main():
                                 )
                                 teacher_hidden = teacher_outputs.last_hidden_state
                                 teacher_hidden = teacher_hidden.to(device)
-
-                        num_extra_padding = random.randint(MIN_EXTRA_MATCHED_PADDING, MAX_EXTRA_MATCHED_PADDING)
-
-                        # Modify masks to randomly attend to extra padding tokens
-                        s_mask = modify_mask_to_attend_padding(s_mask, 512, num_extra_padding=num_extra_padding)
-                        t_mask = modify_mask_to_attend_padding(t_mask, 512, num_extra_padding=num_extra_padding)
 
                         total_loss = torch.tensor(0.0, device=device)
                         align_loss_huber = torch.tensor(0.0, device=device)
