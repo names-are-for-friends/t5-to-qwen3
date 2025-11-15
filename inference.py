@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1011/v5/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v4/restart_1"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -40,7 +40,7 @@ APPEND_DATETIME = True
 
 T5_MASK_ADDITIONAL_PADDING_ATTENTION = 1 # Unmask specified padding amount when using T5 mask (including with Qwen)
 USE_T5_MASK_WITH_QWEN = False
-QWEN_MASK_ADDITIONAL_PADDING_ATTENTION = 1
+QWEN_MASK_ADDITIONAL_PADDING_ATTENTION = 0
 
 # === Configuration Dataclasses ===
 @dataclass
@@ -1775,7 +1775,7 @@ def load_autoencoder(vae_file: str) -> AutoEncoder:
     ae.to(torch.bfloat16)
     return ae
 
-def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
+def load_qwen3_model(qwen3_folder: str, dtype=torch.bfloat16) -> Tuple[Module, Module, Module]:
     logger.info(f"Loading Qwen3 model from {qwen3_folder}")
 
     # Load model config
@@ -1888,7 +1888,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
             state_dict = load_file(layer_path)
             layer.load_state_dict(state_dict)
 
-        layer.to(device, dtype=torch.bfloat16).eval()
+        layer.to(device, dtype=dtype).eval()
         projection_layers.append(layer)
 
     # Load model
@@ -1898,7 +1898,7 @@ def load_qwen3_model(qwen3_folder: str) -> Tuple[Module, Module, Module]:
         device_map="auto",
         trust_remote_code=True,
         attn_implementation="flash_attention_2"
-    ).to(device, dtype=torch.bfloat16).eval()
+    ).to(device, dtype=dtype).eval()
 
     return model, projection_layers, tokenizer
 
@@ -1969,13 +1969,26 @@ if __name__ == "__main__":
         use_t5 = False
 
     device = 'cuda'
-    dtype = torch.bfloat16
+    dtype = torch.float16
+
+    if use_t5:
+        pos_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
+        neg_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
+    else:
+        pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
+        neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
 
     # Tokenize and create embeddings
     if use_t5:
+
+        if not args.positive_prompt.strip():
+            args.positive_prompt = "<pad>"
+        if not args.negative_prompt.strip():
+            args.negative_prompt = "<pad>"
+
         tokenizer = load_t5_tokenizer(args.t5_folder)
         text_inputs = tokenizer(
-            [args.positive_prompt],
+            args.positive_prompt,
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
@@ -1983,13 +1996,14 @@ if __name__ == "__main__":
         ).to(device)
 
         text_inputs_neg = tokenizer(
-            [args.negative_prompt],
+            args.negative_prompt,
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
             return_tensors="pt"
         ).to(device)
         t5_model = load_t5_model(args.t5_folder)
+
         attention_mask = text_inputs["attention_mask"].to(device)
         attention_mask_neg = text_inputs_neg["attention_mask"].to(device)
 
@@ -2008,11 +2022,16 @@ if __name__ == "__main__":
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=t5_model.device)
 
     else:
-        qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder)
+        qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder, dtype)
+
+        if not args.positive_prompt.strip():
+            args.positive_prompt = "<lm_end>"
+        if not args.negative_prompt.strip():
+            args.negative_prompt = "<lm_end>"
 
         # Tokenize and create embeddings
         text_inputs = tokenizer(
-            [args.positive_prompt],
+            args.positive_prompt,
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
@@ -2021,7 +2040,7 @@ if __name__ == "__main__":
         ).to(qwen3_model.device)
 
         text_inputs_neg = tokenizer(
-            [args.negative_prompt],
+            args.negative_prompt,
             padding="max_length",
             max_length=args.max_length,
             truncation=True,
@@ -2059,7 +2078,7 @@ if __name__ == "__main__":
         if USE_T5_MASK_WITH_QWEN:
             tokenizer = load_t5_tokenizer(args.t5_folder)
             text_inputs = tokenizer(
-                [args.positive_prompt],
+                args.positive_prompt,
                 padding="max_length",
                 max_length=args.max_length,
                 truncation=True,
@@ -2067,7 +2086,7 @@ if __name__ == "__main__":
             ).to(device)
 
             text_inputs_neg = tokenizer(
-                [args.negative_prompt],
+                args.negative_prompt,
                 padding="max_length",
                 max_length=args.max_length,
                 truncation=True,
@@ -2082,19 +2101,10 @@ if __name__ == "__main__":
         neg_text_ids = torch.zeros((1, args.max_length, 3), device=qwen3_model.device)
 
     if tokenizer.pad_token_id is not None:
-        if use_t5:
-            pos_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
-            neg_add_pad = T5_MASK_ADDITIONAL_PADDING_ATTENTION
-        else:
-            pos_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
-            neg_add_pad = QWEN_MASK_ADDITIONAL_PADDING_ATTENTION
-        # Empty prompts should always have at least one padding token attended
         if not args.positive_prompt.strip() and pos_add_pad < 1:
             pos_add_pad = 1
         if not args.negative_prompt.strip() and neg_add_pad < 1:
             neg_add_pad = 1
-
-        # Replace masked positions (attention=0) with padding token in student input and then attend
         if pos_add_pad > 0:
             attention_mask = modify_mask_to_attend_padding(
                 attention_mask,
