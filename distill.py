@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
 # Paths
 DATASET_DIR = "/mnt/f/q5_xxs_training_script/400K_dataset.txt"
 T5_MODEL_DIR = "/home/naff/q3-xxs_script/t5-xxl"
-QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v3/restart_1"
-OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v4"
+QWEN3_MODEL_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v5/restart_1"
+OUTPUT_DIR = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v6"
 
 # Caching
 USE_CACHED_EMBEDDINGS = True
@@ -57,10 +57,10 @@ GRAD_CLIP = 1.0
 EPOCHS = 2
 
 # Learning rates
-MAX_LEARNING_RATE_MODEL = 1e-5
-MIN_LEARNING_RATE_MODEL = 1e-6
-MAX_LEARNING_RATE_PROJ = 2e-4
-MIN_LEARNING_RATE_PROJ = 2e-5
+MAX_LEARNING_RATE_MODEL = 6e-5
+MIN_LEARNING_RATE_MODEL = 6e-6
+MAX_LEARNING_RATE_PROJ = 3e-4
+MIN_LEARNING_RATE_PROJ = 3e-5
 
 # Saving
 SAVE_EVERY_X_STEPS = 0
@@ -2162,7 +2162,7 @@ class AlignmentLoss(torch.nn.Module):
         pad_count = 0
 
         # Initialize counters
-        total_valid_student_tokens = 0  # Only count non-special tokens
+        total_valid_student_tokens = 0
         total_text_aligned_tokens = 0
         total_split_aligned_tokens = 0
         total_padding_aligned_tokens = 0
@@ -2367,7 +2367,7 @@ class AlignmentLoss(torch.nn.Module):
             total_padding_aligned_tokens
         )
         # Use only valid student tokens as denominator
-        text_aligned_ratio = total_aligned_tokens / max(total_valid_student_tokens, 1)
+        text_aligned_ratio = total_aligned_tokens / max(total_valid_student_tokens+total_padding_aligned_tokens, 1)
 
         return (
             total_loss, total_huber_loss, total_cosine_loss, text_aligned_ratio
