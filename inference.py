@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 DEFAULT_CHROMA_FILE = "chroma/chroma-unlocked-v41.safetensors"
 DEFAULT_VAE_FILE = "ae/ae.safetensors"
-DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v4/restart_1"
+DEFAULT_QWEN3_FOLDER = "/mnt/f/q5_xxs_training_script/QT-encoder-1511/v6/restart_1/"
 DEFAULT_T5_FOLDER = "t5-xxl/"
 DEFAULT_POSITIVE_PROMPT = "Hatsune Miku, depicted in anime style, holding up a sign that reads 'Qwen3'. In the background there is an anthroporphic muscular wolf, rendered like a high-resolution 3D model, wearing a t-shirt that reads 'Chroma'. They're stood on the moon."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -1981,11 +1981,6 @@ if __name__ == "__main__":
     # Tokenize and create embeddings
     if use_t5:
 
-        if not args.positive_prompt.strip():
-            args.positive_prompt = "<pad>"
-        if not args.negative_prompt.strip():
-            args.negative_prompt = "<pad>"
-
         tokenizer = load_t5_tokenizer(args.t5_folder)
         text_inputs = tokenizer(
             args.positive_prompt,
@@ -2023,11 +2018,6 @@ if __name__ == "__main__":
 
     else:
         qwen3_model, projection_layers, tokenizer = load_qwen3_model(args.qwen3_folder, dtype)
-
-        if not args.positive_prompt.strip():
-            args.positive_prompt = "<lm_end>"
-        if not args.negative_prompt.strip():
-            args.negative_prompt = "<lm_end>"
 
         # Tokenize and create embeddings
         text_inputs = tokenizer(
